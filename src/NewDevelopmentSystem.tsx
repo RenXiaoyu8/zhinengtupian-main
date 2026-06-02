@@ -550,7 +550,7 @@ export default function NewDevelopmentSystem({
       }) as NewDevProject;
       lastAutoSavedKeyRef.current[saved.id] = projectDraftKey(saved);
       setProjects(prev => prev.map(item => item.id === saved.id ? saved : item));
-      setNotice(decision === 'accepted' ? '已采纳并复制到运营卖点' : '已标记不采纳');
+      setNotice(decision === 'accepted' ? '已采纳并复制到运营卖点' : '已处理');
     } finally {
       setSaving(false);
     }
@@ -1147,9 +1147,6 @@ function ProjectEditor({
                       <button type="button" disabled={!canReviewPurchaseSelling || status === 'accepted'} onClick={() => onPurchaseSellingPointDecision(point, 'accepted')} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-500 disabled:opacity-50">
                         {status === 'accepted' ? '已采纳' : '采纳复制到卖点'}
                       </button>
-                      <button type="button" disabled={!canReviewPurchaseSelling || status === 'rejected'} onClick={() => onPurchaseSellingPointDecision(point, 'rejected')} className="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-bold text-slate-200 hover:bg-slate-600 disabled:opacity-50">
-                        {status === 'rejected' ? '已不采纳' : '不采纳'}
-                      </button>
                     </div>
                   </div>
                 );
@@ -1259,8 +1256,9 @@ function ProjectEditor({
       <Section title="包装设计 / 白底图" className={panel}>
         <DesignerTransfer designers={designers} disabled={!canEdit} inputClass={inputClass} onTransfer={onTransfer} current={data.transferredTo} />
         <TextArea label="文案和检测项目确认" value={data.copywritingConfirm || buildPackagingConfirm(data)} onChange={value => onDataPatch({ copywritingConfirm: value })} {...fieldProps} />
-        <ImageReview title="卖点图片" groups={imageGroups(data, 'selling')} token={token} />
-        <ImageReview title="检测项图片" groups={imageGroups(data, 'test')} token={token} />
+        <div className="rounded-lg border border-slate-700 bg-slate-950/40 p-4">
+          <MainDetailBrief data={data} token={token} onCopy={onCopy} />
+        </div>
         <FileUploader label="包装源文件" field="packagingSourceFiles" files={asArray(data.packagingSourceFiles)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
         <FileUploader label="包装预览图" field="packagingPreviewImages" files={asArray(data.packagingPreviewImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
         <FileUploader label="白底图" field="whiteBackgroundImages" files={asArray(data.whiteBackgroundImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
