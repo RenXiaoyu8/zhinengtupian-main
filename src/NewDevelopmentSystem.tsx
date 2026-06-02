@@ -743,12 +743,17 @@ export default function NewDevelopmentSystem({
     }
   };
 
-  const removeProject = async () => {
-    if (!selected || !window.confirm(`确认删除「${selected.title}」吗？`)) return;
-    await api(`/newdev/projects/${selected.id}`, { method: 'DELETE' });
-    setProjects(prev => prev.filter(item => item.id !== selected.id));
-    setSelectedId(projects.find(item => item.id !== selected.id)?.id || null);
+  const removeProjectById = async (projectId: number, title: string) => {
+    if (!window.confirm(`确认删除「${title || '未命名新品'}」吗？`)) return;
+    await api(`/newdev/projects/${projectId}`, { method: 'DELETE' });
+    setProjects(prev => prev.filter(item => item.id !== projectId));
+    setSelectedId(current => current === projectId ? (projects.find(item => item.id !== projectId)?.id || null) : current);
     setNotice('已删除');
+  };
+
+  const removeProject = async () => {
+    if (!selected) return;
+    await removeProjectById(selected.id, selected.title);
   };
 
   const shell = theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900';
@@ -801,7 +806,22 @@ export default function NewDevelopmentSystem({
                     {stepMap.get(project.currentStepKey)?.label || project.currentStepKey} · {project.completedAt ? '完成' : formatRemaining(project.dueAt)}
                   </div>
                 </div>
-                <div className="shrink-0 text-xs text-slate-500">负责人：{project.assignees?.join('、') || '-'}</div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <div className="text-xs text-slate-500">负责人：{project.assignees?.join('、') || '-'}</div>
+                  {canManage && (
+                    <button
+                      type="button"
+                      title="删除新品"
+                      onClick={event => {
+                        event.stopPropagation();
+                        removeProjectById(project.id, project.title).catch(err => setNotice(err.message || '删除失败'));
+                      }}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-red-300 hover:bg-red-600 hover:text-white"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="flex items-center gap-2 overflow-x-auto pb-1">
                 {stepsForRow.map((step, index) => {
@@ -1215,7 +1235,7 @@ function ProjectEditor({
           <input type="checkbox" className="h-4 w-4 accent-sky-500" checked={notifyOperationsOnPurchase} onChange={e => onNotifyOperationsChange(e.target.checked)} />
           采购完成后通知运营部门
         </label>
-        <PurchaseItems items={items} inputClass={inputClass} disabled={!canEdit} onChange={next => onDataPatch({ purchaseItems: next })} />
+        <PurchaseItems items={items} authors={data.testItemAuthors || {}} editors={data.testItemEditors || {}} inputClass={inputClass} disabled={!canEdit} onChange={next => onDataPatch({ purchaseItems: next })} />
         <TextArea label="采购补充说明" value={data.purchaseReview || ''} onChange={value => onDataPatch({ purchaseReview: value })} {...fieldProps} />
       </Section>
     );
@@ -1285,8 +1305,6 @@ function ProjectEditor({
     return (
       <Section title="组长审核" className={panel}>
         <ReviewUploads data={data} token={token} />
-        <ImageReview title="卖点补充图片" groups={imageGroups(data, 'selling')} token={token} />
-        <ImageReview title="检测项补充图片" groups={imageGroups(data, 'test')} token={token} />
         <TextArea label="审核意见" value={data.leaderReviewComment || ''} onChange={value => onDataPatch({ leaderReviewComment: value })} {...fieldProps} />
         <TextArea label="退回修改内容" value={data.leaderRejectText || ''} onChange={value => onDataPatch({ leaderRejectText: value })} {...fieldProps} />
         <FileUploader label="退回参考图片" field="leaderRejectImages" files={asArray(data.leaderRejectImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
@@ -1298,8 +1316,6 @@ function ProjectEditor({
     return (
       <Section title="运营审核" className={panel}>
         <ReviewUploads data={data} token={token} />
-        <ImageReview title="卖点补充图片" groups={imageGroups(data, 'selling')} token={token} />
-        <ImageReview title="检测项补充图片" groups={imageGroups(data, 'test')} token={token} />
         <TextArea label="审核意见" value={data.opsReviewComment || ''} onChange={value => onDataPatch({ opsReviewComment: value })} {...fieldProps} />
         <TextArea label="退回修改内容" value={data.opsRejectText || ''} onChange={value => onDataPatch({ opsRejectText: value })} {...fieldProps} />
         <FileUploader label="退回参考图片" field="opsRejectImages" files={asArray(data.opsRejectImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
@@ -1742,9 +1758,6 @@ function ReviewUploads({ data, token }: { data: Record<string, any>; token?: str
     { label: 'SKU 图', files: asArray<FileRef>(data.skuImages) },
     { label: '主图', files: asArray<FileRef>(data.mainImages) },
     { label: '详情页', files: asArray<FileRef>(data.detailImages) },
-    { label: '包装源文件', files: asArray<FileRef>(data.packagingSourceFiles) },
-    { label: '包装预览图', files: asArray<FileRef>(data.packagingPreviewImages) },
-    { label: '白底图', files: asArray<FileRef>(data.whiteBackgroundImages) },
   ];
   return (
     <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-4">
@@ -1767,7 +1780,21 @@ function ReviewUploads({ data, token }: { data: Record<string, any>; token?: str
   );
 }
 
-function PurchaseItems({ items, disabled, inputClass, onChange }: { items: any[]; disabled?: boolean; inputClass: string; onChange: (items: any[]) => void }) {
+function PurchaseItems({
+  items,
+  authors,
+  editors,
+  disabled,
+  inputClass,
+  onChange,
+}: {
+  items: any[];
+  authors: Record<string, string>;
+  editors: Record<string, string>;
+  disabled?: boolean;
+  inputClass: string;
+  onChange: (items: any[]) => void;
+}) {
   const rows = items.length ? items : [{ sourceName: '', name: '', status: 'pending', detail: '', reason: '' }];
   const patch = (index: number, value: any) => onChange(rows.map((item, i) => i === index ? { ...item, ...value } : item));
   return (
@@ -1780,6 +1807,9 @@ function PurchaseItems({ items, disabled, inputClass, onChange }: { items: any[]
               <div>
                 <div className="mb-1 text-xs font-bold text-slate-400">运营提供的需要检测项目</div>
                 <input className={inputClass} disabled value={item.sourceName || item.name || ''} />
+                <div className="mt-1 text-xs text-slate-500">
+                  添加人：{authors?.[item.sourceName || item.name] || '-'} · 最后编辑：{editors?.[item.sourceName || item.name] || authors?.[item.sourceName || item.name] || '-'}
+                </div>
               </div>
               <div>
                 <div className="mb-1 text-xs font-bold text-slate-400">是否可检测</div>
