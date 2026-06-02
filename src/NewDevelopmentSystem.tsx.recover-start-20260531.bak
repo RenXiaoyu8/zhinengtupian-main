@@ -1,0 +1,2209 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ArrowLeft,
+  Bell,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  FileText,
+  History,
+  Image as ImageIcon,
+  PackageOpen,
+  Plus,
+  RotateCcw,
+  Save,
+  Settings,
+  Trash2,
+  Upload,
+  X,
+} from 'lucide-react';
+import { User } from './types';
+
+const API_BASE = '/api';
+
+type ManagedUser = { username: string; role: string };
+type BrandOption = { id: number; name: string };
+type OpsRotation = { usernames: string[]; currentIndex: number; currentUsername: string; weekKey: string };
+type StepConfig = {
+  stepKey: string;
+  stepOrder: number;
+  label: string;
+  durationHours: number;
+  assigneeUsernames: string[];
+  assigneePositions: string[];
+  escalationHours: number;
+  escalationUsernames: string[];
+  escalationPositions: string[];
+};
+type NewDevProject = {
+  id: number;
+  title: string;
+  barcode: string;
+  standard: string;
+  brand: string;
+  spec: string;
+  currentStepKey: string;
+  dueAt: string | null;
+  data: Record<string, any>;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  assignees: string[];
+};
+type HistoryChange = { field: string; label: string; from: any; to: any };
+type FlowHistoryEntry = {
+  id: string;
+  at: string;
+  user: string;
+  stepKey: string;
+  stepLabel: string;
+  action: string;
+  summary: string;
+  changes?: HistoryChange[];
+  snapshot?: Record<string, any>;
+};
+
+function uniqueStrings(...lists: any[][]): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const list of lists) {
+    for (const item of Array.isArray(list) ? list : []) {
+      const text = String(item || '').trim();
+      if (!text) continue;
+      const key = text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(text);
+    }
+  }
+  return result;
+}
+
+function mergeFileMaps(latest: any, current: any, keys: string[]) {
+  const result: Record<string, any[]> = {};
+  const latestObj = latest && typeof latest === 'object' && !Array.isArray(latest) ? latest : {};
+  const currentObj = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  for (const key of keys) {
+    const currentFiles = asArray(currentObj[key]);
+    const latestFiles = asArray(latestObj[key]);
+    result[key] = currentFiles.length ? currentFiles.slice(0, 3) : latestFiles.slice(0, 3);
+  }
+  return result;
+}
+
+function uniqueFiles(...lists: any[][]) {
+  const result: any[] = [];
+  const seen = new Set<string>();
+  for (const list of lists) {
+    for (const file of Array.isArray(list) ? list : []) {
+      const key = String(file?.path || file?.name || '').trim();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      result.push(file);
+    }
+  }
+  return result;
+}
+
+function mergeSellingDraftData(latestData: any, currentData: any) {
+  const mergeEditableRows = (latestList: any, currentList: any) => {
+    const currentRows = Array.isArray(currentList) ? currentList.map(item => String(item || '')) : [];
+    const latestRows = Array.isArray(latestList) ? latestList.map(item => String(item || '')) : [];
+    const sourceRows = currentRows.length ? currentRows : latestRows;
+    return sourceRows.length ? sourceRows : [''];
+  };
+  const sellingPoints = mergeEditableRows(latestData?.sellingPoints, currentData?.sellingPoints);
+  const testItems = mergeEditableRows(latestData?.testItems, currentData?.testItems);
+  const referenceLinks = uniqueStrings(latestData?.referenceLinks, currentData?.referenceLinks);
+  return {
+    ...(latestData || {}),
+    ...(currentData || {}),
+    sellingPoints,
+    testItems,
+    referenceLinks,
+    sellingPointImages: mergeFileMaps(latestData?.sellingPointImages, currentData?.sellingPointImages, sellingPoints),
+    testItemImages: mergeFileMaps(latestData?.testItemImages, currentData?.testItemImages, testItems),
+    sellingPointAuthors: { ...(latestData?.sellingPointAuthors || {}), ...(currentData?.sellingPointAuthors || {}) },
+    sellingPointEditors: { ...(latestData?.sellingPointEditors || {}), ...(currentData?.sellingPointEditors || {}) },
+    testItemAuthors: { ...(latestData?.testItemAuthors || {}), ...(currentData?.testItemAuthors || {}) },
+    testItemEditors: { ...(latestData?.testItemEditors || {}), ...(currentData?.testItemEditors || {}) },
+  };
+}
+
+function sellingSyncKey(data: any) {
+  return JSON.stringify({
+    sellingPoints: data?.sellingPoints || [],
+    sellingPointImages: data?.sellingPointImages || {},
+    testItems: data?.testItems || [],
+    testItemImages: data?.testItemImages || {},
+    referenceLinks: data?.referenceLinks || [],
+    editLocks: data?.editLocks || {},
+  });
+}
+
+function compactHistoryValue(value: any): any {
+  if (typeof value === 'string') {
+    if (/^data:/i.test(value) || value.length > 200000) return '[large value omitted]';
+    return value;
+  }
+  if (Array.isArray(value)) return value.slice(0, 20).map(compactHistoryValue);
+  if (value && typeof value === 'object') {
+    const result: Record<string, any> = {};
+    Object.entries(value).forEach(([key, item]) => {
+      if (key === 'snapshot' || key === 'history') return;
+      result[key] = compactHistoryValue(item);
+    });
+    return result;
+  }
+  return value;
+}
+
+function compactNewDevDataForSave(data: any) {
+  const nextData = data && typeof data === 'object' && !Array.isArray(data) ? { ...data } : {};
+  if (Array.isArray(nextData.history)) {
+    nextData.history = nextData.history.slice(-80).map((entry: any) => {
+      const compact = entry && typeof entry === 'object' ? { ...entry } : {};
+      delete compact.snapshot;
+      if (Array.isArray(compact.changes)) {
+        compact.changes = compact.changes.slice(-30).map((change: any) => ({
+          ...change,
+          from: compactHistoryValue(change?.from),
+          to: compactHistoryValue(change?.to),
+        }));
+      }
+      return compact;
+    });
+  }
+  return nextData;
+}
+
+function compactNewDevProjectForSave(project: NewDevProject): NewDevProject {
+  return { ...project, data: compactNewDevDataForSave(project.data || {}) };
+}
+
+const inputCls = 'w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-sky-500';
+const lightInputCls = 'w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:ring-2 focus:ring-sky-500';
+const emptyDraft = { title: '', alias: '', barcode: '', standard: '', brandId: '', spec: '' };
+
+const dataLabels: Record<string, string> = {
+  initiationSellingPoints: '绔嬮」鍗栫偣',
+  sellingPoints: '鍗栫偣淇℃伅',
+  testItems: '闇€瑕佹娴嬮」鐩?,
+  feasibleTestItems: '鍙仛妫€娴嬮」鐩?,
+  purchaseReview: '閲囪喘瀹℃牳璇存槑',
+  copywritingConfirm: '鏂囨鍜屾娴嬮」鐩‘璁?,
+  packagingSourceFiles: '鍖呰婧愭枃浠?,
+  packagingPreviewImages: '鍖呰棰勮鍥?,
+  whiteBackgroundImages: '鐧藉簳鍥?,
+  assignedDesigner: '鎸囧畾璁捐',
+  designSelfCheck: '鑷垜瀹℃牳鎻愮ず璇?,
+  mainDetailSourceFiles: '涓诲浘璇︽儏婧愭枃浠?,
+  skuImages: 'SKU 鍥?,
+  mainImages: '涓诲浘',
+  detailImages: '璇︽儏椤?,
+  leaderReviewComment: '缁勯暱瀹℃牳鎰忚',
+  leaderRejectText: '缁勯暱閫€鍥炰慨鏀瑰唴瀹?,
+  leaderRejectImages: '缁勯暱閫€鍥炲浘鐗?,
+  opsReviewComment: '杩愯惀瀹℃牳鎰忚',
+  opsRejectText: '杩愯惀閫€鍥炰慨鏀瑰唴瀹?,
+  opsRejectImages: '杩愯惀閫€鍥炲浘鐗?,
+};
+
+function joinList(values: string[] | undefined) {
+  return (values || []).filter(Boolean).join('銆?);
+}
+
+function formatDate(value: string | null | undefined) {
+  if (!value) return '-';
+  return new Date(value).toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatRemaining(dueAt: string | null) {
+  if (!dueAt) return '涓嶉檺鏃?;
+  const ms = new Date(dueAt).getTime() - Date.now();
+  if (ms <= 0) return '宸茶秴鏃?;
+  const hours = Math.floor(ms / 36e5);
+  const mins = Math.floor((ms % 36e5) / 6e4);
+  return `${hours}灏忔椂 ${mins}鍒嗛挓`;
+}
+
+function updateStep(steps: StepConfig[], stepKey: string, patch: Partial<StepConfig>) {
+  return steps.map(step => (step.stepKey === stepKey ? { ...step, ...patch } : step));
+}
+
+function toggleValue(list: string[], value: string) {
+  return list.includes(value) ? list.filter(item => item !== value) : [...list, value];
+}
+
+function safePathName(value: string) {
+  return (value || '鏈懡鍚嶆柊鍝?).replace(/[/\\:*?"<>|]/g, '_').trim() || '鏈懡鍚嶆柊鍝?;
+}
+
+function asArray(value: any): any[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function uploadSubPath(field: string, fallbackLabel: string) {
+  const map: Record<string, string> = {
+    packagingSourceFiles: '浜у搧鍥剧墖/鍖呰/瀹氱婧愭枃浠?,
+    packagingPreviewImages: '浜у搧鍥剧墖/鍖呰/瀹氱婧愭枃浠?,
+    whiteBackgroundImages: '浜у搧鍥剧墖/鐧藉簳鍥?,
+    mainDetailSourceFiles: '浜у搧鍥剧墖/PSD婧愭枃浠?,
+    skuImages: '浜у搧鍥剧墖/SKU',
+    mainImages: '浜у搧鍥剧墖/涓诲浘',
+    detailImages: '浜у搧鍥剧墖/璇︽儏椤?,
+  };
+  return map[field] || fallbackLabel;
+}
+
+function clipboardImageFiles(clipboardData?: DataTransfer | null): File[] {
+  const files = Array.from(clipboardData?.files || []) as File[];
+  const imageFiles = files.filter(file => file.type.startsWith('image/'));
+  if (imageFiles.length) return imageFiles.map((file, index) => normalizeClipboardImageFile(file, index));
+
+  return (Array.from(clipboardData?.items || []) as DataTransferItem[])
+    .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+    .map(item => item.getAsFile())
+    .filter((file): file is File => !!file)
+    .map((file, index) => normalizeClipboardImageFile(file, index));
+}
+
+function normalizeClipboardImageFile(file: File, index: number): File {
+  if (file.name) return file;
+  const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+  return new File([file], `clipboard-${Date.now()}-${index + 1}.${ext}`, { type: file.type || 'image/png' });
+}
+
+async function cloneClipboardImageFiles(files: File[]): Promise<File[]> {
+  return Promise.all(files.map(async (file, index) => {
+    const normalized = normalizeClipboardImageFile(file, index);
+    const buffer = await normalized.arrayBuffer();
+    return new File([buffer], normalized.name, {
+      type: normalized.type || 'image/png',
+      lastModified: Date.now(),
+    });
+  }));
+}
+
+function buildPackagingConfirmPreview(data: any) {
+  const sellingPoints = asArray(data?.sellingPoints).filter(Boolean);
+  const purchaseItems = asArray(data?.purchaseItems);
+  const passed = purchaseItems.filter((item: any) => item?.status !== 'fail').map((item: any) => item.name).filter(Boolean);
+  const fallbackTests = asArray(data?.testItems).filter(Boolean);
+  return [
+    '鍗栫偣淇℃伅锛?,
+    sellingPoints.length ? sellingPoints.map((item, idx) => `${idx + 1}. ${item}`).join('\n') : '鏃?,
+    '',
+    '纭鍙仛妫€娴嬮」鐩細',
+    (passed.length ? passed : fallbackTests).length ? (passed.length ? passed : fallbackTests).map((item, idx) => `${idx + 1}. ${item}`).join('\n') : '鏃?,
+  ].join('\n');
+}
+
+function buildCollaborativeImageGroups(data: any, type: 'selling' | 'test') {
+  const isSelling = type === 'selling';
+  const list = asArray(isSelling ? data?.sellingPoints : data?.testItems).filter(Boolean);
+  const imageMap = isSelling ? data?.sellingPointImages : data?.testItemImages;
+  const authors = isSelling ? data?.sellingPointAuthors : data?.testItemAuthors;
+  const editors = isSelling ? data?.sellingPointEditors : data?.testItemEditors;
+  return list
+    .map((text: string) => ({
+      text,
+      author: authors?.[text] || '-',
+      editor: editors?.[text] || authors?.[text] || '-',
+      files: asArray(imageMap?.[text]).filter((file: any) => file?.path || file?.name),
+    }))
+    .filter((item: any) => item.files.length);
+}
+
+function thumbnailUrl(path: string, token?: string) {
+  const query = `path=${encodeURIComponent(String(path || '').replace(/\\/g, '/'))}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+  return `${API_BASE}/thumbnail?${query}`;
+}
+
+export default function NewDevelopmentSystem({ theme, user, isActive = true, openTarget, onOpenTargetHandled }: { theme: 'dark' | 'light'; user: User; isActive?: boolean; openTarget?: { projectId: number; stepKey?: string } | null; onOpenTargetHandled?: () => void }) {
+  const [projects, setProjects] = useState<NewDevProject[]>([]);
+  const [steps, setSteps] = useState<StepConfig[]>([]);
+  const [users, setUsers] = useState<ManagedUser[]>([]);
+  const [brands, setBrands] = useState<BrandOption[]>([]);
+  const [opsRotation, setOpsRotation] = useState<OpsRotation>({ usernames: [], currentIndex: 0, currentUsername: '', weekKey: '' });
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [draft, setDraft] = useState(emptyDraft);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showFlowHistory, setShowFlowHistory] = useState(false);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [savingProject, setSavingProject] = useState(false);
+  const [advancingProject, setAdvancingProject] = useState(false);
+  const [rejectingProject, setRejectingProject] = useState(false);
+  const [deletingProjectId, setDeletingProjectId] = useState<number | null>(null);
+  const [uploadingField, setUploadingField] = useState<string | null>(null);
+  const [transferringProject, setTransferringProject] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [tick, setTick] = useState(0);
+  const [selectedDraft, setSelectedDraft] = useState<NewDevProject | null>(null);
+  const [viewingStepKey, setViewingStepKey] = useState<string | null>(null);
+  const projectsRef = useRef<NewDevProject[]>([]);
+  const selectedRef = useRef<NewDevProject | null>(null);
+  const autoSaveTimerRef = useRef<number | null>(null);
+  const lastAutoSavedKeyRef = useRef('');
+  const skipNextAutoSaveRef = useRef(false);
+
+  const canManage = user.username === '浠诲皬闆? || !!user.permissions.canManageNewDevelopment || !!user.permissions.canManageUsers;
+  const cls = theme === 'dark' ? inputCls : lightInputCls;
+  const panel = theme === 'dark' ? 'bg-slate-900 border-slate-800 text-slate-100' : 'bg-white border-slate-200 text-slate-900';
+  const subtlePanel = theme === 'dark' ? 'bg-slate-950/50 border-slate-800' : 'bg-slate-50 border-slate-200';
+  const muted = theme === 'dark' ? 'text-slate-400' : 'text-slate-500';
+  const selectedFromList = useMemo(() => projects.find(p => p.id === selectedId) || null, [projects, selectedId]);
+  const selected = selectedDraft || selectedFromList;
+  projectsRef.current = projects;
+  selectedRef.current = selected;
+  const isNewProjectDraft = !!selected && selected.id <= 0;
+  const departments = useMemo(() => [...new Set(users.map(u => u.role).filter(Boolean))], [users]);
+
+  const api = useCallback(async (url: string, init?: RequestInit) => {
+    const res = await fetch(`${API_BASE}${url}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${user.token}`,
+        ...(init?.headers || {}),
+      },
+    });
+    const text = await res.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (_) {
+      data = { error: text };
+    }
+    if (!res.ok) throw new Error(data.error || `璇锋眰澶辫触 (${res.status})`);
+    return data;
+  }, [user.token]);
+
+  const refresh = useCallback(async () => {
+    const [meta, list] = await Promise.all([api('/newdev/meta'), api('/newdev/projects')]);
+    setSteps(meta.steps || []);
+    setUsers((meta.users || []).map((u: any) => ({ username: u.username, role: u.role || '鏈垎閮ㄩ棬' })));
+    setOpsRotation(meta.opsRotation || { usernames: [], currentIndex: 0, currentUsername: '', weekKey: '' });
+    setBrands(meta.brands || []);
+    setProjects(list || []);
+  }, [api]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setTick(v => v + 1), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!isActive) return;
+    setInitialLoading(true);
+    refresh()
+      .catch(err => alert(err.message))
+      .finally(() => setInitialLoading(false));
+  }, [isActive, refresh]);
+
+  useEffect(() => {
+    skipNextAutoSaveRef.current = true;
+    setSelectedDraft(current => {
+      if (!selectedFromList) return null;
+      if (current?.id === selectedFromList.id && current.currentStepKey === 'selling' && selectedFromList.currentStepKey === 'selling') {
+        const currentKey = sellingSyncKey(current.data);
+        if (currentKey === lastAutoSavedKeyRef.current) {
+          lastAutoSavedKeyRef.current = sellingSyncKey(selectedFromList.data);
+          return { ...selectedFromList, data: { ...(selectedFromList.data || {}) } };
+        }
+        return {
+          ...selectedFromList,
+          data: mergeSellingDraftData(selectedFromList.data, current.data),
+        };
+      }
+      return { ...selectedFromList, data: { ...(selectedFromList.data || {}) } };
+    });
+  }, [selectedFromList]);
+
+  useEffect(() => {
+    setViewingStepKey(prev => prev || selected?.currentStepKey || null);
+  }, [selected?.id, selected?.currentStepKey]);
+
+  useEffect(() => {
+    if (!openTarget?.projectId) return;
+    setSelectedId(openTarget.projectId);
+    setViewingStepKey(openTarget.stepKey || null);
+    onOpenTargetHandled?.();
+  }, [openTarget?.projectId, openTarget?.stepKey, onOpenTargetHandled]);
+
+  useEffect(() => {
+    if (!selectedId || selectedId <= 0 || selected) return;
+    refresh().catch(() => {});
+  }, [selectedId, selected, refresh]);
+
+  const updateSelected = (patch: Partial<NewDevProject>) => {
+    if (!selected) return;
+    setSelectedDraft(prev => prev ? { ...prev, ...patch } : { ...selected, ...patch });
+  };
+
+  const updateData = (field: string, value: any) => {
+    if (!selected) return;
+    updateSelected({ data: { ...(selected.data || {}), [field]: value } });
+  };
+
+  const setSelectedData = (patch: Record<string, any>) => {
+    if (!selected) return;
+    updateSelected({ data: { ...(selected.data || {}), ...patch } });
+  };
+
+  const refreshProjectsOnly = useCallback(async () => {
+    const list = await api('/newdev/projects');
+    if (!Array.isArray(list)) return;
+    skipNextAutoSaveRef.current = true;
+    setProjects(list);
+    setSelectedDraft(current => {
+      if (!current || current.id <= 0) return current;
+      const latest = list.find((item: NewDevProject) => item.id === current.id);
+      if (!latest) return current;
+      if (latest.currentStepKey !== 'selling' || current.currentStepKey !== 'selling') return latest;
+      const currentKey = sellingSyncKey(current.data);
+      if (currentKey === lastAutoSavedKeyRef.current) {
+        lastAutoSavedKeyRef.current = sellingSyncKey(latest.data);
+        return latest;
+      }
+      return { ...latest, data: mergeSellingDraftData(latest.data, current.data) };
+    });
+  }, [api]);
+
+  const startNewProject = () => {
+    const now = new Date().toISOString();
+    setViewingStepKey('initiation');
+    setSelectedId(0);
+    setSelectedDraft({
+      id: 0,
+      title: '',
+      barcode: '',
+      standard: '',
+      brand: '',
+      spec: '',
+      currentStepKey: 'initiation',
+      dueAt: null,
+      data: { alias: '', brandId: '' },
+      createdBy: user.username,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      assignees: [],
+    });
+  };
+
+  const createProject = async (project: NewDevProject) => {
+    if (creatingProject) return;
+    if (!project.title.trim()) return alert('璇峰～鍐欎骇鍝佸悕绉?);
+    setCreatingProject(true);
+    try {
+      const brand = brands.find(b => String(b.id) === String(project.data?.brandId));
+      const created = await api('/newdev/projects', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: project.title,
+          alias: project.data?.alias || '',
+          barcode: project.barcode,
+          standard: project.standard,
+          brandId: project.data?.brandId || '',
+          brand: brand?.name || project.brand || '',
+          spec: project.spec,
+          data: compactNewDevDataForSave(project.data || {}),
+        }),
+      });
+      setDraft(emptyDraft);
+      await refresh();
+      setSelectedId(created.id);
+      return created as NewDevProject;
+    } catch (err: any) {
+      alert(err.message || '鍒涘缓澶辫触');
+      return null;
+    } finally {
+      setCreatingProject(false);
+    }
+  };
+
+  const saveProject = async (project: NewDevProject) => {
+    if (savingProject) return;
+    setSavingProject(true);
+    try {
+      const projectToSave = compactNewDevProjectForSave(project);
+      if (project.id <= 0) {
+        await createProject(projectToSave);
+      } else {
+        await api(`/newdev/projects/${project.id}`, { method: 'PUT', body: JSON.stringify(projectToSave) });
+        await refresh();
+      }
+    } catch (err: any) {
+      alert(err.message || '淇濆瓨澶辫触');
+    } finally {
+      setSavingProject(false);
+    }
+  };
+
+  useEffect(() => {
+    const current = selected;
+    if (!isActive || !current || current.id <= 0 || current.currentStepKey !== 'selling') return;
+    const dataKey = sellingSyncKey(current.data);
+    if (skipNextAutoSaveRef.current) {
+      skipNextAutoSaveRef.current = false;
+      lastAutoSavedKeyRef.current = dataKey;
+      return;
+    }
+    if (dataKey === lastAutoSavedKeyRef.current) return;
+    if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = window.setTimeout(async () => {
+      const latest = selectedRef.current;
+      if (!latest || latest.id <= 0 || latest.currentStepKey !== 'selling') return;
+      try {
+        await api(`/newdev/projects/${latest.id}`, { method: 'PUT', body: JSON.stringify(compactNewDevProjectForSave(latest)) });
+        lastAutoSavedKeyRef.current = dataKey;
+        await refreshProjectsOnly();
+      } catch (_) {}
+    }, 900);
+    return () => {
+      if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
+    };
+  }, [
+    selected?.id,
+    selected?.currentStepKey,
+    selected?.data?.sellingPoints,
+    selected?.data?.sellingPointImages,
+    selected?.data?.testItems,
+    selected?.data?.testItemImages,
+    selected?.data?.referenceLinks,
+    selected?.data?.editLocks,
+    isActive,
+    api,
+    refreshProjectsOnly,
+  ]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const state = await api('/newdev/projects/sync-state');
+        if (!Array.isArray(state)) return;
+        const current = projectsRef.current;
+        const stateKey = state.map((item: any) => `${item.id}:${item.currentStepKey}:${item.updatedAt}:${item.completedAt || ''}`).join('|');
+        const currentKey = current.map(item => `${item.id}:${item.currentStepKey}:${item.updatedAt}:${item.completedAt || ''}`).join('|');
+        if (stateKey !== currentKey) await refreshProjectsOnly();
+      } catch (_) {}
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [isActive, api, refreshProjectsOnly]);
+
+  const validateBeforeAdvance = (project: NewDevProject) => {
+    if (project.currentStepKey === 'packaging' && !asArray(project.data?.whiteBackgroundImages).length) {
+      alert('鍖呰璁捐闃舵鑷冲皯瑕佷笂浼犱竴寮犵櫧搴曞浘锛屾墠鑳芥彁浜や笅涓€姝ャ€?);
+      return false;
+    }
+    if (project.currentStepKey === 'mainDetail') {
+      if (!asArray(project.data?.skuImages).length || !asArray(project.data?.mainImages).length || !asArray(project.data?.detailImages).length) {
+        alert('涓诲浘璇︽儏椤佃璁￠樁娈甸渶瑕佷笂浼?SKU 鍥俱€佷富鍥惧拰璇︽儏椤靛悗鎵嶈兘鎻愪氦銆?);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const advanceProject = async (project: NewDevProject) => {
+    if (advancingProject || !validateBeforeAdvance(project)) return;
+    setAdvancingProject(true);
+    let targetProject = project;
+    try {
+      if (targetProject.id <= 0) {
+        const created = await createProject(targetProject);
+        if (!created) return;
+        targetProject = { ...targetProject, ...created, data: { ...(created.data || {}), ...(targetProject.data || {}) } };
+      }
+      const currentIndex = steps.findIndex(s => s.stepKey === targetProject.currentStepKey);
+      const nextStep = currentIndex >= 0 ? steps[currentIndex + 1] : null;
+      await api(`/newdev/projects/${targetProject.id}/advance`, {
+        method: 'POST',
+        body: JSON.stringify({ data: compactNewDevDataForSave(targetProject.data || {}), ...(nextStep?.stepKey === 'done' ? { stepKey: 'done' } : {}) }),
+      });
+      if (targetProject.currentStepKey === 'purchase') {
+        const items = asArray(targetProject.data?.purchaseItems);
+        const passed = items.filter((item: any) => item.status !== 'fail').map((item: any) => item.name).filter(Boolean);
+        const failed = items.filter((item: any) => item.status === 'fail').map((item: any) => item.name).filter(Boolean);
+        await api(`/newdev/projects/${targetProject.id}/broadcast`, {
+          method: 'POST',
+          body: JSON.stringify({
+            title: `閲囪喘瀹℃牳瀹屾垚锛?{targetProject.title}`,
+            message: `鍙仛椤圭洰锛?{passed.join('銆?) || '鏃?}\n涓嶅彲鍋氶」鐩細${failed.join('銆?) || '鏃?}`,
+          }),
+        });
+      }
+      await refresh();
+    } catch (err: any) {
+      alert(err.message || '鎻愪氦澶辫触');
+    } finally {
+      setAdvancingProject(false);
+    }
+  };
+
+  const rejectProject = async (project: NewDevProject, targetStepKey: string) => {
+    if (rejectingProject) return;
+    setRejectingProject(true);
+    try {
+      await api(`/newdev/projects/${project.id}/reject`, {
+        method: 'POST',
+        body: JSON.stringify({ targetStepKey, data: compactNewDevDataForSave(project.data || {}) }),
+      });
+      await refresh();
+    } catch (err: any) {
+      alert(err.message || '閫€鍥炲け璐?);
+    } finally {
+      setRejectingProject(false);
+    }
+  };
+
+  const transferProject = async (project: NewDevProject, assignee: string) => {
+    if (!assignee || transferringProject) return;
+    setTransferringProject(true);
+    try {
+      await api(`/newdev/projects/${project.id}/transfer`, { method: 'POST', body: JSON.stringify({ assignee }) });
+      await refresh();
+      alert(`宸茶浆浜ょ粰 ${assignee}`);
+    } catch (err: any) {
+      alert(err.message || '杞氦澶辫触');
+    } finally {
+      setTransferringProject(false);
+    }
+  };
+
+  const deleteProject = async (project: NewDevProject) => {
+    if (!canManage || deletingProjectId) return;
+    if (!confirm(`纭畾瑕佸垹闄ゆ柊鍝佽褰曘€?{project.title}銆嶅悧锛熷垹闄ゅ悗涓嶅彲鎭㈠銆俙)) return;
+    setDeletingProjectId(project.id);
+    try {
+      await api(`/newdev/projects/${project.id}`, { method: 'DELETE' });
+      if (selectedId === project.id) setSelectedId(null);
+      await refresh();
+    } catch (err: any) {
+      alert(err.message || '鍒犻櫎澶辫触');
+    } finally {
+      setDeletingProjectId(null);
+    }
+  };
+
+  const uploadFiles = async (field: string, files: FileList | File[] | null) => {
+    const fileList = Array.from(files || []);
+    if (!selected || !fileList.length) return;
+    const nestedField = field.includes('::')
+      ? (() => {
+          const [parent, rawKey] = field.split('::');
+          return { parent, key: decodeURIComponent(rawKey || '') };
+        })()
+      : null;
+    setUploadingField(field);
+    try {
+      let uploadTarget = selected;
+      if (uploadTarget.id <= 0) {
+        const created = await createProject(uploadTarget);
+        if (!created) return;
+        uploadTarget = { ...uploadTarget, ...created, data: { ...(created.data || {}), ...(uploadTarget.data || {}) } };
+      }
+      const formData = new FormData();
+      fileList.forEach((file, index) => formData.append('files', file, file.name || `upload-${Date.now()}-${index + 1}`));
+      const stepLabel = steps.find(s => s.stepKey === uploadTarget.currentStepKey)?.label || uploadTarget.currentStepKey;
+      const fieldFolder = nestedField
+        ? `${stepLabel}/${dataLabels[nestedField.parent] || nestedField.parent}/${nestedField.key || '鏈懡鍚?}/鍥剧墖`
+        : uploadSubPath(field, `${stepLabel}/${dataLabels[field] || field}`);
+      formData.append('path', `${uploadTarget.data?.productFolderPath || `鏂板搧寮€鍙?${safePathName(uploadTarget.title)}`}/${fieldFolder.split('/').map(safePathName).join('/')}`);
+      formData.append('conflictStrategy', 'rename');
+      let res: Response;
+      const uploadController = new AbortController();
+      const uploadTimeout = window.setTimeout(() => uploadController.abort(), 300000);
+      try {
+        res = await fetch(`${API_BASE}/upload`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${user.token}` },
+          body: formData,
+          signal: uploadController.signal,
+        });
+      } catch (networkErr: any) {
+        const message = networkErr?.name === 'AbortError'
+          ? '涓婁紶瓒呮椂锛岃妫€鏌ョ綉缁滄垨鏂囦欢澶у皬'
+          : (networkErr?.message || 'Failed to fetch');
+        throw new Error(`杩炴帴涓婁紶鏈嶅姟澶辫触锛?{message}銆傝纭鏈嶅姟绔凡鍚姩锛屽綋鍓嶅湴鍧€ ${window.location.origin} 鍙闂€俙);
+      } finally {
+        window.clearTimeout(uploadTimeout);
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '涓婁紶澶辫触');
+      setSelectedId(uploadTarget.id);
+      const nextData = nestedField
+        ? {
+            ...(uploadTarget.data || {}),
+            [nestedField.parent]: {
+              ...((uploadTarget.data || {})[nestedField.parent] || {}),
+              [nestedField.key]: [
+                ...asArray((uploadTarget.data || {})[nestedField.parent]?.[nestedField.key]),
+                ...(data.files || [])
+              ].slice(0, 3),
+            },
+            ...(nestedField.parent === 'sellingPointImages'
+              ? { sellingPointEditors: { ...((uploadTarget.data || {}).sellingPointEditors || {}), [nestedField.key]: user.username } }
+              : {}),
+            ...(nestedField.parent === 'testItemImages'
+              ? { testItemEditors: { ...((uploadTarget.data || {}).testItemEditors || {}), [nestedField.key]: user.username } }
+              : {}),
+          }
+        : { ...(uploadTarget.data || {}), [field]: [...asArray(uploadTarget.data?.[field]), ...(data.files || [])] };
+      setProjects(prev => prev.map(item => item.id === uploadTarget.id ? { ...item, data: nextData } : item));
+      updateSelected({ id: uploadTarget.id, data: nextData });
+    } catch (err: any) {
+      alert(err.message || '涓婁紶澶辫触');
+    } finally {
+      setUploadingField(null);
+    }
+  };
+
+  const removeUploadedFile = async (field: string, index: number) => {
+    if (!selected) return;
+    const nestedField = field.includes('::')
+      ? (() => {
+          const [parent, rawKey] = field.split('::');
+          return { parent, key: decodeURIComponent(rawKey || '') };
+        })()
+      : null;
+    const nextData = nestedField
+      ? {
+          ...(selected.data || {}),
+          [nestedField.parent]: {
+            ...((selected.data || {})[nestedField.parent] || {}),
+            [nestedField.key]: asArray((selected.data || {})[nestedField.parent]?.[nestedField.key]).filter((_, itemIndex) => itemIndex !== index),
+          },
+          ...(nestedField.parent === 'sellingPointImages'
+            ? { sellingPointEditors: { ...((selected.data || {}).sellingPointEditors || {}), [nestedField.key]: user.username } }
+            : {}),
+          ...(nestedField.parent === 'testItemImages'
+            ? { testItemEditors: { ...((selected.data || {}).testItemEditors || {}), [nestedField.key]: user.username } }
+            : {}),
+        }
+      : { ...(selected.data || {}), [field]: asArray(selected.data?.[field]).filter((_, itemIndex) => itemIndex !== index) };
+    const nextProject = { ...selected, data: nextData };
+    updateSelected(nextProject);
+    if (selected.id > 0) {
+      try {
+        await api(`/newdev/projects/${selected.id}`, { method: 'PUT', body: JSON.stringify(compactNewDevProjectForSave(nextProject)) });
+        setProjects(prev => prev.map(item => item.id === selected.id ? nextProject : item));
+      } catch (err: any) {
+        alert(err.message || '鍒犻櫎澶辫触');
+      }
+    }
+  };
+
+  useEffect(() => {
+    (window as any).__onNewDevFilesDropped = (field: string, files: File[] | FileList | null) => {
+      uploadFiles(field, files);
+    };
+    return () => {
+      delete (window as any).__onNewDevFilesDropped;
+    };
+  }, [uploadFiles]);
+
+  const saveSteps = async () => {
+    await api('/newdev/steps', { method: 'POST', body: JSON.stringify({ steps }) });
+    await refresh();
+    alert('娴佺▼璐熻矗浜哄拰鍊掕鏃惰缃凡淇濆瓨');
+  };
+
+  const saveOpsRotation = async (next: OpsRotation = opsRotation) => {
+    await api('/newdev/ops-rotation', {
+      method: 'POST',
+      body: JSON.stringify({ usernames: next.usernames, currentIndex: next.currentIndex }),
+    });
+    await refresh();
+    alert('杩愯惀杞€奸『搴忓凡淇濆瓨');
+  };
+
+  const currentStep = selected && !selected.completedAt ? steps.find(s => s.stepKey === selected.currentStepKey) : null;
+  const visibleStepKey = viewingStepKey || selected?.currentStepKey || 'initiation';
+  const visibleStep = steps.find(s => s.stepKey === visibleStepKey);
+  const visibleStepIndex = steps.findIndex(s => s.stepKey === visibleStepKey);
+  const currentStepIndex = selected?.completedAt ? steps.length : steps.findIndex(s => s.stepKey === selected?.currentStepKey);
+  const isViewingCurrentStep = !!selected && visibleStepKey === selected.currentStepKey && !selected.completedAt;
+  const selectedNeedsMe = !!selected && !selected.completedAt && selected.assignees.includes(user.username);
+  const isOpsUser = users.some(member => member.username === user.username && (/杩愯惀/.test(member.role || '') || /杩愯惀/.test(member.username || '')));
+  const isOpsSupplementStep = visibleStepKey === 'selling' || visibleStepKey === 'opsReview';
+  const canSupplementSelected = !!selected && isViewingCurrentStep && isOpsSupplementStep && isOpsUser;
+  const canEditSelected = !!selected && isViewingCurrentStep && (isNewProjectDraft || selectedNeedsMe || canManage || canSupplementSelected);
+  const canSubmitSelected = !!selected && isViewingCurrentStep && (isNewProjectDraft || selectedNeedsMe || canManage);
+  const busy = savingProject || advancingProject || rejectingProject;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className={`text-2xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>鏂板搧寮€鍙?/h2>
+          <p className={muted}>娴佹按绾垮伐浣滄祦锛氱珛椤广€佸崠鐐规娴嬨€侀噰璐鏍搞€佸寘瑁呰璁°€佷富鍥捐鎯呫€佺粍闀垮鏍搞€佽繍钀ュ鏍搞€?/p>
+        </div>
+        <div className="flex gap-2">
+          {canManage && (
+            <button onClick={() => setShowSettings(true)} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-sm font-bold text-white hover:bg-slate-600">
+              <Settings className="h-4 w-4" />
+              娴佺▼璁剧疆
+            </button>
+          )}
+          <button onClick={startNewProject} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500">
+            <Plus className="h-4 w-4" />
+            鏂板缓浜у搧
+          </button>
+        </div>
+      </div>
+
+      {selected ? (
+        <section className="space-y-5">
+          <button
+            type="button"
+            onClick={() => {
+              setSelectedId(null);
+              setSelectedDraft(null);
+              setViewingStepKey(null);
+            }}
+            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-bold ${theme === 'dark' ? 'border-slate-800 bg-slate-900 text-slate-200 hover:bg-slate-800' : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}
+          >
+            <ArrowLeft className="h-4 w-4" />
+            杩斿洖鏂板搧璁板綍
+          </button>
+
+          {selectedNeedsMe && (
+            <div className="rounded-xl border border-amber-400/50 bg-amber-400/10 p-4 text-amber-100">
+              <div className="font-bold">褰撳墠娴佺▼鍒颁簡浣犺礋璐ｇ殑姝ラ</div>
+              <div className="mt-1 text-sm text-amber-50/90">璇峰畬鎴愩€寋currentStep?.label || selected.currentStepKey}銆嶅悗鎻愪氦鍒颁笅涓€姝ャ€?/div>
+            </div>
+          )}
+
+          <div className={`rounded-xl border p-5 ${panel}`}>
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <h3 className="mt-1 text-xl font-bold">{selected.title}</h3>
+                <div className={`mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm ${muted}`}>
+                  <span>褰撳墠澶勭悊锛歿selected.completedAt ? '宸插畬鎴? : currentStep?.label || selected.currentStepKey}</span>
+                  {visibleStepKey !== selected.currentStepKey && <span>姝ｅ湪鏌ョ湅锛歿visibleStep?.label || visibleStepKey}锛堝彧璇伙級</span>}
+                  {isOpsSupplementStep && isViewingCurrentStep && opsRotation.currentUsername && <span>杩愯惀涓昏礋璐ｏ細{opsRotation.currentUsername}</span>}
+                  <span>褰撳墠宸ュ簭璐熻矗浜猴細<span className={selectedNeedsMe ? 'font-bold text-amber-300' : ''}>{selected.assignees.length ? selected.assignees.join('銆?) : '鏈缃?}</span></span>
+                  <span key={tick}>鍊掕鏃讹細{formatRemaining(selected.dueAt)}</span>
+                  <span>鍒涘缓锛歿selected.createdBy || '-'} / {formatDate(selected.createdAt)}</span>
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowFlowHistory(true)}
+                  className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-bold ${theme === 'dark' ? 'border-slate-700 bg-slate-800 text-slate-100 hover:bg-slate-700' : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}
+                >
+                  <History className="h-4 w-4" />
+                  娴佺▼璁板綍
+                </button>
+                <StatusBadge completed={!!selected.completedAt} overdue={!!selected.dueAt && new Date(selected.dueAt).getTime() < Date.now()} />
+              </div>
+            </div>
+
+            <div className="mt-5 border-t border-slate-800 pt-5">
+              <StepEditor
+                project={{ ...selected, currentStepKey: visibleStepKey }}
+                users={users}
+                brands={brands}
+                inputClassName={cls}
+                canEdit={canEditSelected}
+                theme={theme}
+                uploadingField={uploadingField}
+                transferringProject={transferringProject}
+                onProjectChange={updateSelected}
+                onDataChange={updateData}
+                onDataPatch={setSelectedData}
+                onUpload={uploadFiles}
+                onDeleteUpload={removeUploadedFile}
+                authToken={user.token}
+                currentUsername={user.username}
+                onTransfer={(assignee) => transferProject(selected, assignee)}
+              />
+
+              {!canEditSelected && (
+                <div className={`mt-4 rounded-lg border px-3 py-2 text-sm ${theme === 'dark' ? 'border-slate-800 bg-slate-950/60 text-slate-400' : 'border-slate-200 bg-slate-50 text-slate-500'}`}>
+                  {selected.completedAt
+                    ? '璇ユ柊鍝佹祦绋嬪凡瀹屾垚锛岃祫鏂欏彧鍙煡鐪嬨€?
+                    : visibleStepIndex >= 0 && visibleStepIndex < currentStepIndex
+                      ? '璇ラ樁娈靛凡纭瀹屾垚锛岃祫鏂欏彧鍙煡鐪嬨€?
+                      : visibleStepIndex > currentStepIndex
+                        ? '璇ラ樁娈佃繕鏈紑濮嬶紝璧勬枡鍙彲鏌ョ湅銆?
+                        : '褰撳墠璐﹀彿涓嶆槸璇ラ樁娈佃礋璐ｄ汉锛岃祫鏂欏彧鍙煡鐪嬨€?}
+                </div>
+              )}
+              {canEditSelected && canSupplementSelected && !canSubmitSelected && (
+                <div className={`mt-4 rounded-lg border px-3 py-2 text-sm ${theme === 'dark' ? 'border-amber-400/30 bg-amber-400/10 text-amber-100' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+                  浣犳槸杩愯惀閮ㄩ棬鎴愬憳锛屽彲浠ヨˉ鍏呭苟淇濆瓨鍐呭锛涙湰鍛ㄤ富璐熻矗浜恒€寋opsRotation.currentUsername || '鏈缃?}銆嶈礋璐ｆ渶缁堟彁浜?瀹℃牳銆?                </div>
+              )}
+
+              <div className="mt-5 flex flex-wrap justify-end gap-3">
+                {canEditSelected && (
+                  <button disabled={busy} onClick={() => saveProject(selected)} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-60">
+                    <Save className="h-4 w-4" />
+                    {savingProject ? '淇濆瓨涓?..' : '淇濆瓨'}
+                  </button>
+                )}
+                {canSubmitSelected && selected.currentStepKey === 'leaderReview' && (
+                  <button disabled={busy} onClick={() => rejectProject(selected, 'mainDetail')} className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-bold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-60">
+                    <RotateCcw className="h-4 w-4" />
+                    {rejectingProject ? '閫€鍥炰腑...' : '閫€鍥炶璁′慨鏀?}
+                  </button>
+                )}
+                {canSubmitSelected && selected.currentStepKey === 'opsReview' && (
+                  <button disabled={busy} onClick={() => rejectProject(selected, 'mainDetail')} className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-bold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-60">
+                    <RotateCcw className="h-4 w-4" />
+                    {rejectingProject ? '閫€鍥炰腑...' : '閫€鍥炶璁′慨鏀?}
+                  </button>
+                )}
+                {canSubmitSelected && !selected.completedAt && (
+                  <button disabled={busy} onClick={() => advanceProject(selected)} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60">
+                    <Check className="h-4 w-4" />
+                    {advancingProject ? '鎻愪氦涓?..' : selected.currentStepKey === 'opsReview' ? '瀹℃牳閫氳繃锛岀粨鏉熸祦绋? : selected.currentStepKey.includes('Review') ? '瀹℃牳閫氳繃锛屾彁浜や笅涓€姝? : '鎴戝凡瀹屾垚锛屾彁浜ゅ埌涓嬩竴姝?}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+      ) : (
+        <section className={`rounded-xl border p-4 ${panel}`}>
+          <div className="mb-4 flex items-center justify-between">
+            <h3 className="font-bold">鏂板搧璁板綍</h3>
+            <span className={`text-xs ${muted}`}>鍏?{projects.length} 涓?/span>
+          </div>
+          <div className="space-y-3">
+            {initialLoading ? (
+              <div className={`flex items-center justify-center gap-2 rounded-lg border p-8 text-center text-sm ${subtlePanel} ${muted}`}>
+                <Clock className="h-4 w-4 animate-spin" />
+                鍔犺浇涓?..
+              </div>
+            ) : projects.map(project => (
+              <div key={project.id}>
+                <ProjectListItem
+                  project={project}
+                  steps={steps}
+                  needsMe={project.assignees.includes(user.username) && !project.completedAt}
+                  onSelect={(stepKey) => {
+                    setViewingStepKey(stepKey || project.currentStepKey);
+                    setSelectedId(project.id);
+                  }}
+                  onDelete={canManage ? () => deleteProject(project) : undefined}
+                  deleting={deletingProjectId === project.id}
+                  theme={theme}
+                  tick={tick}
+                />
+              </div>
+            ))}
+            {!initialLoading && !projects.length && <div className={`rounded-lg border p-8 text-center text-sm ${subtlePanel} ${muted}`}>鏆傛棤鏂板搧寮€鍙戣褰?/div>}
+          </div>
+        </section>
+      )}
+      {selected && showFlowHistory && (
+        <FlowHistoryModal
+          project={selected}
+          history={Array.isArray(selected.data?.history) ? selected.data.history : []}
+          onClose={() => setShowFlowHistory(false)}
+          onJumpToStep={(stepKey) => {
+            setViewingStepKey(stepKey);
+            setShowFlowHistory(false);
+          }}
+          theme={theme}
+        />
+      )}
+
+      {showSettings && (
+        <Modal title="娴佺▼璐熻矗浜哄拰鍊掕鏃惰缃? onClose={() => setShowSettings(false)} theme={theme}>
+          <div className="space-y-4">
+            <OpsRotationEditor
+              users={users}
+              value={opsRotation}
+              onChange={setOpsRotation}
+              onSave={saveOpsRotation}
+              theme={theme}
+            />
+            {steps.filter(step => step.stepKey !== 'done').map((step, idx) => (
+              <div key={step.stepKey} className={`rounded-lg border p-4 ${subtlePanel}`}>
+                <div className="mb-3 font-bold">{idx + 1}. {step.label}</div>
+                <div className="grid gap-4">
+                  <TimeLimitEditor value={step.durationHours} onChange={durationHours => setSteps(prev => updateStep(prev, step.stepKey, { durationHours }))} inputClassName={cls} />
+                  <div className="grid gap-4 lg:grid-cols-2">
+                    <PeoplePicker
+                      title="姝ラ璐熻矗浜?
+                      users={users}
+                      departments={departments}
+                      selectedUsers={step.assigneeUsernames}
+                      selectedDepartments={step.assigneePositions}
+                      onUsersChange={assigneeUsernames => setSteps(prev => updateStep(prev, step.stepKey, { assigneeUsernames }))}
+                      onDepartmentsChange={assigneePositions => setSteps(prev => updateStep(prev, step.stepKey, { assigneePositions }))}
+                      theme={theme}
+                    />
+                    <div className="space-y-3">
+                      <label className="block text-sm font-semibold">
+                        鏈€鍚庡嚑灏忔椂缇ゅ彂鎻愰啋
+                        <input className={`${cls} mt-2`} type="number" min={0} value={step.escalationHours} onChange={e => setSteps(prev => updateStep(prev, step.stepKey, { escalationHours: Number(e.target.value) }))} placeholder="渚嬪 4" />
+                      </label>
+                      <PeoplePicker
+                        title="缇ゅ彂鎻愰啋瀵硅薄"
+                        users={users}
+                        departments={departments}
+                        selectedUsers={step.escalationUsernames}
+                        selectedDepartments={step.escalationPositions}
+                        onUsersChange={escalationUsernames => setSteps(prev => updateStep(prev, step.stepKey, { escalationUsernames }))}
+                        onDepartmentsChange={escalationPositions => setSteps(prev => updateStep(prev, step.stepKey, { escalationPositions }))}
+                        theme={theme}
+                        emptyHint="鐣欑┖鍒欓粯璁ょ兢鍙戝叏閮ㄤ汉"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+            <button onClick={saveSteps} className="w-full rounded-lg bg-sky-600 py-2 font-bold text-white hover:bg-sky-500">淇濆瓨娴佺▼璁剧疆</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function StepEditor({
+  project,
+  users,
+  brands,
+  inputClassName,
+  canEdit,
+  theme,
+  uploadingField,
+  transferringProject,
+  onProjectChange,
+  onDataChange,
+  onDataPatch,
+  onUpload,
+  onDeleteUpload,
+  authToken,
+  currentUsername,
+  onTransfer,
+}: {
+  project: NewDevProject;
+  users: ManagedUser[];
+  brands: BrandOption[];
+  inputClassName: string;
+  canEdit: boolean;
+  theme: 'dark' | 'light';
+  uploadingField: string | null;
+  transferringProject: boolean;
+  onProjectChange: (patch: Partial<NewDevProject>) => void;
+  onDataChange: (field: string, value: any) => void;
+  onDataPatch: (patch: Record<string, any>) => void;
+  onUpload: (field: string, files: FileList | File[] | null) => void;
+  onDeleteUpload: (field: string, index: number) => void;
+  authToken?: string;
+  currentUsername: string;
+  onTransfer: (assignee: string) => void;
+}) {
+  const data = project.data || {};
+  const fieldProps = { className: inputClassName, disabled: !canEdit };
+  const designers = [
+    ...users.filter(u => /璁捐/.test(u.role || '') || /璁捐/.test(u.username || '') || u.username === '浠诲皬闆?),
+    ...(users.some(u => u.username === '浠诲皬闆?) ? [] : [{ username: '浠诲皬闆?, role: '璁捐閮? }]),
+  ].filter((member, index, arr) => arr.findIndex(item => item.username === member.username) === index);
+
+  if (project.currentStepKey === 'selling') {
+    const initiationPoints = asArray(data.initiationSellingPoints).filter(Boolean);
+    const stampEditors = (nextList: string[], editorField: string, previousList: any[] = []) => {
+      const previous = previousList.map(item => String(item || ''));
+      const currentEditors = data[editorField] && typeof data[editorField] === 'object' ? data[editorField] : {};
+      const nextEditors: Record<string, string> = {};
+      nextList.forEach((item, index) => {
+        const text = String(item || '').trim();
+        if (!text) return;
+        nextEditors[text] = previous[index] === item && currentEditors[text] ? currentEditors[text] : currentUsername;
+      });
+      return nextEditors;
+    };
+    const moveImagesForEditedRows = (imageMap: any, previousList: any[], nextList: string[]) => {
+      const source = imageMap && typeof imageMap === 'object' && !Array.isArray(imageMap) ? imageMap : {};
+      const result: Record<string, any[]> = {};
+      nextList.forEach((item, index) => {
+        const text = String(item || '').trim();
+        if (!text) return;
+        const previousText = String(previousList[index] || '').trim();
+        result[text] = asArray(source[text] || source[previousText]).slice(0, 3);
+      });
+      return result;
+    };
+    const editLocks = data.editLocks && typeof data.editLocks === 'object' && !Array.isArray(data.editLocks) ? data.editLocks : {};
+    const updateEditLock = (lockKey: string, locked: boolean) => {
+      const nextLocks = { ...editLocks };
+      if (locked) {
+        nextLocks[lockKey] = { username: currentUsername, at: Date.now() };
+      } else if (nextLocks[lockKey]?.username === currentUsername) {
+        delete nextLocks[lockKey];
+      }
+      onDataPatch({ editLocks: nextLocks });
+    };
+    return (
+      <StepSection title="杩愯惀瀵绘壘鍗栫偣 / 妫€娴嬮」鐩?>
+        {!!initiationPoints.length && (
+          <div className={`rounded-lg border p-4 ${theme === 'dark' ? 'border-sky-500/30 bg-sky-500/10' : 'border-sky-200 bg-sky-50'}`}>
+            <div className="mb-2 text-sm font-bold text-sky-300">绔嬮」鍗栫偣鍙傝€?/div>
+            <div className="mb-2 text-xs text-slate-400">杩欓噷鐨勫唴瀹瑰彧缁欒繍钀ュ弬鑰冿紝涓嶄細鑷姩浼犲埌鍚庨潰锛涜繍钀ラ噰绾冲悗闇€瑕佸鍒跺苟閲嶆柊濉啓鍒颁笅闈㈢殑鍗栫偣淇℃伅銆?/div>
+            <div className="space-y-1 text-sm">
+              {initiationPoints.map((point, index) => (
+                <div key={`${point}-${index}`} className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1">{index + 1}. {point}</span>
+                  {!canEdit ? null : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = [...asArray(data.sellingPoints), point];
+                        onDataPatch({
+                          sellingPoints: next,
+                          sellingPointEditors: stampEditors(next, 'sellingPointEditors', asArray(data.sellingPoints)),
+                        });
+                      }}
+                      className="rounded-md bg-sky-600 px-2 py-1 text-xs font-bold text-white hover:bg-sky-500"
+                    >
+                      澶嶅埗
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <CollaborativeLineListEditor
+          label="鍗栫偣淇℃伅"
+          tone="selling"
+          value={asArray(data.sellingPoints)}
+          authors={data.sellingPointAuthors || {}}
+          editors={data.sellingPointEditors || {}}
+          imagesByText={data.sellingPointImages || {}}
+          imageFieldPrefix="sellingPointImages"
+          onChange={v => onDataPatch({
+            sellingPoints: v,
+            sellingPointImages: moveImagesForEditedRows(data.sellingPointImages, asArray(data.sellingPoints), v),
+            sellingPointEditors: stampEditors(v, 'sellingPointEditors', asArray(data.sellingPoints)),
+          })}
+          onUpload={onUpload}
+          onDeleteUpload={onDeleteUpload}
+          inputClassName={inputClassName}
+          disabled={!canEdit}
+          uploadingField={uploadingField}
+          currentUsername={currentUsername}
+          editLocks={editLocks}
+          onLockChange={updateEditLock}
+          placeholder="濉啓涓€涓崠鐐?
+        />
+        <CollaborativeLineListEditor
+          label="闇€瑕佹娴嬬殑椤圭洰"
+          tone="test"
+          value={asArray(data.testItems)}
+          authors={data.testItemAuthors || {}}
+          editors={data.testItemEditors || {}}
+          imagesByText={data.testItemImages || {}}
+          imageFieldPrefix="testItemImages"
+          onChange={v => onDataPatch({
+            testItems: v,
+            testItemImages: moveImagesForEditedRows(data.testItemImages, asArray(data.testItems), v),
+            testItemEditors: stampEditors(v, 'testItemEditors', asArray(data.testItems)),
+          })}
+          onUpload={onUpload}
+          onDeleteUpload={onDeleteUpload}
+          inputClassName={inputClassName}
+          disabled={!canEdit}
+          uploadingField={uploadingField}
+          currentUsername={currentUsername}
+          editLocks={editLocks}
+          onLockChange={updateEditLock}
+          placeholder="濉啓涓€涓娴嬮」鐩?
+        />
+        <LineListEditor label="鍙傝€冮摼鎺? value={asArray(data.referenceLinks)} onChange={v => onDataChange('referenceLinks', v)} inputClassName={inputClassName} disabled={!canEdit} placeholder="绮樿创鍙傝€冮摼鎺? />
+      </StepSection>
+    );
+  }
+
+  if (project.currentStepKey === 'purchase') {
+    const sourceItems = asArray(data.purchaseItems).length
+      ? asArray(data.purchaseItems)
+      : asArray(data.testItems).map((name: any) => ({ name: String(name || ''), status: 'pending' }));
+    const setItem = (index: number, patch: any) => onDataChange('purchaseItems', sourceItems.map((item: any, i: number) => (i === index ? { ...item, ...patch } : item)));
+    return (
+      <StepSection title="閲囪喘瀹℃牳妫€娴嬮」鐩?>
+        <CollaborativeImageReviewSection title="閸楁牜鍋ｇ悰銉ュ帠閸ュ墽澧? groups={buildCollaborativeImageGroups(data, 'selling')} token={authToken} />
+        <CollaborativeImageReviewSection title="妫€娴嬮」鐩ˉ鍏呭浘鐗? groups={buildCollaborativeImageGroups(data, 'test')} token={authToken} />
+        <PurchaseReviewEditor items={sourceItems} disabled={!canEdit} inputClassName={inputClassName} onItemChange={setItem} onAdd={() => onDataChange('purchaseItems', [...sourceItems, { name: '', status: 'pending' }])} />
+        <TextArea label="閲囪喘瀹℃牳璇存槑" value={data.purchaseReview || ''} onChange={v => onDataChange('purchaseReview', v)} {...fieldProps} />
+      </StepSection>
+    );
+  }
+
+  if (project.currentStepKey === 'packaging') {
+    const packagingConfirm = data.copywritingConfirm || buildPackagingConfirmPreview(data);
+    return (
+      <StepSection title="鍖呰璁捐 / 鐧藉簳鍥?>
+        <label className="block text-sm font-semibold">
+          杞氦缁欏叾浠栬璁?          <select className={`${inputClassName} mt-2`} disabled={!canEdit || transferringProject} value="" onChange={e => e.target.value && onTransfer(e.target.value)}>
+            <option value="">{transferringProject ? '杞氦涓?..' : '閫夋嫨浜哄憳鍚庣珛鍗宠浆浜?}</option>
+            {designers.map(member => <option key={member.username} value={member.username}>{member.username} / {member.role}</option>)}
+          </select>
+        </label>
+        <TextArea label="纭鍚庣殑鏂囨鍜屾娴嬮」鐩? value={packagingConfirm} onChange={v => onDataChange('copywritingConfirm', v)} {...fieldProps} />
+        <CollaborativeImageReviewSection title="鍗栫偣琛ュ厖鍥剧墖" groups={buildCollaborativeImageGroups(data, 'selling')} token={authToken} />
+        <CollaborativeImageReviewSection title="妫€娴嬮」鐩ˉ鍏呭浘鐗? groups={buildCollaborativeImageGroups(data, 'test')} token={authToken} />
+        <FileUploader label="鍖呰璁捐婧愭枃浠? field="packagingSourceFiles" files={asArray(data.packagingSourceFiles)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+        <FileUploader label="鍖呰棰勮鍥? field="packagingPreviewImages" files={asArray(data.packagingPreviewImages)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+        <FileUploader label="鐧藉簳鍥撅紙鑷冲皯涓€寮狅紝鍙涓搴︼級" field="whiteBackgroundImages" files={asArray(data.whiteBackgroundImages)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+      </StepSection>
+    );
+  }
+
+  if (project.currentStepKey === 'mainDetail') {
+    return (
+      <StepSection title="涓诲浘璇︽儏椤佃璁?>
+        <label className="block text-sm font-semibold">
+          鎸囧畾璁捐
+          <select className={`${inputClassName} mt-2`} disabled={!canEdit || transferringProject} value="" onChange={e => e.target.value && onTransfer(e.target.value)}>
+            <option value="">{transferringProject ? '杞氦涓?..' : (data.transferredTo ? `褰撳墠锛?{data.transferredTo}` : '閫夋嫨浜哄憳鍚庣珛鍗宠浆浜?)}</option>
+            {designers.map(member => <option key={member.username} value={member.username}>{member.username} / {member.role}</option>)}
+          </select>
+        </label>
+        <label className="flex items-center gap-2 text-sm font-semibold">
+          <input type="checkbox" className="h-4 w-4 accent-sky-500" disabled={!canEdit} checked={!!data.designSelfCheckDone} onChange={e => onDataChange('designSelfCheckDone', e.target.checked)} />
+          宸插畬鎴愯嚜鎴戝鏍告彁绀鸿瘝妫€鏌?        </label>
+        <FileUploader label="婧愭枃浠? field="mainDetailSourceFiles" files={asArray(data.mainDetailSourceFiles)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+        <FileUploader label="SKU 鍥? field="skuImages" files={asArray(data.skuImages)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+        <FileUploader label="涓诲浘" field="mainImages" files={asArray(data.mainImages)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+        <FileUploader label="璇︽儏椤? hint="璇蜂笂浼犳暣寮犵殑璇︽儏椤碉紝涓嶈鍒囩墖銆? field="detailImages" files={asArray(data.detailImages)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+        {(data.leaderRejectText || asArray(data.leaderRejectImages).length || data.opsRejectText || asArray(data.opsRejectImages).length) && (
+          <div className={`rounded-lg border p-4 ${theme === 'dark' ? 'border-red-500/30 bg-red-500/10' : 'border-red-200 bg-red-50'}`}>
+            <div className="mb-2 text-sm font-bold text-red-300">閫€鍥炰慨鏀硅姹?/div>
+            {data.leaderRejectText && <p className="text-sm">缁勯暱锛歿data.leaderRejectText}</p>}
+            {data.opsRejectText && <p className="mt-2 text-sm">杩愯惀锛歿data.opsRejectText}</p>}
+          </div>
+        )}
+      </StepSection>
+    );
+  }
+
+  if (project.currentStepKey === 'leaderReview') {
+    return (
+      <StepSection title="缁勯暱瀹℃牳">
+        <ReviewUploads title="璁捐鎻愪氦鍐呭" data={data} token={authToken} />
+        <CollaborativeImageReviewSection title="鍗栫偣琛ュ厖鍥剧墖" groups={buildCollaborativeImageGroups(data, 'selling')} token={authToken} />
+        <CollaborativeImageReviewSection title="妫€娴嬮」鐩ˉ鍏呭浘鐗? groups={buildCollaborativeImageGroups(data, 'test')} token={authToken} />
+        <TextArea label="瀹℃牳鎰忚" value={data.leaderReviewComment || ''} onChange={v => onDataChange('leaderReviewComment', v)} {...fieldProps} />
+        <TextArea label="閫€鍥炰慨鏀瑰唴瀹癸紙鏈夐棶棰樻椂濉啓锛? value={data.leaderRejectText || ''} onChange={v => onDataChange('leaderRejectText', v)} {...fieldProps} />
+        <FileUploader label="閫€鍥炲弬鑰冨浘鐗? field="leaderRejectImages" files={asArray(data.leaderRejectImages)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+      </StepSection>
+    );
+  }
+
+  if (project.currentStepKey === 'opsReview') {
+    return (
+      <StepSection title="杩愯惀瀹℃牳">
+        <ReviewUploads title="璁捐鎻愪氦鍐呭" data={data} token={authToken} />
+        <CollaborativeImageReviewSection title="鍗栫偣琛ュ厖鍥剧墖" groups={buildCollaborativeImageGroups(data, 'selling')} token={authToken} />
+        <CollaborativeImageReviewSection title="妫€娴嬮」鐩ˉ鍏呭浘鐗? groups={buildCollaborativeImageGroups(data, 'test')} token={authToken} />
+        <TextArea label="瀹℃牳鎰忚" value={data.opsReviewComment || ''} onChange={v => onDataChange('opsReviewComment', v)} {...fieldProps} />
+        <TextArea label="閫€鍥炰慨鏀瑰唴瀹癸紙鏈夐棶棰樻椂濉啓锛? value={data.opsRejectText || ''} onChange={v => onDataChange('opsRejectText', v)} {...fieldProps} />
+        <FileUploader label="閫€鍥炲弬鑰冨浘鐗? field="opsRejectImages" files={asArray(data.opsRejectImages)} canEdit={canEdit} uploadingField={uploadingField} onUpload={onUpload} onDelete={onDeleteUpload} />
+      </StepSection>
+    );
+  }
+
+  return (
+    <StepSection title="绔嬮」淇℃伅">
+      <div className="grid gap-4 md:grid-cols-2">
+        <LabeledInput label="浜у搧鍚嶇О" value={project.title} onChange={value => onProjectChange({ title: value })} {...fieldProps} />
+        <LabeledInput label="鍒悕" value={data.alias || ''} onChange={value => onDataChange('alias', value)} {...fieldProps} />
+        <LabeledInput label="鏉＄爜" value={project.barcode} onChange={value => onProjectChange({ barcode: value })} {...fieldProps} />
+        <LabeledInput label="鎵ц鏍囧噯" value={project.standard} onChange={value => onProjectChange({ standard: value })} {...fieldProps} />
+        <label className="block text-sm font-semibold">
+          鍝佺墝
+          <select className={`${inputClassName} mt-2`} disabled={!canEdit} value={data.brandId || ''} onChange={e => {
+            const brand = brands.find(item => String(item.id) === String(e.target.value));
+            onDataChange('brandId', e.target.value);
+            onProjectChange({ brand: brand?.name || '' });
+          }}>
+            <option value="">璇烽€夋嫨鍝佺墝</option>
+            {brands.map(brand => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
+          </select>
+        </label>
+        <LabeledInput label="瑙勬牸" value={project.spec} onChange={value => onProjectChange({ spec: value })} {...fieldProps} />
+      </div>
+      <LineListEditor label="绔嬮」鍗栫偣" value={asArray(data.initiationSellingPoints)} onChange={v => onDataChange('initiationSellingPoints', v)} inputClassName={inputClassName} disabled={!canEdit} placeholder="濉啓涓€涓粰杩愯惀鍙傝€冪殑鍗栫偣" />
+    </StepSection>
+  );
+}
+
+function StepSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <h4 className="mb-4 font-bold">{title}</h4>
+      <div className="space-y-4">{children}</div>
+    </div>
+  );
+}
+
+function TextArea({ label, className, value, disabled, onChange }: { label: string; className: string; value: string; disabled?: boolean; onChange: (value: string) => void }) {
+  return (
+    <label className="block text-sm font-semibold">
+      {label}
+      <textarea className={`${className} mt-2 disabled:cursor-not-allowed disabled:opacity-60`} rows={5} value={value || ''} disabled={disabled} onChange={e => onChange(e.target.value)} />
+    </label>
+  );
+}
+
+function LineListEditor({ label, value, authors, onChange, inputClassName, disabled, placeholder }: { label: string; value: string[]; authors?: Record<string, string>; onChange: (value: string[]) => void; inputClassName: string; disabled?: boolean; placeholder?: string }) {
+  const rows = value.length ? value : [''];
+  const update = (index: number, next: string) => onChange(rows.map((row, i) => (i === index ? next : row)));
+  return (
+    <div>
+      <div className="mb-2 text-sm font-semibold">{label}</div>
+      <div className="space-y-2">
+        {rows.map((row, index) => (
+          <div key={index} className="flex gap-2">
+            <div className="min-w-0 flex-1">
+              <input className={inputClassName} disabled={disabled} value={row || ''} placeholder={placeholder} onChange={e => update(index, e.target.value)} />
+              {row && authors?.[row] && <div className="mt-1 text-xs text-slate-500">娣诲姞浜猴細{authors[row]}</div>}
+            </div>
+            {!disabled && (
+              <button type="button" onClick={() => onChange(rows.filter((_, i) => i !== index))} className="rounded-lg bg-slate-700 px-3 text-sm font-bold text-white hover:bg-slate-600">
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+      {!disabled && (
+        <button type="button" onClick={() => onChange([...rows, ''])} className="mt-2 inline-flex items-center gap-2 rounded-lg bg-sky-600 px-3 py-2 text-sm font-bold text-white hover:bg-sky-500">
+          <Plus className="h-4 w-4" />
+          澧炲姞涓€琛?        </button>
+      )}
+    </div>
+  );
+}
+
+function CollaborativeLineListEditor({
+  label,
+  tone,
+  value,
+  authors,
+  editors,
+  imagesByText,
+  imageFieldPrefix,
+  onChange,
+  onUpload,
+  onDeleteUpload,
+  inputClassName,
+  disabled,
+  uploadingField,
+  currentUsername,
+  editLocks,
+  onLockChange,
+  placeholder,
+}: {
+  label: string;
+  tone: 'selling' | 'test';
+  value: string[];
+  authors?: Record<string, string>;
+  editors?: Record<string, string>;
+  imagesByText?: Record<string, { name?: string; path?: string }[]>;
+  imageFieldPrefix: string;
+  onChange: (value: string[]) => void;
+  onUpload: (field: string, files: FileList | File[] | null) => void;
+  onDeleteUpload: (field: string, index: number) => void;
+  inputClassName: string;
+  disabled?: boolean;
+  uploadingField: string | null;
+  currentUsername: string;
+  editLocks?: Record<string, { username?: string; at?: number }>;
+  onLockChange?: (lockKey: string, locked: boolean) => void;
+  placeholder?: string;
+}) {
+  const colors = tone === 'selling'
+    ? {
+        shell: 'border-sky-500/35 bg-sky-500/8',
+        title: 'text-sky-200',
+        accent: 'bg-sky-500',
+        row: 'border-sky-500/20 bg-sky-950/30',
+        uploadIdle: 'border-sky-700 bg-sky-950/40 hover:border-sky-400',
+        uploadActive: 'border-sky-300 bg-sky-500/15 ring-2 ring-sky-300/40',
+        icon: 'text-sky-300',
+        hint: 'text-sky-300',
+        button: 'bg-sky-600 hover:bg-sky-500',
+      }
+    : {
+        shell: 'border-violet-500/35 bg-violet-500/8',
+        title: 'text-violet-200',
+        accent: 'bg-violet-500',
+        row: 'border-violet-500/20 bg-violet-950/30',
+        uploadIdle: 'border-violet-700 bg-violet-950/40 hover:border-violet-400',
+        uploadActive: 'border-violet-300 bg-violet-500/15 ring-2 ring-violet-300/40',
+        icon: 'text-violet-300',
+        hint: 'text-violet-300',
+        button: 'bg-violet-600 hover:bg-violet-500',
+      };
+  const valueRows = value.length ? value : [''];
+  const [localRows, setLocalRows] = useState<string[]>(valueRows);
+  const rows = localRows.length ? localRows : [''];
+  const update = (index: number, next: string) => {
+    const nextRows = rows.map((row, i) => (i === index ? next : row));
+    setLocalRows(nextRows);
+    onChange(nextRows);
+  };
+  const addRow = () => {
+    const nextRows = [...rows, ''];
+    const lockKey = `${imageFieldPrefix}:${nextRows.length - 1}`;
+    setLocalRows(nextRows);
+    onChange(nextRows);
+    onLockChange?.(lockKey, true);
+  };
+  const remove = (index: number) => {
+    const nextRows = rows.filter((_, i) => i !== index);
+    setLocalRows(nextRows.length ? nextRows : ['']);
+    onChange(nextRows);
+  };
+  const [draggingField, setDraggingField] = useState<string | null>(null);
+  const hoverUploadRef = useRef<{ field: string; text: string; remaining: number } | null>(null);
+
+  useEffect(() => {
+    setLocalRows(prev => {
+      const previous = prev.length ? prev : [''];
+      const known = new Set(valueRows.map(row => String(row || '').trim()).filter(Boolean));
+      const extraDraftRows = previous
+        .slice(valueRows.length)
+        .filter(row => {
+          const text = String(row || '').trim();
+          return !text || !known.has(text);
+        });
+      const nextRows = [...valueRows, ...extraDraftRows];
+      return nextRows.length ? nextRows : [''];
+    });
+  }, [imageFieldPrefix, value]);
+
+  useEffect(() => {
+    if (disabled) return;
+    const handlePaste = async (event: ClipboardEvent) => {
+      const target = hoverUploadRef.current;
+      if (!target?.text || target.remaining <= 0) return;
+      const pastedFiles = clipboardImageFiles(event.clipboardData);
+      if (!pastedFiles.length) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onUpload(target.field, await cloneClipboardImageFiles(pastedFiles.slice(0, target.remaining)));
+    };
+
+    window.addEventListener('paste', handlePaste, true);
+    return () => window.removeEventListener('paste', handlePaste, true);
+  }, [disabled, onUpload]);
+
+  return (
+    <div className={`rounded-xl border p-4 ${colors.shell}`}>
+      <div className={`mb-3 flex items-center gap-2 text-sm font-semibold ${colors.title}`}>
+        <span className={`h-2.5 w-2.5 rounded-full ${colors.accent}`} />
+        {label}
+      </div>
+      <div className="space-y-3">
+        {rows.map((row, index) => {
+          const text = String(row || '');
+          const files = asArray(imagesByText?.[text]).slice(0, 3);
+          const field = `${imageFieldPrefix}::${encodeURIComponent(text)}`;
+          const lockKey = `${imageFieldPrefix}:${index}`;
+          const lock = editLocks?.[lockKey];
+          const lockUser = String(lock?.username || '');
+          const lockedByOther = !!lockUser && lockUser !== currentUsername && Date.now() - Number(lock?.at || 0) < 120000;
+          const isDragging = draggingField === field;
+          return (
+            <div key={index} className={`grid gap-3 rounded-lg border p-3 md:grid-cols-[minmax(0,1fr)_220px] ${colors.row}`}>
+              <div className="min-w-0">
+                <div className="flex items-start gap-2">
+                  <input className={inputClassName} disabled={disabled || lockedByOther} value={text} placeholder={lockedByOther ? `${lockUser} 姝ｅ湪缂栬緫杩欎竴琛宍 : placeholder} onFocus={() => { if (!lockedByOther) onLockChange?.(lockKey, true); }} onBlur={() => onLockChange?.(lockKey, false)} onChange={e => update(index, e.target.value)} />
+                  {!disabled && !lockedByOther && (
+                    <button type="button" onClick={() => remove(index)} className="mt-1 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-600 text-white hover:bg-red-500" title="鍒犻櫎杩欎竴琛?>
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+                {text && (
+                  <div className="mt-1 text-xs text-slate-500">
+                    娣诲姞浜猴細{authors?.[text] || '-'} 路 鏈€鍚庣紪杈戯細{editors?.[text] || authors?.[text] || '-'}
+                  </div>
+                )}
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs font-bold text-slate-400">
+                  <span>琛ュ厖鍥剧墖 {files.length}/3</span>
+                </div>
+                {!disabled && !lockedByOther && (
+                  <label
+                    data-newdev-upload={field}
+                    onMouseEnter={() => {
+                      hoverUploadRef.current = { field, text, remaining: Math.max(0, 3 - files.length) };
+                    }}
+                    onMouseLeave={() => {
+                      if (hoverUploadRef.current?.field === field) hoverUploadRef.current = null;
+                    }}
+                    onDragEnter={e => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setDraggingField(field);
+                      (window as any).__newdevUploadDragActive = true;
+                    }}
+                    onDragLeave={e => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setDraggingField(current => (current === field ? null : current));
+                      window.setTimeout(() => { (window as any).__newdevUploadDragActive = false; }, 200);
+                    }}
+                    onDragOver={e => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setDraggingField(field);
+                      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+                    }}
+                    onDrop={e => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setDraggingField(null);
+                      (window as any).__newdevUploadDragActive = false;
+                      if (!text) return;
+                      onUpload(field, (Array.from(e.dataTransfer.files || []) as File[]).slice(0, Math.max(0, 3 - files.length)));
+                    }}
+                    onPaste={async e => {
+                      const pastedFiles = clipboardImageFiles(e.clipboardData);
+                      if (!pastedFiles.length || !text) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onUpload(field, await cloneClipboardImageFiles(pastedFiles.slice(0, Math.max(0, 3 - files.length))));
+                    }}
+                    tabIndex={0}
+                    className={`flex min-h-20 cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed p-3 text-center transition ${
+                      isDragging ? colors.uploadActive : colors.uploadIdle
+                    } ${(!text || files.length >= 3) ? 'cursor-not-allowed opacity-60' : ''}`}
+                  >
+                    <Plus className={`h-6 w-6 ${colors.icon}`} />
+                    <div className="mt-1 text-xs font-bold">{uploadingField === field ? '涓婁紶涓?..' : '鎷栧姩 / 绮樿创 / 鐐瑰嚮涓婁紶'}</div>
+                    <div className="mt-1 text-[11px] text-slate-500">{!text ? '璇峰厛濉啓杩欎竴琛屽唴瀹? : files.length >= 3 ? '鏈€澶氫笂浼?3 寮? : '鐢ㄥ浘鐗囪ˉ鍏呰繖鏉′俊鎭?}</div>
+                    {text && files.length < 3 && <div className={`mt-1 text-[11px] ${colors.hint}`}>榧犳爣绉诲姩鍒版鍐呭悗鎸?Ctrl+V 绮樿创鍥剧墖涓婁紶</div>}
+                    <input
+                      className="hidden"
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      disabled={!text || files.length >= 3 || uploadingField === field}
+                      onClick={e => e.stopPropagation()}
+                      onChange={e => {
+                        if (!text) return;
+                        onUpload(field, (Array.from(e.target.files || []) as File[]).slice(0, Math.max(0, 3 - files.length)));
+                        e.currentTarget.value = '';
+                      }}
+                    />
+                  </label>
+                )}
+                {uploadingField === field && <div className="text-xs text-sky-400">涓婁紶涓?..</div>}
+                <div className="grid grid-cols-3 gap-2">
+                  {files.map((file, fileIndex) => (
+                    <div key={`${file.path || file.name}-${fileIndex}`} className="relative aspect-square overflow-hidden rounded border border-slate-800 bg-slate-900">
+                      <ThumbnailImage src={`${API_BASE}/thumbnail?path=${encodeURIComponent(String(file.path || '').replace(/\\/g, '/'))}`} name={file.name || file.path || ''} className="h-full w-full object-cover" />
+                      {!disabled && (
+                        <button type="button" onClick={() => onDeleteUpload(field, fileIndex)} className="absolute right-1 top-1 rounded bg-red-600/90 p-0.5 text-white">
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {!disabled && (
+        <button type="button" onClick={addRow} className={`mt-3 inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-bold text-white ${colors.button}`}>
+          <Plus className="h-4 w-4" />
+          澧炲姞涓€琛?        </button>
+      )}
+    </div>
+  );
+}
+
+function PurchaseReviewEditor({ items, disabled, inputClassName, onItemChange, onAdd }: { items: any[]; disabled?: boolean; inputClassName: string; onItemChange: (index: number, patch: any) => void; onAdd: () => void }) {
+  const rows = items.length ? items : [{ name: '', status: 'pending' }];
+  return (
+    <div>
+      <div className="mb-2 text-sm font-semibold">妫€娴嬮」鐩鏍?/div>
+      <div className="space-y-2">
+        {rows.map((item, index) => (
+          <div key={index} className="grid gap-2 md:grid-cols-[1fr_auto]">
+            <input className={inputClassName} disabled={disabled} value={item.name || ''} placeholder="鍑嗙‘鐨勬娴嬮」鐩悕" onChange={e => onItemChange(index, { name: e.target.value })} />
+            <div className="flex gap-2">
+              <button type="button" disabled={disabled} onClick={() => onItemChange(index, { status: 'pass' })} className={`rounded-lg px-3 py-2 text-sm font-bold ${item.status === 'pass' ? 'bg-sky-600 text-white' : 'bg-slate-700 text-slate-300'} disabled:opacity-60`}>
+                <Check className="h-4 w-4" />
+              </button>
+              <button type="button" disabled={disabled} onClick={() => onItemChange(index, { status: 'fail' })} className={`rounded-lg px-3 py-2 text-sm font-bold ${item.status === 'fail' ? 'bg-red-600 text-white' : 'bg-slate-700 text-slate-300'} disabled:opacity-60`}>
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {!disabled && (
+        <button type="button" onClick={onAdd} className="mt-2 inline-flex items-center gap-2 rounded-lg bg-sky-600 px-3 py-2 text-sm font-bold text-white hover:bg-sky-500">
+          <Plus className="h-4 w-4" />
+          澧炲姞妫€娴嬮」鐩?        </button>
+      )}
+    </div>
+  );
+}
+
+function ReviewUploads({ title, data, token }: { title: string; data: Record<string, any>; token?: string }) {
+  const groups = [
+    { label: '婧愭枃浠?, files: asArray(data.mainDetailSourceFiles) },
+    { label: 'SKU 鍥?, files: asArray(data.skuImages) },
+    { label: '涓诲浘', files: asArray(data.mainImages) },
+    { label: '璇︽儏椤?, files: asArray(data.detailImages) },
+  ];
+  const hasFiles = groups.some(group => group.files.length);
+
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-4">
+      <div className="mb-3 text-sm font-bold">{title}</div>
+      {!hasFiles && <div className="text-sm text-slate-500">璁捐鏆傛湭涓婁紶鏂囦欢</div>}
+      <div className="space-y-4">
+        {groups.map(group => (
+          <div key={group.label}>
+            <div className="mb-2 text-xs font-bold text-slate-400">{group.label}</div>
+            {group.files.length ? (
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {group.files.map((file: any, index: number) => <ReviewFileCard key={`${file.path || file.name}-${index}`} file={file} token={token} />)}
+              </div>
+            ) : (
+              <div className="text-xs text-slate-600">鏆傛棤涓婁紶</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CollaborativeImageReviewSection({
+  title,
+  groups,
+  token,
+}: {
+  title: string;
+  groups: { text: string; author: string; editor: string; files: { name?: string; path?: string }[] }[];
+  token?: string;
+}) {
+  if (!groups.length) return null;
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-4">
+      <div className="mb-3 text-sm font-bold">{title}</div>
+      <div className="space-y-4">
+        {groups.map(group => (
+          <div key={group.text} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+            <div className="text-sm font-semibold text-slate-100">{group.text}</div>
+            <div className="mt-1 text-xs text-slate-500">娣诲姞浜猴細{group.author} 路 鏈€鍚庣紪杈戯細{group.editor}</div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {group.files.map((file, index) => (
+                <ReviewFileCard key={`${group.text}-${file.path || file.name}-${index}`} file={file} token={token} />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ThumbnailImage({ src, name, className }: { src: string; name: string; className?: string }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+  }, [src]);
+
+  if (!src || failed) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-slate-900">
+        <ImageIcon className="h-8 w-8 text-slate-500" />
+      </div>
+    );
+  }
+
+  return (
+    <img
+      src={src}
+      alt={name}
+      loading="lazy"
+      decoding="async"
+      onError={() => setFailed(true)}
+      className={className}
+    />
+  );
+}
+
+function ReviewFileCard({ file, token }: { file: { name?: string; path?: string }; token?: string; key?: React.Key }) {
+  const path = file.path || '';
+  const name = file.name || path || '鏂囦欢';
+  const isImage = /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
+  const query = `path=${encodeURIComponent(path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+  const previewUrl = path ? `${API_BASE}/thumbnail?${query}` : '';
+  const downloadUrl = path ? `${API_BASE}/download?${query}&inline=1` : '';
+
+  return (
+    <a
+      href={downloadUrl || undefined}
+      target="_blank"
+      rel="noreferrer"
+      onDoubleClick={async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const electron = (window as any).electron;
+        if (electron?.openFile && path) await electron.openFile(path, downloadUrl);
+      }}
+      className="group overflow-hidden rounded-lg border border-slate-800 bg-slate-950/70 text-sm text-slate-300 transition hover:border-sky-500/60"
+    >
+      <div className="flex aspect-video items-center justify-center bg-slate-900">
+        {isImage && previewUrl ? (
+          <ThumbnailImage src={previewUrl} name={name} className="h-full w-full object-contain" />
+        ) : (
+          <FileText className="h-8 w-8 text-slate-500 group-hover:text-sky-400" />
+        )}
+      </div>
+      <div className="flex items-center gap-2 px-3 py-2">
+        {isImage ? <ImageIcon className="h-4 w-4 shrink-0 text-sky-400" /> : <FileText className="h-4 w-4 shrink-0 text-slate-400" />}
+        <span className="min-w-0 truncate">{name}</span>
+      </div>
+    </a>
+  );
+}
+
+function FileUploader({
+  label,
+  hint,
+  field,
+  files,
+  canEdit,
+  uploadingField,
+  onUpload,
+  onDelete,
+}: {
+  label: string;
+  hint?: string;
+  field: string;
+  files: { name?: string; path?: string }[];
+  canEdit: boolean;
+  uploadingField: string | null;
+  onUpload: (field: string, files: FileList | File[] | null) => void;
+  onDelete: (field: string, index: number) => void;
+}) {
+  const uploading = uploadingField === field;
+  const [isDragging, setIsDragging] = useState(false);
+  const isHoveringRef = useRef(false);
+  const dropClass = isDragging
+    ? 'border-sky-400 bg-sky-500/15 ring-2 ring-sky-400/40'
+    : 'border-slate-700 bg-slate-950/60 hover:border-sky-500';
+
+  useEffect(() => {
+    if (!canEdit) return;
+    const handlePaste = async (event: ClipboardEvent) => {
+      if (!isHoveringRef.current || uploading) return;
+      const pastedFiles = clipboardImageFiles(event.clipboardData);
+      if (!pastedFiles.length) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onUpload(field, await cloneClipboardImageFiles(pastedFiles));
+    };
+
+    window.addEventListener('paste', handlePaste, true);
+    return () => window.removeEventListener('paste', handlePaste, true);
+  }, [canEdit, field, onUpload, uploading]);
+  return (
+    <div className="rounded-lg border border-slate-800 p-4">
+      <div className="mb-3 text-sm font-bold">{label}</div>
+      {hint && <div className="mb-3 text-xs font-medium text-amber-300">{hint}</div>}
+      {canEdit && (
+        <label
+          data-newdev-upload={field}
+          onMouseEnter={() => {
+            isHoveringRef.current = true;
+          }}
+          onMouseLeave={() => {
+            isHoveringRef.current = false;
+          }}
+          onDragEnter={e => {
+            e.preventDefault();
+            e.stopPropagation();
+            setIsDragging(true);
+            (window as any).__newdevUploadDragActive = true;
+          }}
+          onDragLeave={e => {
+            e.preventDefault();
+            e.stopPropagation();
+            setIsDragging(false);
+            window.setTimeout(() => { (window as any).__newdevUploadDragActive = false; }, 200);
+          }}
+          onDragOver={e => {
+            e.preventDefault();
+            e.stopPropagation();
+            setIsDragging(true);
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+          }}
+          onDrop={e => {
+            e.preventDefault();
+            e.stopPropagation();
+            setIsDragging(false);
+            (window as any).__newdevUploadDragActive = false;
+            onUpload(field, e.dataTransfer.files);
+          }}
+          onPaste={async e => {
+            const pastedFiles = clipboardImageFiles(e.clipboardData);
+            if (!pastedFiles.length) return;
+            e.preventDefault();
+            e.stopPropagation();
+            onUpload(field, await cloneClipboardImageFiles(pastedFiles));
+          }}
+          tabIndex={0}
+          className={`flex min-h-32 cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed p-5 text-center transition ${dropClass}`}
+        >
+          <Plus className="h-10 w-10 text-sky-400" />
+          <div className="mt-1 text-xs text-sky-300">榧犳爣绉诲姩鍒版鍐呭悗鎸?Ctrl+V 绮樿创鍥剧墖涓婁紶</div>
+          <div className="mt-2 text-sm font-bold">{uploading ? '涓婁紶涓?..' : '鎷栧姩/绮樿创鏂囦欢鍒拌繖閲岋紝鎴栫偣鍑讳笂浼?}</div>
+          <div className="mt-1 text-xs text-slate-500">鏂囦欢浼氫繚瀛樺埌璇ヤ骇鍝佸搴旀枃浠跺す</div>
+          <input
+            className="hidden"
+            type="file"
+            multiple
+            disabled={uploading}
+            onClick={e => e.stopPropagation()}
+            onChange={e => {
+              onUpload(field, e.target.files);
+              e.currentTarget.value = '';
+            }}
+          />
+        </label>
+      )}
+      <div className="mt-3 space-y-2">
+        {files.map((file, index) => (
+          <div key={`${file.path || file.name}-${index}`} className="flex items-center gap-2 rounded-lg bg-slate-950/60 px-3 py-2 text-sm text-slate-300">
+            {/\.(png|jpe?g|webp|gif)$/i.test(file.name || file.path || '') ? <ImageIcon className="h-4 w-4 text-sky-400" /> : <FileText className="h-4 w-4 text-slate-400" />}
+            <span className="min-w-0 truncate">{file.path || file.name}</span>
+            {canEdit && (
+              <button
+                type="button"
+                title="鍒犻櫎"
+                onClick={() => onDelete(field, index)}
+                className="ml-auto shrink-0 rounded-md p-1 text-slate-500 hover:bg-red-500/10 hover:text-red-400"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        ))}
+        {!files.length && <div className="text-sm text-slate-500">鏆傛湭涓婁紶</div>}
+      </div>
+    </div>
+  );
+}
+
+function ProjectListItem({
+  project,
+  steps,
+  needsMe,
+  onSelect,
+  onDelete,
+  deleting,
+  theme,
+  tick,
+}: {
+  project: NewDevProject;
+  steps: StepConfig[];
+  needsMe: boolean;
+  onSelect: (stepKey?: string) => void;
+  onDelete?: () => void;
+  deleting?: boolean;
+  theme: 'dark' | 'light';
+  tick: number;
+}) {
+  const step = steps.find(s => s.stepKey === project.currentStepKey);
+  const rawStepIndex = steps.findIndex(s => s.stepKey === project.currentStepKey);
+  const activeIndex = project.completedAt ? steps.length - 1 : Math.max(0, rawStepIndex);
+  const stepIndex = project.completedAt ? steps.length : activeIndex + 1;
+  const overdue = !!project.dueAt && new Date(project.dueAt).getTime() < Date.now();
+  const border = theme === 'dark' ? 'border-slate-800 hover:border-sky-500/60 hover:bg-slate-900/80' : 'border-slate-200 hover:border-sky-300 hover:bg-slate-50';
+  const iconClass = project.completedAt ? 'bg-sky-600 text-white' : needsMe ? 'bg-amber-400 text-slate-950' : overdue ? 'bg-red-500 text-white' : 'bg-slate-800 text-slate-300';
+  return (
+    <div className="group relative">
+      {onDelete && (
+        <button
+          type="button"
+          title="鍒犻櫎鏂板搧璁板綍"
+          disabled={deleting}
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          className="absolute right-3 top-3 z-10 rounded-lg p-2 text-slate-500 opacity-0 transition hover:bg-red-500/10 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-60 group-hover:opacity-100"
+        >
+          <Trash2 className="h-4 w-4" />
+        </button>
+      )}
+      <div role="button" tabIndex={0} onClick={() => onSelect()} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') onSelect(); }} className={`w-full cursor-pointer rounded-xl border p-4 pr-12 text-left transition ${border}`}>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${iconClass}`}>
+              {project.completedAt ? <Check className="h-4 w-4" /> : needsMe ? <Bell className="h-4 w-4" /> : overdue ? <Clock className="h-4 w-4" /> : <PackageOpen className="h-4 w-4" />}
+            </span>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <div className="truncate text-base font-bold">{project.title}</div>
+                {needsMe && <span className="shrink-0 rounded-full bg-amber-400 px-2 py-0.5 text-[11px] font-bold text-slate-950">寰呮垜澶勭悊</span>}
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                <span className={project.completedAt ? 'text-sky-400' : overdue ? 'text-red-400' : 'text-amber-300'}>{project.completedAt ? '宸插畬鎴? : step?.label || project.currentStepKey}</span>
+                <span>绗?{stepIndex}/{steps.length || '-'} 姝?/span>
+                <span key={tick}>{formatRemaining(project.dueAt)}</span>
+              </div>
+            </div>
+          </div>
+          <div className="text-right text-xs text-slate-500">
+            <div>璐熻矗浜?/div>
+            <div className="mt-1 max-w-48 truncate font-bold text-slate-300">{project.assignees.length ? project.assignees.join('銆?) : '鏈缃?}</div>
+          </div>
+        </div>
+
+        <div className="mt-5 overflow-x-auto pb-1">
+          <div className="grid min-w-[760px] grid-cols-8 items-start gap-2">
+            {steps.map((item, index) => {
+              const state = project.completedAt || index < activeIndex ? 'done' : index === activeIndex ? 'current' : 'future';
+              return (
+                <div key={item.stepKey}>
+                  <StepPill index={index} label={item.label} state={state} overdue={overdue && state === 'current'} theme={theme} onClick={(event) => {
+                    event.stopPropagation();
+                    onSelect(item.stepKey);
+                  }} />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StepPill({ index, label, state, overdue, theme, onClick }: { index: number; label: string; state: 'done' | 'current' | 'future'; overdue: boolean; theme: 'dark' | 'light'; onClick?: (event: React.MouseEvent<HTMLButtonElement>) => void }) {
+  const isCurrent = state === 'current';
+  const iconClass = state === 'done'
+    ? 'bg-sky-600 text-white'
+    : isCurrent
+      ? overdue ? 'bg-red-500 text-white' : 'bg-amber-400 text-slate-950'
+      : theme === 'dark' ? 'bg-slate-800 text-slate-500' : 'bg-slate-200 text-slate-500';
+  const textClass = state === 'done' ? 'text-sky-400' : isCurrent ? overdue ? 'text-red-300' : 'text-amber-300' : 'text-slate-500';
+  return (
+    <button type="button" onClick={onClick} className={`flex w-full flex-col items-center gap-2 rounded-lg px-1 py-2 transition hover:bg-sky-500/10 focus:outline-none focus:ring-2 focus:ring-sky-500 ${isCurrent ? 'scale-110 bg-amber-400/10' : ''}`}>
+      <span className={`flex shrink-0 items-center justify-center rounded-full font-bold transition ${isCurrent ? 'h-10 w-10 text-sm shadow-lg' : 'h-7 w-7 text-xs'} ${iconClass}`}>
+        {state === 'done' ? <Check className={isCurrent ? 'h-5 w-5' : 'h-4 w-4'} /> : index + 1}
+      </span>
+      <span className={`line-clamp-2 min-h-[32px] text-center font-bold leading-4 ${isCurrent ? 'text-sm' : 'text-[11px]'} ${textClass}`}>{label}</span>
+    </button>
+  );
+}
+
+function StatusBadge({ completed, overdue }: { completed: boolean; overdue: boolean }) {
+  if (completed) return <span className="rounded-full bg-sky-600 px-3 py-1 text-xs font-bold text-white">宸插畬鎴?/span>;
+  if (overdue) return <span className="rounded-full bg-red-500 px-3 py-1 text-xs font-bold text-white">宸茶秴鏃?/span>;
+  return <span className="rounded-full bg-amber-400 px-3 py-1 text-xs font-bold text-slate-950">杩涜涓?/span>;
+}
+
+function LabeledInput({ label, className, value, disabled, onChange }: { label: string; className: string; value: string; disabled?: boolean; onChange: (value: string) => void }) {
+  return (
+    <label className="block text-sm font-semibold">
+      {label}
+      <input className={`${className} mt-2 disabled:cursor-not-allowed disabled:opacity-60`} value={value || ''} disabled={disabled} onChange={e => onChange(e.target.value)} />
+    </label>
+  );
+}
+
+function TimeLimitEditor({ value, onChange, inputClassName }: { value: number; onChange: (value: number) => void; inputClassName: string }) {
+  const unlimited = !value || value <= 0;
+  return (
+    <div className="grid gap-3 md:grid-cols-[160px_1fr]">
+      <label className="flex items-center gap-2 text-sm font-semibold">
+        <input type="checkbox" checked={unlimited} onChange={e => onChange(e.target.checked ? 0 : 24)} className="h-4 w-4 accent-sky-500" />
+        涓嶉檺鏃?      </label>
+      <input className={inputClassName} type="number" min={1} disabled={unlimited} value={unlimited ? '' : value} onChange={e => onChange(Number(e.target.value || 0))} placeholder={unlimited ? '褰撳墠姝ラ涓嶉檺鏃? : '姝ラ鍊掕鏃跺皬鏃?} />
+    </div>
+  );
+}
+
+function OpsRotationEditor({ users, value, onChange, onSave, theme }: { users: ManagedUser[]; value: OpsRotation; onChange: (value: OpsRotation) => void; onSave: (value?: OpsRotation) => void; theme: 'dark' | 'light' }) {
+  const opsUsers = users.filter(user => /杩愯惀/.test(user.role || '') || /杩愯惀/.test(user.username || ''));
+  const border = theme === 'dark' ? 'border-slate-700' : 'border-slate-200';
+  const rowBg = theme === 'dark' ? 'bg-slate-950/60' : 'bg-white';
+  const ordered = value.usernames.length ? value.usernames.filter(name => opsUsers.some(user => user.username === name)) : opsUsers.map(user => user.username);
+  const setOrdered = (usernames: string[]) => onChange({ ...value, usernames, currentIndex: usernames.length ? Math.min(value.currentIndex, usernames.length - 1) : 0, currentUsername: usernames[value.currentIndex] || '' });
+  const move = (index: number, delta: number) => {
+    const next = [...ordered];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    setOrdered(next);
+  };
+  const setCurrent = (index: number) => onChange({ ...value, usernames: ordered, currentIndex: index, currentUsername: ordered[index] || '' });
+
+  return (
+    <div className={`rounded-lg border ${border} p-4`}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="font-bold">杩愯惀杞€间富璐熻矗浜?/div>
+          <div className="mt-1 text-xs text-slate-500">绗簩姝ュ拰绗竷姝ョ敱杩愯惀鎸夐『搴忚疆娴佷富璐熻矗锛屾瘡鍛ㄤ竴鑷姩鍒囧埌涓嬩竴浣嶏紱鍏朵粬杩愯惀鍙ˉ鍏咃紝鍙湁涓昏礋璐ｅ彲鎻愪氦/瀹℃牳銆?/div>
+        </div>
+        <button type="button" onClick={() => onSave({ ...value, usernames: ordered })} className="rounded-lg bg-sky-600 px-3 py-2 text-sm font-bold text-white hover:bg-sky-500">淇濆瓨杩愯惀杞€?/button>
+      </div>
+      <div className="mt-3 space-y-2">
+        {ordered.map((username, index) => (
+          <div key={username} className={`flex items-center gap-2 rounded-lg ${rowBg} px-3 py-2 text-sm`}>
+            <span className="w-8 text-slate-500">{index + 1}</span>
+            <span className="min-w-0 flex-1 font-bold">{username}</span>
+            {index === value.currentIndex && <span className="rounded-full bg-amber-400 px-2 py-0.5 text-xs font-bold text-slate-950">鏈懆涓昏礋璐?/span>}
+            <button type="button" onClick={() => setCurrent(index)} className="rounded-md bg-slate-700 px-2 py-1 text-xs font-bold text-white hover:bg-slate-600">璁句负鏈懆</button>
+            <button type="button" onClick={() => move(index, -1)} className="rounded-md bg-slate-700 px-2 py-1 text-xs font-bold text-white hover:bg-slate-600">涓婄Щ</button>
+            <button type="button" onClick={() => move(index, 1)} className="rounded-md bg-slate-700 px-2 py-1 text-xs font-bold text-white hover:bg-slate-600">涓嬬Щ</button>
+          </div>
+        ))}
+        {!ordered.length && <div className="rounded-lg border border-dashed border-slate-700 p-3 text-xs text-slate-500">鏆傛棤杩愯惀閮ㄩ棬璐﹀彿锛岃鍏堝湪璐﹀彿鏉冮檺閲岀淮鎶よ繍钀ラ儴闂ㄤ汉鍛樸€?/div>}
+      </div>
+    </div>
+  );
+}
+
+function PeoplePicker({
+  title,
+  users,
+  departments,
+  selectedUsers,
+  selectedDepartments,
+  onUsersChange,
+  onDepartmentsChange,
+  theme,
+  emptyHint,
+}: {
+  title: string;
+  users: ManagedUser[];
+  departments: string[];
+  selectedUsers: string[];
+  selectedDepartments: string[];
+  onUsersChange: (value: string[]) => void;
+  onDepartmentsChange: (value: string[]) => void;
+  theme: 'dark' | 'light';
+  emptyHint?: string;
+}) {
+  const [openDepartment, setOpenDepartment] = useState<string | null>(departments[0] || null);
+  const border = theme === 'dark' ? 'border-slate-700' : 'border-slate-200';
+  const itemBg = theme === 'dark' ? 'bg-slate-950/60' : 'bg-white';
+  const text = theme === 'dark' ? 'text-slate-300' : 'text-slate-700';
+  const usersByDepartment = departments.map(department => ({ department, users: users.filter(u => u.role === department) }));
+
+  return (
+    <div className={`rounded-lg border ${border} p-3`}>
+      <div className="text-sm font-bold">{title}</div>
+      <div className="mt-1 text-xs text-slate-500">閮ㄩ棬锛歿joinList(selectedDepartments) || '鏃?}锛涗汉鍛橈細{joinList(selectedUsers) || '鏃?}</div>
+      {emptyHint && <div className="mt-2 text-xs text-slate-500">{emptyHint}</div>}
+      <div className="mt-3 space-y-2">
+        {usersByDepartment.map(group => (
+          <div key={group.department} className={`rounded-lg ${itemBg} p-2`}>
+            <div className="flex items-center justify-between gap-2">
+              <label className={`flex items-center gap-2 text-sm font-semibold ${text}`}>
+                <input type="checkbox" checked={selectedDepartments.includes(group.department)} onChange={() => onDepartmentsChange(toggleValue(selectedDepartments, group.department))} className="h-4 w-4 accent-sky-500" />
+                {group.department}鍏ㄩ儴
+              </label>
+              <button type="button" onClick={() => setOpenDepartment(openDepartment === group.department ? null : group.department)} className="inline-flex items-center gap-1 text-xs text-sky-400">
+                {openDepartment === group.department ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                閫夋嫨鎴愬憳
+              </button>
+            </div>
+            {openDepartment === group.department && (
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                {group.users.map(member => (
+                  <label key={member.username} className={`flex items-center gap-2 text-sm ${text}`}>
+                    <input type="checkbox" checked={selectedUsers.includes(member.username)} onChange={() => onUsersChange(toggleValue(selectedUsers, member.username))} className="h-4 w-4 accent-sky-500" />
+                    {member.username}
+                  </label>
+                ))}
+                {!group.users.length && <div className="text-xs text-slate-500">璇ラ儴闂ㄦ殏鏃犺处鍙?/div>}
+              </div>
+            )}
+          </div>
+        ))}
+        {!departments.length && <div className="rounded-lg border border-dashed border-slate-700 p-3 text-xs text-slate-500">鏆傛棤鍙€夐儴闂紝璇峰厛鍦ㄨ处鍙锋潈闄愯缃腑缁存姢璐﹀彿閮ㄩ棬銆?/div>}
+      </div>
+    </div>
+  );
+}
+
+function displayValue(value: any) {
+  if (value === null || value === undefined || value === '') return '绌?;
+  if (Array.isArray(value)) return value.map(item => item?.path || item?.name || String(item)).join('锛?) || '绌?;
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function FlowHistoryModal({ project, history, onClose, onJumpToStep, theme }: { project: NewDevProject; history: FlowHistoryEntry[]; onClose: () => void; onJumpToStep: (stepKey: string) => void; theme: 'dark' | 'light' }) {
+  const panel = theme === 'dark' ? 'border-slate-800 bg-slate-950/60' : 'border-slate-200 bg-slate-50';
+  const muted = theme === 'dark' ? 'text-slate-400' : 'text-slate-500';
+  const items = [...history].sort((a, b) => Date.parse(b.at || '') - Date.parse(a.at || ''));
+
+  return (
+    <Modal title={`娴佺▼璁板綍 - ${project.title}`} onClose={onClose} theme={theme}>
+      <div className="mx-auto max-w-3xl space-y-3">
+        {!items.length && <div className={`rounded-lg border p-6 text-center text-sm ${panel} ${muted}`}>鏆傛棤娴佺▼璁板綍</div>}
+        {items.map((entry, index) => (
+          <button
+            type="button"
+            key={entry.id || `${entry.at}-${index}`}
+            onClick={() => entry.stepKey && onJumpToStep(entry.stepKey)}
+            className={`w-full rounded-lg border p-4 text-left transition hover:border-sky-500 hover:bg-sky-500/10 ${panel}`}
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="font-bold">{entry.summary || '璁板綍浜嗘祦绋嬪彉鏇?}</div>
+                <div className={`mt-1 text-xs ${muted}`}>{entry.user || '-'} / {entry.stepLabel || entry.stepKey || '-'} / {formatDate(entry.at)}</div>
+              </div>
+              <span className="rounded-full bg-slate-800 px-2 py-1 text-xs font-bold text-slate-200">
+                {entry.action === 'create' ? '鍒涘缓' : entry.action === 'advance' ? '娴佽浆' : entry.action === 'reject' ? '閫€鍥? : entry.action === 'complete' ? '瀹屾垚' : '淇敼'}
+              </span>
+            </div>
+            <div className="mt-3 text-xs text-sky-400">
+              {entry.stepKey ? '鐐瑰嚮璺宠浆鍒拌姝ラ鐣岄潰' : '璇ヨ褰曟病鏈夊彲璺宠浆鐨勬楠?}
+            </div>
+          </button>
+        ))}
+      </div>
+    </Modal>
+  );
+}
+
+function Modal({ title, children, onClose, theme }: { title: string; children: React.ReactNode; onClose: () => void; theme: 'dark' | 'light' }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className={`max-h-[86vh] w-full max-w-5xl overflow-y-auto rounded-xl border p-5 shadow-2xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800 text-slate-100' : 'bg-white border-slate-200 text-slate-900'}`}>
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="text-lg font-bold">{title}</h3>
+          <button onClick={onClose} className="rounded-full p-2 text-slate-500 hover:bg-slate-800 hover:text-white">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>用户管理</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+    h1 { margin: 0 0 20px; font-size: 1.5rem; color: #10b981; }
+    .bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+    .btn { padding: 8px 16px; border-radius: 8px; border: none; cursor: pointer; font-size: 14px; font-weight: 600; }
+    .btn-primary { background: #10b981; color: #fff; }
+    .btn-primary:hover { background: #059669; }
+    .btn-ghost { background: #334155; color: #94a3b8; }
+    .btn-ghost:hover { background: #475569; color: #fff; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-danger:hover { background: #b91c1c; }
+    table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden; }
+    th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid #334155; }
+    th { background: #334155; color: #94a3b8; font-size: 12px; text-transform: uppercase; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #33415540; }
+    .perms { font-size: 12px; color: #94a3b8; }
+    .act { display: flex; gap: 8px; }
+    .act button { padding: 6px 10px; font-size: 12px; border-radius: 6px; border: none; cursor: pointer; background: #334155; color: #94a3b8; }
+    .act button:hover { background: #10b981; color: #fff; }
+    .act .del:hover { background: #dc2626; }
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
+    .modal-box { background: #1e293b; border-radius: 16px; padding: 24px; max-width: 420px; width: 100%; border: 1px solid #334155; }
+    .modal-box h2 { margin: 0 0 20px; font-size: 1.25rem; color: #10b981; }
+    .field { margin-bottom: 16px; }
+    .field label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; text-transform: uppercase; }
+    .field input, .field select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 14px; }
+    .field input:read-only { opacity: 0.7; }
+    .perms-row { display: flex; flex-wrap: wrap; gap: 12px 20px; margin-top: 8px; }
+    .perms-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; text-transform: none; }
+    .perms-row input { width: auto; }
+    .modal-actions { display: flex; gap: 12px; margin-top: 24px; }
+    .modal-actions .btn { flex: 1; }
+    .hide { display: none !important; }
+    .path-hint { font-size: 12px; color: #64748b; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <h1>用户管理</h1>
+  <p class="path-hint">直接读写与主程序相同的 users.json，修改后主程序重新登录即生效。</p>
+  <div class="bar">
+    <span id="count">共 0 个用户</span>
+    <button class="btn btn-primary" id="btnAdd">添加用户</button>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>用户名</th>
+        <th>密码</th>
+        <th>角色</th>
+        <th>权限</th>
+        <th style="width:120px">操作</th>
+      </tr>
+    </thead>
+    <tbody id="list"></tbody>
+  </table>
+
+  <div class="modal hide" id="modalAdd">
+    <div class="modal-box">
+      <h2>添加用户</h2>
+      <div class="field">
+        <label>用户名</label>
+        <input type="text" id="addUsername" placeholder="登录用户名" />
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input type="password" id="addPassword" placeholder="登录密码" />
+      </div>
+      <div class="field">
+        <label>角色</label>
+        <input type="text" id="addRole" list="roleList" placeholder="如 Admin、Editor、Viewer，可自定义" />
+        <datalist id="roleList">
+          <option value="Admin" />
+          <option value="Editor" />
+          <option value="Uploader" />
+          <option value="Viewer" />
+        </datalist>
+      </div>
+      <div class="field">
+        <label>权限</label>
+        <div class="perms-row" id="addPerms"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" id="submitAdd">确认添加</button>
+        <button class="btn btn-ghost" id="cancelAdd">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hide" id="modalEdit">
+    <div class="modal-box">
+      <h2>编辑用户</h2>
+      <div class="field">
+        <label>用户名</label>
+        <input type="text" id="editUsername" readonly />
+      </div>
+      <div class="field">
+        <label>当前密码（只读）</label>
+        <input type="text" id="editPasswordCurrent" readonly />
+      </div>
+      <div class="field">
+        <label>新密码（留空则不修改）</label>
+        <input type="password" id="editPassword" placeholder="不修改请留空" />
+      </div>
+      <div class="field">
+        <label>角色</label>
+        <input type="text" id="editRole" list="roleListEdit" placeholder="可自定义角色名" />
+        <datalist id="roleListEdit">
+          <option value="Admin" />
+          <option value="Editor" />
+          <option value="Uploader" />
+          <option value="Viewer" />
+        </datalist>
+      </div>
+      <div class="field">
+        <label>权限</label>
+        <div class="perms-row" id="editPerms"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" id="submitEdit">保存</button>
+        <button class="btn btn-ghost" id="cancelEdit">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const PERM_LABELS = {
+      canUpload: '上传',
+      canDownload: '下载',
+      canDelete: '删除',
+      canManageProducts: '产品管理',
+      canManageBrands: '品牌管理',
+      canTag: '打标签'
+    };
+    const PERM_KEYS = Object.keys(PERM_LABELS);
+
+    async function api(method, path, body) {
+      const opt = { method, headers: {} };
+      if (body) {
+        opt.headers['Content-Type'] = 'application/json';
+        opt.body = JSON.stringify(body);
+      }
+      const r = await fetch(path, opt);
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || '请求失败');
+      return data;
+    }
+
+    function renderPerms(perms) {
+      return PERM_KEYS.filter(k => perms[k]).map(k => PERM_LABELS[k]).join('、') || '—';
+    }
+
+    function renderList(users) {
+      document.getElementById('count').textContent = '共 ' + users.length + ' 个用户';
+      const tbody = document.getElementById('list');
+      tbody.innerHTML = users.map(u => `
+        <tr>
+          <td>${escapeHtml(u.username)}</td>
+          <td class="perms">${escapeHtml(u.password || '')}</td>
+          <td>${escapeHtml(u.role)}</td>
+          <td class="perms">${escapeHtml(renderPerms(u.permissions))}</td>
+          <td class="act">
+            <button type="button" data-edit="${escapeHtml(u.username)}">编辑</button>
+            <button type="button" class="del" data-del="${escapeHtml(u.username)}">删除</button>
+          </td>
+        </tr>
+      `).join('');
+      tbody.querySelectorAll('[data-edit]').forEach(btn => {
+        btn.onclick = () => openEdit(users.find(x => x.username === btn.dataset.edit));
+      });
+      tbody.querySelectorAll('[data-del]').forEach(btn => {
+        btn.onclick = () => doDelete(btn.dataset.del);
+      });
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    let users = [];
+
+    async function load() {
+      try {
+        users = await api('GET', '/api/users');
+        renderList(users);
+      } catch (e) {
+        alert('加载失败: ' + e.message);
+      }
+    }
+
+    function makePermCheckboxes(containerId, perms, onChange) {
+      const el = document.getElementById(containerId);
+      el.innerHTML = PERM_KEYS.map(k => `
+        <label><input type="checkbox" data-key="${k}" ${perms[k] ? 'checked' : ''} /> ${PERM_LABELS[k]}</label>
+      `).join('');
+      el.querySelectorAll('input').forEach(inp => {
+        inp.onchange = () => {
+          perms[inp.dataset.key] = inp.checked;
+          if (onChange) onChange();
+        };
+      });
+    }
+
+    document.getElementById('btnAdd').onclick = () => {
+      const perms = { canUpload: false, canDownload: true, canDelete: false, canManageProducts: false, canManageBrands: false, canTag: false };
+      document.getElementById('addUsername').value = '';
+      document.getElementById('addPassword').value = '';
+      document.getElementById('addRole').value = 'Viewer';
+      document.getElementById('addRole').placeholder = '如 Admin、Editor、Viewer，可自定义';
+      makePermCheckboxes('addPerms', perms);
+      document.getElementById('modalAdd').classList.remove('hide');
+    };
+
+    document.getElementById('cancelAdd').onclick = () => document.getElementById('modalAdd').classList.add('hide');
+
+    document.getElementById('submitAdd').onclick = async () => {
+      const username = document.getElementById('addUsername').value.trim();
+      const password = document.getElementById('addPassword').value.trim();
+      const role = document.getElementById('addRole').value.trim() || 'Viewer';
+      if (!username || !password) { alert('请填写用户名和密码'); return; }
+      const perms = {};
+      document.querySelectorAll('#addPerms input').forEach(inp => { perms[inp.dataset.key] = inp.checked; });
+      try {
+        await api('POST', '/api/users', {
+          username,
+          password,
+          role,
+          permissions: perms
+        });
+        document.getElementById('modalAdd').classList.add('hide');
+        load();
+      } catch (e) { alert(e.message); }
+    };
+
+    function openEdit(u) {
+      if (!u) return;
+      document.getElementById('editUsername').value = u.username;
+      document.getElementById('editPasswordCurrent').value = u.password || '';
+      document.getElementById('editPassword').value = '';
+      document.getElementById('editRole').value = u.role || 'Viewer';
+      const perms = { ...u.permissions };
+      makePermCheckboxes('editPerms', perms);
+      document.getElementById('modalEdit').classList.remove('hide');
+      window._editPerms = perms;
+    }
+
+    document.getElementById('cancelEdit').onclick = () => document.getElementById('modalEdit').classList.add('hide');
+
+    document.getElementById('submitEdit').onclick = async () => {
+      const username = document.getElementById('editUsername').value.trim();
+      const password = document.getElementById('editPassword').value.trim();
+      const role = document.getElementById('editRole').value.trim() || 'Viewer';
+      const perms = window._editPerms || {};
+      const body = { username, role, permissions: perms };
+      if (password) body.password = password;
+      try {
+        await api('PUT', '/api/users', body);
+        document.getElementById('modalEdit').classList.add('hide');
+        load();
+      } catch (e) { alert(e.message); }
+    };
+
+    async function doDelete(username) {
+      if (!confirm('确定删除用户「' + username + '」？')) return;
+      try {
+        await api('DELETE', '/api/users?username=' + encodeURIComponent(username));
+        load();
+      } catch (e) { alert(e.message); }
+    }
+
+    load();
+
+    // 定时心跳：让服务端知道页面还在；关掉本页后心跳停止，服务端约 2 分钟后自动退出并释放端口
+    setInterval(() => { fetch('/api/ping').catch(() => {}); }, 10000);
+  </script>
+</body>
+</html>

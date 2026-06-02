@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+release/
+releases/*.zip
+uploads/
+tmp-asar/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.server-port
+*.db
+*.sqlite
+*.sqlite3

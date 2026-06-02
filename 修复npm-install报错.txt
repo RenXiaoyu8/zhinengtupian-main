@@ -1,0 +1,36 @@
+========================================
+  npm install 报 EBUSY 时的修复步骤
+========================================
+
+原因：node_modules\electron 被占用（多为 Cursor/VS Code 或 Node 进程）。
+
+请按顺序做：
+
+1. 保存所有文件后，完全关闭 Cursor。
+
+2. 打开任务管理器（Ctrl+Shift+Esc），在“进程”里结束所有：
+   - Node.js
+   - Electron
+   （有的话就结束，没有可跳过）
+
+3. 以管理员身份打开 PowerShell：
+   - 开始菜单输入 PowerShell
+   - 右键 “Windows PowerShell” → “以管理员身份运行”
+
+4. 在 PowerShell 里依次执行（可复制整段）：
+
+   cd C:\Users\renxi\Desktop\zhinengtupian-main
+   Remove-Item -Recurse -Force node_modules\electron -ErrorAction SilentlyContinue
+   npm install
+
+5. 看到 “added xxx packages” 且无报错即成功。之后再打开 Cursor 即可。
+
+----------------------------------------
+若仍报错：可尝试删除整个 node_modules 后重装
+----------------------------------------
+
+   cd C:\Users\renxi\Desktop\zhinengtupian-main
+   Remove-Item -Recurse -Force node_modules -ErrorAction SilentlyContinue
+   npm install
+
+（同样需在关闭 Cursor 后的管理员 PowerShell 中执行。）

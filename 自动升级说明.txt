@@ -1,0 +1,55 @@
+自动升级使用说明
+
+一、首次需要手动给用户发一次“带自动升级能力”的新客户端
+原因：
+1) 老客户端目录里没有 updater.exe
+2) 没有 updater.exe 的旧客户端，即使检测到新版本，也无法自动升级
+
+所以流程是：
+1. 先给用户发一次新的客户端
+2. 从这一次开始，后续版本就可以点“更新”自动升级
+
+二、你这边以后如何发布新版本
+方法 1：双击
+  发布新版本.bat
+
+方法 2：命令行
+  npm run publish:release
+
+发布时会自动做这些事：
+1. 更新 package.json 的版本号
+2. 构建客户端
+3. 构建 updater.exe
+4. 生成 zip 发布包
+5. 放到 releases 目录
+6. 更新 update_config.json
+
+三、发布完成后文件位置
+1. 发布包目录：
+  releases
+
+2. 更新配置：
+  update_config.json
+
+3. 本地打包后的客户端目录：
+  release\ShangpinCloudAssets
+
+说明：
+打包后若 electron-builder 生成了 release\win-unpacked，脚本会自动把它整理成唯一的
+release\ShangpinCloudAssets，避免同时出现两个客户端目录。
+
+四、用户端更新逻辑
+1. 启动客户端
+2. 客户端请求 /check_update
+3. 若发现新版本，会弹出更新提示
+4. 点击“立即更新”后，客户端会下载 zip 并覆盖当前目录
+5. 更新完成后自动重启
+
+五、若自动升级没有反应，优先检查
+1. 当前客户端目录里是否有 updater.exe
+2. update_config.json 的 publicBaseUrl 是否正确
+3. releases 目录里是否存在 update_config.json 中 fileName 对应的 zip
+4. 服务端是否能访问：
+  http://你的服务器IP:43123/check_update
+5. 用户端能否访问下载地址：
+  http://你的服务器IP:43123/releases/xxx.zip

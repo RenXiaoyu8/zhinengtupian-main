@@ -1,0 +1,130 @@
+{
+  "name": "shangpin-cloud-assets",
+  "private": true,
+  "version": "2.2.7",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build:icons": "node ./scripts/generate_icons.mjs",
+    "build": "vite build",
+    "build:server": "esbuild ././server.ts --bundle --platform=node --format=cjs --outfile=electron/server-bundle.cjs --external:better-sqlite3 --external:sharp --external:canvas --external:vite",
+    "build:updater": "python ./scripts/build_updater.py",
+    "preview": "vite preview",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit",
+    "electron:dev": "npx electron .",
+    "electron:rebuild": "npx electron-rebuild -f",
+    "electron:build": "npm run build:icons && npm run build && npm run build:server && npm run build:updater && electron-builder",
+    "publish:release": "python ./scripts/publish_release.py",
+    "install:safe": "npm install --omit=optional"
+  },
+  "dependencies": {
+    "@emotion/is-prop-valid": "^1.4.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/mime-types": "^3.0.1",
+    "@types/multer": "^2.1.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "ag-psd": "^30.1.0",
+    "archiver": "^5.3.2",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.6.2",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "form-data": "^4.0.0",
+    "jsonwebtoken": "^9.0.3",
+    "lucide-react": "^0.546.0",
+    "mime-types": "^3.0.2",
+    "motion": "^12.23.24",
+    "multer": "^2.1.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sharp": "^0.34.5",
+    "vite": "^6.2.0",
+    "xlsx": "^0.18.5"
+  },
+  "optionalDependencies": {
+    "canvas": "^3.0.3",
+    "pdfjs-dist": "4.8.69"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "autoprefixer": "^10.4.21",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.24.0",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  },
+  "build": {
+    "forceCodeSigning": false,
+    "appId": "com.shangpin.cloud-assets",
+    "productName": "尚品易站云资产",
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "package.json",
+      "dist",
+      "electron/**/*",
+      "node_modules/**/*"
+    ],
+    "extraFiles": [
+      {
+        "from": "server_config.json",
+        "to": "."
+      },
+      {
+        "from": "启动诊断.bat",
+        "to": "."
+      },
+      {
+        "from": "手动启动后台服务.bat",
+        "to": "."
+      },
+      {
+        "from": "start-backend.bat",
+        "to": "."
+      },
+      {
+        "from": "start-backend.ps1",
+        "to": "."
+      },
+      {
+        "from": "build/updater.exe",
+        "to": "."
+      },
+      {
+        "from": "build/app-icon.ico",
+        "to": "app-icon.ico"
+      },
+      {
+        "from": "build/app-icon.png",
+        "to": "app-icon.png"
+      },
+      {
+        "from": "尚品易站云资产logo-01.svg",
+        "to": "尚品易站云资产logo-01.svg"
+      }
+    ],
+    "win": {
+      "icon": "build/app-icon.ico",
+      "target": [
+        "dir"
+      ],
+      "signAndEditExecutable": true
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "compression": "maximum"
+  }
+}

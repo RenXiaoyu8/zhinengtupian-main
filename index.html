@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>尚品易站云资产</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <script>
+      /* #region agent log */
+      var __dbg=function(msg,data){ var pl={sessionId:'18dc8e',location:'index.html',message:msg,data:data||{},timestamp:Date.now()}; try{ if(window.__debugLogToFile) window.__debugLogToFile(pl); }catch(e){} try{ fetch('http://127.0.0.1:7793/ingest/23809eb2-266d-4f27-8bde-c919afed29bf',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'18dc8e'},body:JSON.stringify(pl)}).catch(function(){}); }catch(e){} };
+      /* #endregion */
+    </script>
+    <script>
+      (function(){
+        __dbg('inline script ran',{});
+        var isNewDevUpload=function(e){ try { return e && e.target && e.target.closest && e.target.closest('[data-newdev-upload]'); } catch(err) { return false; } };
+        var p=function(e){ e.preventDefault(); e.stopPropagation(); if(e.dataTransfer) e.dataTransfer.dropEffect='copy'; };
+        document.addEventListener('dragover',function(e){
+          if(isNewDevUpload(e)){
+            e.preventDefault();
+            if(e.dataTransfer) e.dataTransfer.dropEffect='copy';
+            return;
+          }
+          p(e); __dbg('dragover',{types:(e.dataTransfer&&e.dataTransfer.types)?Array.from(e.dataTransfer.types):[]}); try{ window.dispatchEvent(new CustomEvent('app-dragover')); }catch(err){}
+        },true);
+        document.addEventListener('drop',function(e){
+          if(isNewDevUpload(e)){
+            e.preventDefault();
+            if(e.dataTransfer) e.dataTransfer.dropEffect='copy';
+            return;
+          }
+          p(e);
+          var hasCb=!!window.__onFilesDropped, fl=e.dataTransfer&&e.dataTransfer.files, len=fl?fl.length:0;
+          __dbg('drop',{hasCallback:hasCb,filesLength:len});
+          try{ window.dispatchEvent(new CustomEvent('app-dragleave')); }catch(err){}
+          if(window.__onFilesDropped&&e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files.length){
+            try{ __dbg('calling __onFilesDropped',{count:e.dataTransfer.files.length}); window.__onFilesDropped(Array.from(e.dataTransfer.files)); __dbg('onFilesDropped returned',{}); }catch(err){ __dbg('onFilesDropped threw',{err:String(err)}); }
+          }
+        },true);
+        document.addEventListener('dragleave',function(e){
+          if(!e.relatedTarget||!document.body.contains(e.relatedTarget)){ try{ window.dispatchEvent(new CustomEvent('app-dragleave')); }catch(err){} }
+        },true);
+      })();
+    </script>
+    <div id="root" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;font-size:18px">
+      加载中...
+    </div>
+    <script>
+      window.onerror = function(msg, url, line, col, err) {
+        var el = document.getElementById('root');
+        if (el) el.innerHTML = '<div style="padding:24px;max-width:600px"><h1 style="color:#ef4444;margin-bottom:12px">加载出错</h1><pre style="background:#1e293b;padding:16px;border-radius:8px;overflow:auto;font-size:12px;color:#e2e8f0">' + (err ? err.stack : msg) + '</pre></div>';
+        return false;
+      };
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

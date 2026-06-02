@@ -1,0 +1,4 @@
+{
+  "lanBaseUrl": "http://192.168.1.100:43123",
+  "publicBaseUrl": "http://YOUR_PUBLIC_IP:43123"
+}
