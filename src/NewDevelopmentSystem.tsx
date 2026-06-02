@@ -337,7 +337,7 @@ export default function NewDevelopmentSystem({
   const [screen, setScreen] = useState<'list' | 'create' | 'detail'>('list');
   const [detailStepKey, setDetailStepKey] = useState<string | null>(null);
   const [notifyOperationsOnPurchase, setNotifyOperationsOnPurchase] = useState(true);
-  const [draft, setDraft] = useState({ title: '', barcode: '', standard: '', brand: '', brandId: '', spec: '' });
+  const [draft, setDraft] = useState({ title: '', barcode: '', standard: '', brand: '', brandId: '', spec: '', purchaseSellingPoints: [''] });
   const autoSaveRef = useRef<number | null>(null);
   const lastAutoSavedKeyRef = useRef<Record<number, string>>({});
 
@@ -547,14 +547,18 @@ export default function NewDevelopmentSystem({
           standard: draft.standard,
           brand: brand?.name || draft.brand,
           spec: draft.spec,
-          data: { brandId: draft.brandId, initiationSellingPoints: [''] },
+          data: {
+            brandId: draft.brandId,
+            initiationSellingPoints: [''],
+            purchaseSellingPoints: normalizeRows(draft.purchaseSellingPoints),
+          },
         }),
       });
       setProjects(prev => [created, ...prev.filter(item => item.id !== created.id)]);
       lastAutoSavedKeyRef.current[created.id] = projectDraftKey(created);
       setSelectedId(created.id);
       setScreen('detail');
-      setDraft({ title: '', barcode: '', standard: '', brand: '', brandId: '', spec: '' });
+      setDraft({ title: '', barcode: '', standard: '', brand: '', brandId: '', spec: '', purchaseSellingPoints: [''] });
       setNotice('新品项目已创建');
     } catch (err: any) {
       setNotice(err.message || '创建失败');
@@ -837,6 +841,15 @@ export default function NewDevelopmentSystem({
             {brands.map(brand => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
           </select>
           <input className={`${inputClass} md:col-span-2`} placeholder="货号" value={draft.spec} onChange={e => setDraft(v => ({ ...v, spec: e.target.value }))} />
+        </div>
+        <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
+          <LineList
+            label="采购添加卖点"
+            value={draft.purchaseSellingPoints}
+            inputClass={inputClass}
+            placeholder="填写采购建议卖点"
+            onChange={value => setDraft(v => ({ ...v, purchaseSellingPoints: value }))}
+          />
         </div>
         <div className="mt-4 flex justify-end gap-2">
           <button type="button" className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-bold" onClick={() => setScreen('list')}>返回</button>
