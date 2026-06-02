@@ -267,6 +267,11 @@ db.exec(`
     week_key TEXT NOT NULL DEFAULT ''
   );
 
+  CREATE TABLE IF NOT EXISTS newdev_settings (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL DEFAULT '{}'
+  );
+
   CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL,
@@ -588,6 +593,31 @@ function getOpsRotation() {
     currentUsername: usernames.length ? usernames[currentIndex % usernames.length] : '',
     weekKey,
   };
+}
+
+function getNewDevSetting<T = any>(key: string, fallback: T): T {
+  const row = db.prepare('SELECT value_json FROM newdev_settings WHERE key = ?').get(key) as any;
+  if (!row) return fallback;
+  try {
+    return JSON.parse(String(row.value_json || '')) as T;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function setNewDevSetting(key: string, value: any) {
+  db.prepare(`
+    INSERT INTO newdev_settings (key, value_json) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+  `).run(key, JSON.stringify(value));
+}
+
+function purchaseNotificationRecipients(): string[] {
+  const configured = parseJsonArray(getNewDevSetting('purchaseNotificationUsers', []));
+  if (configured.length) return configured;
+  const ops = usernamesByPositions(['运营部', '运营']);
+  if (ops.length) return ops;
+  return opsUsernames();
 }
 
 function setOpsRotation(usernames: string[], currentIndex: number) {
@@ -955,10 +985,12 @@ function buildPackagingConfirmText(data: any) {
 function ensureProductFromNewDev(body: any) {
   const title = String(body.title || '').trim();
   const barcode = String(body.barcode || '').trim();
+  const spec = String(body.spec || '').trim();
   const alias = String(body.alias || body.names || '').trim();
-  const brandId = Number(body.brandId || body.brand_id || 0) || null;
-  const sku = barcode || `NEWDEV-${Date.now()}`;
+  const brandId = Number(body.brandId || body.brand_id || body.data?.brandId || 0) || null;
+  const sku = spec || barcode || `NEWDEV-${Date.now()}`;
   const brand = brandId ? db.prepare('SELECT id, name FROM brands WHERE id = ?').get(brandId) as any : null;
+  if (!brand) throw new Error('请选择有效品牌');
   const existing = db.prepare('SELECT * FROM products WHERE sku = ?').get(sku) as any;
   let productId = existing?.id ? Number(existing.id) : 0;
   if (existing) {
@@ -969,8 +1001,8 @@ function ensureProductFromNewDev(body: any) {
       .run(sku, title, alias, brandId, '');
     productId = Number(result.lastInsertRowid);
   }
-  createProductFolders(brand?.name, sku, title, [], loadProductFolderTemplate());
-  const brandFolder = (brand?.name || '未分类品牌').replace(/[/\\:*?"<>|]/g, '_');
+  createProductFolders(brand.name, sku, title, [], loadProductFolderTemplate());
+  const brandFolder = brand.name.replace(/[/\\:*?"<>|]/g, '_');
   const productFolder = (title || sku).replace(/[/\\:*?"<>|]/g, '_');
   return {
     productId,
@@ -1344,6 +1376,7 @@ app.get('/api/newdev/meta', authenticate, (req, res) => {
   res.json({
     steps: getStepConfigs(),
     opsRotation: getOpsRotation(),
+    purchaseNotificationUsers: purchaseNotificationRecipients(),
     brands: db.prepare('SELECT * FROM brands ORDER BY name ASC').all(),
     users: loadJsonUsers().map(u => ({
       username: u.username,
@@ -1359,6 +1392,13 @@ app.post('/api/newdev/ops-rotation', authenticate, (req: any, res) => {
   const usernames = parseJsonArray(req.body?.usernames);
   const currentIndex = Number(req.body?.currentIndex || 0);
   res.json({ success: true, opsRotation: setOpsRotation(usernames, currentIndex) });
+});
+
+app.post('/api/newdev/settings', authenticate, (req: any, res) => {
+  const perms = getReqPermissions(req);
+  if (!perms.canManageNewDevelopment && !canManageUsers(req)) return res.status(403).json({ error: '无权操作' });
+  setNewDevSetting('purchaseNotificationUsers', parseJsonArray(req.body?.purchaseNotificationUsers));
+  res.json({ success: true, purchaseNotificationUsers: purchaseNotificationRecipients() });
 });
 
 app.post('/api/newdev/steps', authenticate, (req: any, res) => {
@@ -1422,7 +1462,12 @@ app.post('/api/newdev/projects', authenticate, (req: any, res) => {
   const createdAt = nowIso();
   const creationStepKey = 'initiation';
   const stepKey = 'selling';
-  const linkedProduct = ensureProductFromNewDev(body);
+  let linkedProduct: any;
+  try {
+    linkedProduct = ensureProductFromNewDev(body);
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || '创建产品资料失败' });
+  }
   const data = appendProjectHistory(compactProjectData({ ...(body.data || {}), ...linkedProduct }), {
     user: createdBy,
     stepKey: creationStepKey,
@@ -1560,7 +1605,7 @@ app.post('/api/newdev/projects/:id/advance', authenticate, (req: any, res) => {
   if (!done) createStepNotification(id, row.title, next);
   if (row.current_step_key === 'purchase' && req.body?.notifyOperations) {
     const summary = String(req.body?.purchaseSummary || '').trim();
-    const opsUsers = usernamesByPositions(['运营部']).length ? usernamesByPositions(['运营部']) : allUsernames();
+    const opsUsers = purchaseNotificationRecipients();
     addNotification(
       opsUsers,
       `采购审核已完成：${row.title}`,

@@ -330,6 +330,7 @@ export default function NewDevelopmentSystem({
   const [brands, setBrands] = useState<BrandOption[]>([]);
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [opsRotation, setOpsRotation] = useState<OpsRotation | null>(null);
+  const [purchaseNotificationUsers, setPurchaseNotificationUsers] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -340,7 +341,7 @@ export default function NewDevelopmentSystem({
   const [screen, setScreen] = useState<'list' | 'create' | 'detail'>('list');
   const [detailStepKey, setDetailStepKey] = useState<string | null>(null);
   const [notifyOperationsOnPurchase, setNotifyOperationsOnPurchase] = useState(true);
-  const [draft, setDraft] = useState({ title: '', barcode: '', standard: '', brand: '', brandId: '', spec: '', purchaseSellingPoints: [''] });
+  const [draft, setDraft] = useState({ title: '', barcode: '', standard: '', brand: '', brandId: '', alias: '', spec: '', purchaseSellingPoints: [''] });
   const autoSaveRef = useRef<number | null>(null);
   const lastAutoSavedKeyRef = useRef<Record<number, string>>({});
 
@@ -412,6 +413,7 @@ export default function NewDevelopmentSystem({
     setBrands(meta.brands || []);
     setUsers(meta.users || []);
     setOpsRotation(meta.opsRotation || null);
+    setPurchaseNotificationUsers(Array.isArray(meta.purchaseNotificationUsers) ? meta.purchaseNotificationUsers : []);
     for (const project of (list || []) as NewDevProject[]) {
       lastAutoSavedKeyRef.current[project.id] = projectDraftKey(project);
     }
@@ -543,6 +545,10 @@ export default function NewDevelopmentSystem({
       setNotice('请先填写产品名称');
       return;
     }
+    if (!draft.brandId) {
+      setNotice('请选择品牌');
+      return;
+    }
     setSaving(true);
     try {
       const brand = brands.find(item => String(item.id) === String(draft.brandId));
@@ -553,9 +559,12 @@ export default function NewDevelopmentSystem({
           barcode: draft.barcode,
           standard: draft.standard,
           brand: brand?.name || draft.brand,
+          brandId: draft.brandId,
+          alias: draft.alias,
           spec: draft.spec,
           data: {
             brandId: draft.brandId,
+            alias: draft.alias,
             initiationSellingPoints: [''],
             purchaseSellingPoints: normalizeRows(draft.purchaseSellingPoints),
           },
@@ -565,7 +574,7 @@ export default function NewDevelopmentSystem({
       lastAutoSavedKeyRef.current[created.id] = projectDraftKey(created);
       setSelectedId(created.id);
       setScreen('detail');
-      setDraft({ title: '', barcode: '', standard: '', brand: '', brandId: '', spec: '', purchaseSellingPoints: [''] });
+      setDraft({ title: '', barcode: '', standard: '', brand: '', brandId: '', alias: '', spec: '', purchaseSellingPoints: [''] });
       setNotice('新品项目已创建');
     } catch (err: any) {
       setNotice(err.message || '创建失败');
@@ -828,7 +837,7 @@ export default function NewDevelopmentSystem({
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-lg font-bold">创建新品</div>
-            <div className="text-xs text-slate-500">新建后会进入立项流程，后台字段仍以原逻辑为准</div>
+            <div className="text-xs text-slate-500">创建新品即完成立项，并同步创建产品资料和默认文件夹</div>
           </div>
           <button type="button" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white" onClick={() => setScreen('list')}>
             <ArrowLeft className="h-4 w-4" />
@@ -847,6 +856,7 @@ export default function NewDevelopmentSystem({
             <option value="">请选择品牌</option>
             {brands.map(brand => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
           </select>
+          <input className={`${inputClass} md:col-span-2`} placeholder="别名，多个可用逗号分隔" value={draft.alias} onChange={e => setDraft(v => ({ ...v, alias: e.target.value }))} />
           <input className={`${inputClass} md:col-span-2`} placeholder="货号" value={draft.spec} onChange={e => setDraft(v => ({ ...v, spec: e.target.value }))} />
         </div>
         <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
@@ -1015,10 +1025,12 @@ export default function NewDevelopmentSystem({
             steps={steps}
             users={users}
             opsRotation={opsRotation}
+            purchaseNotificationUsers={purchaseNotificationUsers}
             inputClass={inputClass}
-            onSave={async (nextSteps, nextOps) => {
+            onSave={async (nextSteps, nextOps, nextPurchaseNotificationUsers) => {
               await api('/newdev/steps', { method: 'POST', body: JSON.stringify({ steps: nextSteps }) });
               await api('/newdev/ops-rotation', { method: 'POST', body: JSON.stringify(nextOps) });
+              await api('/newdev/settings', { method: 'POST', body: JSON.stringify({ purchaseNotificationUsers: nextPurchaseNotificationUsers }) });
               await refresh();
               setShowSettings(false);
             }}
@@ -1861,11 +1873,27 @@ function Section({ title, className, children }: { title: string; className: str
   );
 }
 
-function SettingsEditor({ steps, users, opsRotation, inputClass, onSave }: { steps: StepConfig[]; users: ManagedUser[]; opsRotation: OpsRotation | null; inputClass: string; onSave: (steps: StepConfig[], ops: { usernames: string[]; currentIndex: number }) => void }) {
+function SettingsEditor({
+  steps,
+  users,
+  opsRotation,
+  purchaseNotificationUsers,
+  inputClass,
+  onSave,
+}: {
+  steps: StepConfig[];
+  users: ManagedUser[];
+  opsRotation: OpsRotation | null;
+  purchaseNotificationUsers: string[];
+  inputClass: string;
+  onSave: (steps: StepConfig[], ops: { usernames: string[]; currentIndex: number }, purchaseNotificationUsers: string[]) => void;
+}) {
   const [localSteps, setLocalSteps] = useState(steps);
   const [opsUsers, setOpsUsers] = useState<string[]>(opsRotation?.usernames || []);
   const [currentIndex, setCurrentIndex] = useState(opsRotation?.currentIndex || 0);
+  const [purchaseUsers, setPurchaseUsers] = useState<string[]>(purchaseNotificationUsers || []);
   const updateStep = (index: number, patch: Partial<StepConfig>) => setLocalSteps(value => value.map((step, i) => i === index ? { ...step, ...patch } : step));
+  const toggleUser = (username: string, checked: boolean) => setPurchaseUsers(value => checked ? [...new Set([...value, username])] : value.filter(name => name !== username));
   return (
     <div className="space-y-4">
       <div>
@@ -1880,6 +1908,17 @@ function SettingsEditor({ steps, users, opsRotation, inputClass, onSave }: { ste
         </div>
         <input className={`${inputClass} mt-2`} type="number" min={0} value={currentIndex} onChange={event => setCurrentIndex(Number(event.target.value || 0))} />
       </div>
+      <div>
+        <div className="mb-2 text-sm font-bold">采购审核结果通知对象</div>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {users.map(member => (
+            <label key={member.username} className="flex items-center gap-2 rounded-lg border border-slate-800 p-2 text-sm">
+              <input type="checkbox" checked={purchaseUsers.includes(member.username)} onChange={event => toggleUser(member.username, event.target.checked)} />
+              {member.username} / {member.role || '-'}
+            </label>
+          ))}
+        </div>
+      </div>
       <div className="space-y-3">
         {localSteps.map((step, index) => (
           <div key={step.stepKey} className="rounded-lg border border-slate-800 p-3">
@@ -1892,7 +1931,7 @@ function SettingsEditor({ steps, users, opsRotation, inputClass, onSave }: { ste
           </div>
         ))}
       </div>
-      <button type="button" className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500" onClick={() => onSave(localSteps, { usernames: opsUsers, currentIndex })}>
+      <button type="button" className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500" onClick={() => onSave(localSteps, { usernames: opsUsers, currentIndex }, purchaseUsers)}>
         <Save className="h-4 w-4" />
         保存设置
       </button>
