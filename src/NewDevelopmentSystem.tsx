@@ -247,20 +247,23 @@ function buildPurchaseSummary(data: Record<string, any>) {
   const items = asArray<any>(data.purchaseItems);
   const passed: string[] = [];
   const failed: string[] = [];
-  const renamed: string[] = [];
+  const details: string[] = [];
   const source = items.length ? items : original.map(name => ({ name, status: 'pending' }));
   source.forEach((item, index) => {
     const name = String(item?.name || '').trim();
-    const oldName = String(original[index] || '').trim();
+    const sourceName = String(item?.sourceName || original[index] || name).trim();
+    const detail = String(item?.detail || '').trim();
+    const reason = String(item?.reason || '').trim();
     if (!name) return;
-    if (item?.status === 'fail') failed.push(name);
-    else passed.push(name);
-    if (oldName && oldName !== name) renamed.push(`${oldName} -> ${name}`);
+    if (item?.status === 'fail') failed.push(`${sourceName}${reason ? `（原因：${reason}）` : ''}`);
+    else passed.push(`${sourceName}${detail ? `（具体检测项：${detail}）` : ''}`);
+    if (detail && item?.status !== 'fail') details.push(`${sourceName} -> ${detail}`);
   });
   return [
     `通过：${passed.length ? passed.join('、') : '无'}`,
     `未通过：${failed.length ? failed.join('、') : '无'}`,
-    renamed.length ? `名称修改：${renamed.join('；')}` : '名称修改：无',
+    details.length ? `补充检测项：${details.join('；')}` : '补充检测项：无',
+    data.purchaseReview ? `采购补充说明：${data.purchaseReview}` : '采购补充说明：无',
   ].join('\n');
 }
 
@@ -517,6 +520,10 @@ export default function NewDevelopmentSystem({
 
   const decidePurchaseSellingPoint = useCallback(async (point: string, decision: 'accepted' | 'rejected') => {
     if (!selected || selected.id <= 0) return;
+    if (autoSaveRef.current) {
+      window.clearTimeout(autoSaveRef.current);
+      autoSaveRef.current = null;
+    }
     setSaving(true);
     try {
       const saved = await api(`/newdev/projects/${selected.id}/purchase-selling-point`, {
@@ -1153,7 +1160,29 @@ function ProjectEditor({
             onDeleteUpload={onDeleteUpload}
           />
         </div>
-        <LineList label="参考链接" value={asArray<string>(data.referenceLinks)} inputClass={inputClass} disabled={!canEdit} placeholder="粘贴参考链接" onChange={value => onDataPatch({ referenceLinks: value })} />
+        <CollaborativeList
+          label="参考链接"
+          tone="reference"
+          rows={normalizeRows(data.referenceLinks)}
+          authors={{}}
+          editors={{}}
+          imagesByText={{}}
+          imageFieldPrefix="referenceLinks"
+          inputClass={inputClass}
+          disabled={!canEdit}
+          uploadingField={uploadingField}
+          currentUsername={currentUsername}
+          editLocks={data.editLocks || {}}
+          token={token}
+          placeholder="粘贴参考链接"
+          showImages={false}
+          onRowsChange={nextRows => onDataPatch({ referenceLinks: nextRows })}
+          onLockChange={(key, locked) => onDataPatch({
+            editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
+          })}
+          onUpload={onUpload}
+          onDeleteUpload={onDeleteUpload}
+        />
       </Section>
     );
   }
@@ -1161,25 +1190,15 @@ function ProjectEditor({
   if (visibleStepKey === 'purchase') {
     const items = asArray<any>(data.purchaseItems).length
       ? asArray<any>(data.purchaseItems)
-      : normalizeRows(data.testItems).map(name => ({ name, status: 'pending' }));
-    const purchaseSellingRows = normalizeRows(data.purchaseSellingPoints);
+      : normalizeRows(data.testItems).filter(name => name.trim()).map(name => ({ sourceName: name, name, status: 'pending', detail: '', reason: '' }));
     return (
       <Section title="采购审核检测项" className={panel}>
         <label className="flex items-center gap-2 text-sm font-medium text-slate-400">
           <input type="checkbox" className="h-4 w-4 accent-sky-500" checked={notifyOperationsOnPurchase} onChange={e => onNotifyOperationsChange(e.target.checked)} />
           采购完成后通知运营部门
         </label>
-        <LineList
-          label="采购添加卖点"
-          value={purchaseSellingRows}
-          inputClass={inputClass}
-          disabled={!canEdit}
-          placeholder="填写采购建议卖点"
-          onChange={value => onDataPatch({ purchaseSellingPoints: value })}
-        />
-        <ImageReview title="检测项补充图片" groups={imageGroups(data, 'test')} token={token} />
         <PurchaseItems items={items} inputClass={inputClass} disabled={!canEdit} onChange={next => onDataPatch({ purchaseItems: next })} />
-        <TextArea label="采购审核说明" value={data.purchaseReview || ''} onChange={value => onDataPatch({ purchaseReview: value })} {...fieldProps} />
+        <TextArea label="采购补充说明" value={data.purchaseReview || ''} onChange={value => onDataPatch({ purchaseReview: value })} {...fieldProps} />
       </Section>
     );
   }
@@ -1319,13 +1338,14 @@ function CollaborativeList({
   editLocks,
   token,
   placeholder,
+  showImages = true,
   onRowsChange,
   onLockChange,
   onUpload,
   onDeleteUpload,
 }: {
   label: string;
-  tone: 'selling' | 'test';
+  tone: 'selling' | 'test' | 'reference';
   rows: string[];
   authors: Record<string, string>;
   editors: Record<string, string>;
@@ -1338,6 +1358,7 @@ function CollaborativeList({
   editLocks: Record<string, { username?: string; at?: number } | undefined>;
   token?: string;
   placeholder?: string;
+  showImages?: boolean;
   onRowsChange: (rows: string[]) => void;
   onLockChange: (key: string, locked: boolean) => void;
   onUpload: (field: string, files: FileList | File[] | null) => void;
@@ -1352,13 +1373,21 @@ function CollaborativeList({
         active: 'border-sky-300 bg-sky-500/15 ring-2 ring-sky-300/40',
         text: 'text-sky-200',
       }
-    : {
+    : tone === 'test' ? {
         shell: 'border-violet-500/35 bg-violet-500/10',
         row: 'border-violet-500/20 bg-violet-950/30',
         button: 'bg-violet-600 hover:bg-violet-500',
         upload: 'border-violet-700 bg-violet-950/50 hover:border-violet-400',
         active: 'border-violet-300 bg-violet-500/15 ring-2 ring-violet-300/40',
         text: 'text-violet-200',
+      }
+    : {
+        shell: 'border-emerald-500/35 bg-emerald-500/10',
+        row: 'border-emerald-500/20 bg-emerald-950/30',
+        button: 'bg-emerald-600 hover:bg-emerald-500',
+        upload: 'border-emerald-700 bg-emerald-950/50 hover:border-emerald-400',
+        active: 'border-emerald-300 bg-emerald-500/15 ring-2 ring-emerald-300/40',
+        text: 'text-emerald-200',
       };
   const valueRows = rows.length ? rows : [''];
   const [dragField, setDragField] = useState<string | null>(null);
@@ -1408,7 +1437,7 @@ function CollaborativeList({
           const remaining = Math.max(0, 3 - files.length);
           return (
             <div key={`${imageFieldPrefix}-row-${index}`} className={`rounded-lg border p-3 ${color.row}`}>
-              <div className="grid gap-3 lg:grid-cols-[1fr_220px]">
+              <div className={`grid gap-3 ${showImages ? 'lg:grid-cols-[1fr_220px]' : ''}`}>
                 <div>
                   <div className="flex gap-2">
                     <input
@@ -1427,10 +1456,10 @@ function CollaborativeList({
                     )}
                   </div>
                   <div className="mt-1 text-xs text-slate-500">
-                    {clean ? `添加人：${authors?.[clean] || '-'} · 最后编辑：${editors?.[clean] || authors?.[clean] || '-'}` : lockedByOther ? `${lock?.username} 新建了空白行，正在编辑` : '空白行会立即同步给其他人'}
+                    {showImages && clean ? `添加人：${authors?.[clean] || '-'} · 最后编辑：${editors?.[clean] || authors?.[clean] || '-'}` : lockedByOther ? `${lock?.username} 新建了空白行，正在编辑` : '空白行会立即同步给其他人'}
                   </div>
                 </div>
-                <div>
+                {showImages && <div>
                   <div className="mb-1 text-xs font-bold text-slate-400">补充图片 {files.length}/3</div>
                   {!disabled && !lockedByOther && (
                     <label
@@ -1502,7 +1531,7 @@ function CollaborativeList({
                       </div>
                     ))}
                   </div>
-                </div>
+                </div>}
               </div>
             </div>
           );
@@ -1721,32 +1750,47 @@ function ReviewUploads({ data, token }: { data: Record<string, any>; token?: str
 }
 
 function PurchaseItems({ items, disabled, inputClass, onChange }: { items: any[]; disabled?: boolean; inputClass: string; onChange: (items: any[]) => void }) {
-  const rows = items.length ? items : [{ name: '', status: 'pending' }];
+  const rows = items.length ? items : [{ sourceName: '', name: '', status: 'pending', detail: '', reason: '' }];
   const patch = (index: number, value: any) => onChange(rows.map((item, i) => i === index ? { ...item, ...value } : item));
   return (
     <div>
       <div className="mb-2 text-sm font-semibold">检测项目审核</div>
-      <div className="space-y-2">
+      <div className="space-y-3">
         {rows.map((item, index) => (
-          <div key={index} className="grid gap-2 md:grid-cols-[1fr_auto]">
-            <input className={inputClass} disabled={disabled} value={item.name || ''} placeholder="检测项目名称" onChange={event => patch(index, { name: event.target.value })} />
-            <div className="flex gap-2">
-              <button type="button" disabled={disabled} onClick={() => patch(index, { status: 'pass' })} className={`rounded-lg px-3 py-2 text-sm font-bold ${item.status === 'pass' ? 'bg-sky-600 text-white' : 'bg-slate-700 text-slate-300'} disabled:opacity-60`}>
-                <Check className="h-4 w-4" />
-              </button>
-              <button type="button" disabled={disabled} onClick={() => patch(index, { status: 'fail' })} className={`rounded-lg px-3 py-2 text-sm font-bold ${item.status === 'fail' ? 'bg-red-600 text-white' : 'bg-slate-700 text-slate-300'} disabled:opacity-60`}>
-                <X className="h-4 w-4" />
-              </button>
+          <div key={index} className="rounded-lg border border-slate-800 bg-slate-950/40 p-3">
+            <div className="grid gap-3 lg:grid-cols-[1fr_auto]">
+              <div>
+                <div className="mb-1 text-xs font-bold text-slate-400">运营提供的需要检测项目</div>
+                <input className={inputClass} disabled value={item.sourceName || item.name || ''} />
+              </div>
+              <div>
+                <div className="mb-1 text-xs font-bold text-slate-400">是否可检测</div>
+                <div className="flex gap-2">
+                  <button type="button" disabled={disabled} onClick={() => patch(index, { status: 'pass' })} className={`inline-flex h-10 w-10 items-center justify-center rounded-lg text-sm font-bold ${item.status === 'pass' ? 'bg-emerald-600 text-white' : 'bg-slate-700 text-slate-300'} disabled:opacity-60`} title="可以检测">
+                    <Check className="h-4 w-4" />
+                  </button>
+                  <button type="button" disabled={disabled} onClick={() => patch(index, { status: 'fail' })} className={`inline-flex h-10 w-10 items-center justify-center rounded-lg text-sm font-bold ${item.status === 'fail' ? 'bg-red-600 text-white' : 'bg-slate-700 text-slate-300'} disabled:opacity-60`} title="不可检测">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="mt-3">
+              {item.status === 'fail' ? (
+                <>
+                  <div className="mb-1 text-xs font-bold text-slate-400">不可检测原因</div>
+                  <input className={inputClass} disabled={disabled} value={item.reason || ''} placeholder="填写不能检测的原因" onChange={event => patch(index, { reason: event.target.value })} />
+                </>
+              ) : (
+                <>
+                  <div className="mb-1 text-xs font-bold text-slate-400">具体检测项</div>
+                  <input className={inputClass} disabled={disabled} value={item.detail || item.name || ''} placeholder="补充具体检测项" onChange={event => patch(index, { detail: event.target.value, name: event.target.value || item.sourceName || item.name })} />
+                </>
+              )}
             </div>
           </div>
         ))}
       </div>
-      {!disabled && (
-        <button type="button" onClick={() => onChange([...rows, { name: '', status: 'pending' }])} className="mt-2 inline-flex items-center gap-2 rounded-lg bg-sky-600 px-3 py-2 text-sm font-bold text-white hover:bg-sky-500">
-          <Plus className="h-4 w-4" />
-          增加检测项目
-        </button>
-      )}
     </div>
   );
 }

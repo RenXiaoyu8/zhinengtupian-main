@@ -899,6 +899,23 @@ function mergeCollaborativeNewDevData(oldData: any, nextData: any, username: str
     merged.sellingPointAuthors[point] = oldAuthors[point] || nextAuthors[point] || username;
     merged.sellingPointEditors[point] = nextEditors[point] || oldEditors[point] || username;
   }
+  const oldProposalStatus = oldData?.purchaseSellingPointStatus && typeof oldData.purchaseSellingPointStatus === 'object' && !Array.isArray(oldData.purchaseSellingPointStatus)
+    ? oldData.purchaseSellingPointStatus
+    : {};
+  const nextProposalStatus = nextData?.purchaseSellingPointStatus && typeof nextData.purchaseSellingPointStatus === 'object' && !Array.isArray(nextData.purchaseSellingPointStatus)
+    ? nextData.purchaseSellingPointStatus
+    : {};
+  merged.purchaseSellingPointStatus = { ...nextProposalStatus, ...oldProposalStatus };
+  const acceptedPurchasePoints = (Array.isArray(oldData?.purchaseSellingPoints) ? oldData.purchaseSellingPoints : [])
+    .map((item: any) => String(item || '').trim())
+    .filter((point: string) => point && merged.purchaseSellingPointStatus?.[point] === 'accepted');
+  for (const point of acceptedPurchasePoints) {
+    if (!merged.sellingPoints.map((item: any) => String(item || '').trim()).includes(point)) {
+      merged.sellingPoints = [...merged.sellingPoints.filter((item: any) => String(item || '').trim()), point];
+      merged.sellingPointAuthors[point] = oldAuthors[point] || nextAuthors[point] || username;
+      merged.sellingPointEditors[point] = nextEditors[point] || oldEditors[point] || username;
+    }
+  }
   const oldTestAuthors = oldData?.testItemAuthors && typeof oldData.testItemAuthors === 'object' ? oldData.testItemAuthors : {};
   const nextTestAuthors = nextData?.testItemAuthors && typeof nextData.testItemAuthors === 'object' ? nextData.testItemAuthors : {};
   const oldTestEditors = oldData?.testItemEditors && typeof oldData.testItemEditors === 'object' ? oldData.testItemEditors : {};
