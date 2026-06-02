@@ -1403,20 +1403,21 @@ app.post('/api/newdev/projects', authenticate, (req: any, res) => {
   `).get(title, barcode, createdBy, duplicateSince) as any;
   if (duplicate) return res.json(projectRowToJson(duplicate));
   const createdAt = nowIso();
-  const stepKey = 'initiation';
+  const creationStepKey = 'initiation';
+  const stepKey = 'selling';
   const linkedProduct = ensureProductFromNewDev(body);
   const data = appendProjectHistory(compactProjectData({ ...(body.data || {}), ...linkedProduct }), {
     user: createdBy,
-    stepKey,
-    stepLabel: stepLabel(stepKey),
+    stepKey: creationStepKey,
+    stepLabel: stepLabel(creationStepKey),
     action: 'create',
-    summary: '创建新品项目',
+    summary: `创建新品项目，并进入${stepLabel(stepKey)}`,
     changes: [
       { field: 'title', label: '产品名称', from: '', to: title },
       ...(barcode ? [{ field: 'barcode', label: '条码', from: '', to: barcode }] : []),
       ...(body.standard ? [{ field: 'standard', label: '执行标准', from: '', to: String(body.standard || '') }] : []),
       ...(body.brand ? [{ field: 'brand', label: '品牌', from: '', to: String(body.brand || '') }] : []),
-      ...(body.spec ? [{ field: 'spec', label: '规格', from: '', to: String(body.spec || '') }] : []),
+      ...(body.spec ? [{ field: 'spec', label: '货号', from: '', to: String(body.spec || '') }] : []),
     ],
   });
   const result = db.prepare(`
