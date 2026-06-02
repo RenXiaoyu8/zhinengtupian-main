@@ -107,6 +107,8 @@ Remove-TrackedIgnoredPath "dist"
 Remove-TrackedIgnoredPath "release"
 Remove-TrackedIgnoredPath "releases"
 Remove-TrackedIgnoredPath "tmp-asar"
+Remove-TrackedIgnoredPath "scripts/__pycache__"
+Remove-TrackedIgnoredPath "user-manager/__pycache__"
 
 $pathsToAdd = [System.Collections.Generic.List[string]]::new()
 

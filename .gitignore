@@ -6,6 +6,8 @@ releases/*.zip
 uploads/
 tmp-asar/
 coverage/
+__pycache__/
+*.pyc
 .DS_Store
 *.log
 .env*
