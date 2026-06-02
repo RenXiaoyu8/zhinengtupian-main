@@ -888,6 +888,7 @@ function mergeEditableStringsByIndex(oldList: any, nextList: any): string[] {
 }
 
 function mergeFilesByPath(oldFiles: any, nextFiles: any, limit = 3): any[] {
+  if (Array.isArray(nextFiles)) return nextFiles.slice(0, limit);
   const result: any[] = [];
   const seen = new Set<string>();
   for (const file of [...(Array.isArray(oldFiles) ? oldFiles : []), ...(Array.isArray(nextFiles) ? nextFiles : [])]) {
@@ -2660,7 +2661,7 @@ app.post('/api/upload', authenticate, (req: any, res: any, next: any) => {
         return res.status(400).json({ error: '路径非法' });
       }
 
-      if (conflictStrategyRaw !== 'overwrite' && conflictStrategyRaw !== 'rename' && fs.existsSync(desiredPath)) {
+      if (conflictStrategyRaw === 'ask' && fs.existsSync(desiredPath)) {
         conflictedFiles.push({
           name: path.basename(desiredPath),
           path: path.join(targetDir, safeRel).replace(/\\/g, '/')

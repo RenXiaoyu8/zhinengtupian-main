@@ -1246,6 +1246,7 @@ function ProjectEditor({
           采购完成后通知运营部门
         </label>
         <PurchaseItems items={items} authors={data.testItemAuthors || {}} editors={data.testItemEditors || {}} inputClass={inputClass} disabled={!canEdit} onChange={next => onDataPatch({ purchaseItems: next })} />
+        <ImageReview title="运营上传的检测项图片" groups={imageGroups(data, 'test')} token={token} />
         <TextArea label="采购补充说明" value={data.purchaseReview || ''} onChange={value => onDataPatch({ purchaseReview: value })} {...fieldProps} />
       </Section>
     );
@@ -1681,13 +1682,22 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
   const name = file.name || file.path || '文件';
   const isImage = /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
   const href = downloadUrl(file.path, token);
+  const openFile = () => {
+    if (!href) return;
+    const opened = window.open(href, '_blank');
+    if (!opened) window.location.href = href;
+  };
   return (
     <div
       className="group relative overflow-hidden rounded-lg border border-slate-800 bg-slate-950/70"
-      onDoubleClick={() => { if (href) window.open(href, '_blank', 'noopener,noreferrer'); }}
+      onDoubleClick={event => {
+        event.preventDefault();
+        event.stopPropagation();
+        openFile();
+      }}
       title="双击打开"
     >
-      <a href={href || undefined} target="_blank" rel="noreferrer" className="block">
+      <button type="button" onClick={event => event.preventDefault()} className="block w-full text-left">
         <div className="flex aspect-video items-center justify-center bg-slate-900">
           {isImage ? <Thumbnail path={file.path} token={token} name={name} className="h-full w-full object-contain" /> : <FileText className="h-8 w-8 text-slate-500" />}
         </div>
@@ -1695,9 +1705,9 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
           {isImage ? <ImageIcon className="h-4 w-4 shrink-0 text-sky-400" /> : <FileText className="h-4 w-4 shrink-0 text-slate-400" />}
           <span className="min-w-0 truncate">{name}</span>
         </div>
-      </a>
+      </button>
       {canDelete && (
-        <button type="button" onClick={onDelete} className="absolute right-2 top-2 rounded bg-red-600/90 p-1 text-white opacity-0 transition group-hover:opacity-100">
+        <button type="button" onClick={event => { event.stopPropagation(); onDelete?.(); }} className="absolute right-2 top-2 rounded bg-red-600/90 p-1 text-white opacity-0 transition group-hover:opacity-100">
           <X className="h-4 w-4" />
         </button>
       )}
