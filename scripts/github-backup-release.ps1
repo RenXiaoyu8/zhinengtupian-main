@@ -193,7 +193,7 @@ Run-Git @("push", "origin", $branch)
 if (-not $tagExists) {
   Run-Git @("push", "origin", $tag)
 } else {
-  Run-Git @("push", "origin", "--tags")
+  Write-Host "Tag $tag already exists remotely or locally; skipped pushing tags again."
 }
 
 if (-not $SkipGithubRelease) {
