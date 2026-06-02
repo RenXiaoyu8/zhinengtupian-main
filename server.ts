@@ -348,7 +348,9 @@ type ProductFolderTemplateItem = {
 };
 
 const DEFAULT_PRODUCT_FOLDER_TEMPLATE: ProductFolderTemplateItem[] = [
-  { name: '产品图片', children: [{ name: '原图', children: [] }, { name: '主图', children: [] }, { name: '详情页', children: [] }] },
+  { name: '产品图片', children: [{ name: '原图', children: [] }, { name: '主图', children: [] }, { name: '详情页', children: [] }, { name: '白底图', children: [] }, { name: 'PSD源文件', children: [] }] },
+  { name: 'sku', children: [] },
+  { name: '包装', children: [{ name: '定稿源文件', children: [] }] },
   { name: '视频', children: [] },
   { name: '检测报告', children: [] },
 ];
@@ -1044,7 +1046,7 @@ function buildProjectChanges(row: any, body: any, oldData: any, nextData: any) {
     whiteBackgroundImages: '白底图',
     assignedDesigner: '指定设计',
     designSelfCheck: '自我审核提示词',
-    mainDetailSourceFiles: '主图详情源文件',
+    mainDetailSourceFiles: '主图详情页源文件',
     skuImages: 'SKU 图',
     mainImages: '主图',
     detailImages: '详情页',

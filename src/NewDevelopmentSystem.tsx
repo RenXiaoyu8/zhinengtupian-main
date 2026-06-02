@@ -72,7 +72,7 @@ const dataLabels: Record<string, string> = {
   packagingSourceFiles: '包装源文件',
   packagingPreviewImages: '包装预览图',
   whiteBackgroundImages: '白底图',
-  mainDetailSourceFiles: '主图详情源文件',
+  mainDetailSourceFiles: '主图详情页源文件',
   skuImages: 'SKU 图',
   mainImages: '主图',
   detailImages: '详情页',
@@ -309,6 +309,12 @@ async function cloneClipboardFiles(files: File[]) {
 function fieldFolder(field: string, label: string) {
   if (field.startsWith('sellingPointImages:')) return `运营寻找卖点/卖点图片/${safePathName(label)}`;
   if (field.startsWith('testItemImages:')) return `运营寻找卖点/检测项图片/${safePathName(label)}`;
+  if (field === 'packagingSourceFiles' || field === 'packagingPreviewImages') return '包装/定稿源文件';
+  if (field === 'whiteBackgroundImages') return '产品图片/白底图';
+  if (field === 'mainDetailSourceFiles') return '产品图片/PSD源文件';
+  if (field === 'skuImages') return 'sku';
+  if (field === 'mainImages') return '产品图片/主图';
+  if (field === 'detailImages') return '产品图片/详情页';
   return dataLabels[field] || field;
 }
 
@@ -1267,7 +1273,7 @@ function ProjectEditor({
             {data.opsRejectText && <p className="mt-1">运营退回：{data.opsRejectText}</p>}
           </div>
         )}
-        <FileUploader label="主图详情源文件" field="mainDetailSourceFiles" files={asArray(data.mainDetailSourceFiles)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
+        <FileUploader label="主图详情页源文件" field="mainDetailSourceFiles" files={asArray(data.mainDetailSourceFiles)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
         <FileUploader label="SKU 图" field="skuImages" files={asArray(data.skuImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
         <FileUploader label="主图" field="mainImages" files={asArray(data.mainImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
         <FileUploader label="详情页" hint="详情页内容请上传整套页面文件或截图" field="detailImages" files={asArray(data.detailImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
@@ -1732,7 +1738,7 @@ function ImageReview({ title, groups, token }: { title: string; groups: { text: 
 
 function ReviewUploads({ data, token }: { data: Record<string, any>; token?: string }) {
   const groups = [
-    { label: '主图详情源文件', files: asArray<FileRef>(data.mainDetailSourceFiles) },
+    { label: '主图详情页源文件', files: asArray<FileRef>(data.mainDetailSourceFiles) },
     { label: 'SKU 图', files: asArray<FileRef>(data.skuImages) },
     { label: '主图', files: asArray<FileRef>(data.mainImages) },
     { label: '详情页', files: asArray<FileRef>(data.detailImages) },
