@@ -28,6 +28,24 @@ function Run-Git {
   }
 }
 
+function Run-GitWithRetry {
+  param(
+    [string[]]$GitArgs,
+    [int]$Retries = 2
+  )
+  $attempt = 0
+  while ($true) {
+    & git @GitArgs
+    if ($LASTEXITCODE -eq 0) { return }
+    if ($attempt -ge $Retries) {
+      throw "git $($GitArgs -join ' ') failed with exit code $LASTEXITCODE"
+    }
+    $attempt += 1
+    Write-Host "[WARN] git $($GitArgs -join ' ') failed; retrying ($attempt/$Retries)..." -ForegroundColor Yellow
+    Start-Sleep -Seconds (2 * $attempt)
+  }
+}
+
 function Add-ExistingPath {
   param(
     [System.Collections.Generic.List[string]]$List,
@@ -189,11 +207,14 @@ if ($LASTEXITCODE -eq 0) {
   Run-Git @("tag", $tag)
 }
 
-Run-Git @("push", "origin", $branch)
-if (-not $tagExists) {
-  Run-Git @("push", "origin", $tag)
+Run-GitWithRetry @("push", "origin", $branch)
+$remoteTag = (& git ls-remote --tags origin $tag)
+if ($remoteTag) {
+  Write-Host "Tag $tag already exists on remote; skipped pushing tag."
+} elseif (-not $tagExists) {
+  Run-GitWithRetry @("push", "origin", $tag)
 } else {
-  Write-Host "Tag $tag already exists remotely or locally; skipped pushing tags again."
+  Run-GitWithRetry @("push", "origin", $tag)
 }
 
 if (-not $SkipGithubRelease) {
