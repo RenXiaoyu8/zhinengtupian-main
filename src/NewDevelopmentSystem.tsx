@@ -9,6 +9,7 @@ import {
   Image as ImageIcon,
   PackageOpen,
   Plus,
+  Copy,
   RotateCcw,
   Save,
   Settings,
@@ -526,6 +527,15 @@ export default function NewDevelopmentSystem({
     });
   }, [canEditSelected, scheduleSellingAutosave, selected]);
 
+  const copyText = useCallback(async (text: string, message = '已复制') => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setNotice(message);
+    } catch (_) {
+      setNotice('复制失败');
+    }
+  }, []);
+
   const decidePurchaseSellingPoint = useCallback(async (point: string, decision: 'accepted' | 'rejected') => {
     if (!selected || selected.id <= 0) return;
     if (autoSaveRef.current) {
@@ -998,6 +1008,7 @@ export default function NewDevelopmentSystem({
                 onUpload={uploadFiles}
                 onDeleteUpload={deleteUpload}
                 onTransfer={transfer}
+                onCopy={copyText}
               />
 
               {canEditSelected ? (
@@ -1088,6 +1099,7 @@ function ProjectEditor({
   onUpload,
   onDeleteUpload,
   onTransfer,
+  onCopy,
 }: {
   project: NewDevProject;
   steps: StepConfig[];
@@ -1109,6 +1121,7 @@ function ProjectEditor({
   onUpload: (field: string, files: FileList | File[] | null) => void;
   onDeleteUpload: (field: string, index: number) => void;
   onTransfer: (assignee: string) => void;
+  onCopy: (text: string, message?: string) => void;
 }) {
   const data = project.data || {};
   const fieldProps = { className: inputClass, disabled: !canEdit };
@@ -1260,31 +1273,7 @@ function ProjectEditor({
       <Section title="主图详情页设计" className={panel}>
         <DesignerTransfer designers={designers} disabled={!canEdit} inputClass={inputClass} onTransfer={onTransfer} current={data.transferredTo} />
         <div className="rounded-lg border border-slate-700 bg-slate-950/40 p-4">
-          <div className="mb-3 text-sm font-bold">卖点与检测总览</div>
-          <div className="grid gap-4 lg:grid-cols-2">
-            <ImageReview title="卖点补充图片" groups={imageGroups(data, 'selling')} token={token} />
-            <ImageReview title="检测项补充图片" groups={imageGroups(data, 'test')} token={token} />
-          </div>
-          <div className="mt-4 grid gap-4 lg:grid-cols-2">
-            <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-              <div className="mb-2 text-xs font-bold text-slate-400">卖点</div>
-              <div className="space-y-2 text-sm">
-                {normalizeRows(data.sellingPoints).filter(Boolean).map((text, index) => (
-                  <div key={`${text}-${index}`} className="rounded bg-slate-900/80 px-3 py-2">{index + 1}. {text}</div>
-                ))}
-                {!normalizeRows(data.sellingPoints).filter(Boolean).length && <div className="text-xs text-slate-500">暂无卖点</div>}
-              </div>
-            </div>
-            <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-              <div className="mb-2 text-xs font-bold text-slate-400">检测项</div>
-              <div className="space-y-2 text-sm">
-                {normalizeRows(data.testItems).filter(Boolean).map((text, index) => (
-                  <div key={`${text}-${index}`} className="rounded bg-slate-900/80 px-3 py-2">{index + 1}. {text}</div>
-                ))}
-                {!normalizeRows(data.testItems).filter(Boolean).length && <div className="text-xs text-slate-500">暂无检测项</div>}
-              </div>
-            </div>
-          </div>
+          <MainDetailBrief data={data} token={token} onCopy={onCopy} />
         </div>
         {(data.leaderRejectText || data.opsRejectText || asArray(data.leaderRejectImages).length || asArray(data.opsRejectImages).length) && (
           <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm">
@@ -1695,7 +1684,11 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
   const isImage = /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
   const href = downloadUrl(file.path, token);
   return (
-    <div className="group relative overflow-hidden rounded-lg border border-slate-800 bg-slate-950/70">
+    <div
+      className="group relative overflow-hidden rounded-lg border border-slate-800 bg-slate-950/70"
+      onDoubleClick={() => { if (href) window.open(href, '_blank', 'noopener,noreferrer'); }}
+      title="双击打开"
+    >
       <a href={href || undefined} target="_blank" rel="noreferrer" className="block">
         <div className="flex aspect-video items-center justify-center bg-slate-900">
           {isImage ? <Thumbnail path={file.path} token={token} name={name} className="h-full w-full object-contain" /> : <FileText className="h-8 w-8 text-slate-500" />}
@@ -1710,6 +1703,68 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
           <X className="h-4 w-4" />
         </button>
       )}
+    </div>
+  );
+}
+
+function MainDetailBrief({ data, token, onCopy }: { data: Record<string, any>; token?: string; onCopy: (text: string, message?: string) => void }) {
+  const sellingGroups = imageGroups(data, 'selling');
+  const testGroups = imageGroups(data, 'test');
+  const sellingMap = new Map(sellingGroups.map(group => [group.text, group.files]));
+  const testMap = new Map(testGroups.map(group => [group.text, group.files]));
+  const sellingRows = normalizeRows(data.sellingPoints).map(row => row.trim()).filter(Boolean);
+  const testRows = normalizeRows(data.testItems).map(row => row.trim()).filter(Boolean);
+  const allText = [
+    '卖点：',
+    ...(sellingRows.length ? sellingRows.map((text, index) => `${index + 1}. ${text}`) : ['无']),
+    '',
+    '检测项目：',
+    ...(testRows.length ? testRows.map((text, index) => `${index + 1}. ${text}`) : ['无']),
+  ].join('\n');
+
+  const renderRows = (title: string, rows: string[], filesMap: Map<string, FileRef[]>) => (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="text-sm font-bold">{title}</div>
+        <button type="button" onClick={() => onCopy(rows.map((text, index) => `${index + 1}. ${text}`).join('\n') || '无', `已复制${title}`)} className="inline-flex items-center gap-1 rounded-lg bg-slate-700 px-2 py-1 text-xs font-bold text-white hover:bg-slate-600">
+          <Copy className="h-3.5 w-3.5" />
+          复制
+        </button>
+      </div>
+      <div className="space-y-3">
+        {rows.map((text, index) => {
+          const files = filesMap.get(text) || [];
+          return (
+            <div key={`${title}-${text}-${index}`} className="grid gap-3 rounded-lg border border-slate-800 bg-slate-900/60 p-3 lg:grid-cols-[minmax(0,1fr)_280px]">
+              <div className="select-text whitespace-pre-wrap break-words text-sm leading-6 text-slate-100">
+                {index + 1}. {text}
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {files.length ? files.map((file, fileIndex) => (
+                  <FileCard key={`${file.path || file.name}-${fileIndex}`} file={file} token={token} />
+                )) : <div className="col-span-3 text-xs text-slate-500">暂无图片</div>}
+              </div>
+            </div>
+          );
+        })}
+        {!rows.length && <div className="text-xs text-slate-500">暂无内容</div>}
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="text-sm font-bold">卖点与检测总览</div>
+        <button type="button" onClick={() => onCopy(allText, '已复制全部文字')} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-3 py-2 text-xs font-bold text-white hover:bg-sky-500">
+          <Copy className="h-4 w-4" />
+          复制全部
+        </button>
+      </div>
+      <div className="space-y-4">
+        {renderRows('卖点', sellingRows, sellingMap)}
+        {renderRows('检测项目', testRows, testMap)}
+      </div>
     </div>
   );
 }

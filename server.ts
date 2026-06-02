@@ -914,7 +914,7 @@ function mergeCollaborativeNewDevData(oldData: any, nextData: any, username: str
   const merged = { ...oldData, ...nextData };
   const sellingPoints = mergeEditableStringsByIndex(oldData?.sellingPoints, nextData?.sellingPoints);
   const testItems = mergeEditableStringsByIndex(oldData?.testItems, nextData?.testItems);
-  const referenceLinks = mergeUniqueStrings(oldData?.referenceLinks, nextData?.referenceLinks);
+  const referenceLinks = mergeEditableStringsByIndex(oldData?.referenceLinks, nextData?.referenceLinks);
   merged.sellingPoints = sellingPoints;
   merged.testItems = testItems;
   merged.referenceLinks = referenceLinks;
