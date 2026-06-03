@@ -828,6 +828,12 @@ export default function NewDevelopmentSystem({
               <Plus className="h-4 w-4" />
               新建新品
             </button>
+            {canManage && (
+              <button type="button" onClick={() => setShowSettings(true)} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-sm font-bold text-white hover:bg-slate-600">
+                <Settings className="h-4 w-4" />
+                权限设置
+              </button>
+            )}
             <button type="button" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white" onClick={() => refresh()}>
               <RotateCcw className="h-4 w-4" />
             </button>
@@ -974,12 +980,6 @@ export default function NewDevelopmentSystem({
                       历史
                     </button>
                     {canManage && (
-                      <button type="button" onClick={() => setShowSettings(true)} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-sm font-bold text-white hover:bg-slate-600">
-                        <Settings className="h-4 w-4" />
-                        设置
-                      </button>
-                    )}
-                    {canManage && (
                       <button type="button" onClick={removeProject} className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-3 py-2 text-sm font-bold text-white hover:bg-red-500">
                         <Trash2 className="h-4 w-4" />
                         删除
@@ -1051,25 +1051,35 @@ export default function NewDevelopmentSystem({
               />
 
               {canEditSelected ? (
-                <div className={`sticky bottom-0 flex flex-wrap justify-end gap-2 border-t py-4 backdrop-blur ${theme === 'dark' ? 'border-slate-800 bg-slate-950/85' : 'border-slate-200 bg-slate-50/85'}`}>
-                  <button type="button" disabled={saving} onClick={() => saveProject()} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600 disabled:opacity-50">
-                    <Save className="h-4 w-4" />
-                    {saving ? '保存中...' : '保存'}
+                <div className={`sticky bottom-0 flex flex-wrap items-center justify-between gap-2 border-t py-4 backdrop-blur ${theme === 'dark' ? 'border-slate-800 bg-slate-950/85' : 'border-slate-200 bg-slate-50/85'}`}>
+                  <button type="button" onClick={() => setScreen('list')} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600">
+                    <ArrowLeft className="h-4 w-4" />
+                    返回
                   </button>
-                  {['leaderReview', 'opsReview'].includes(selected.currentStepKey) && (
-                    <button type="button" disabled={saving} onClick={rejectToDesign} className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-4 py-2 text-sm font-bold text-white hover:bg-amber-500 disabled:opacity-50">
-                      <ArrowLeft className="h-4 w-4" />
-                      退回修改
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <button type="button" disabled={saving} onClick={() => saveProject()} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600 disabled:opacity-50">
+                      <Save className="h-4 w-4" />
+                      {saving ? '保存中...' : '保存'}
                     </button>
-                  )}
-                  <button type="button" disabled={saving} onClick={advance} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500 disabled:opacity-50">
-                    <Check className="h-4 w-4" />
-                    提交下一步
-                  </button>
+                    {['leaderReview', 'opsReview'].includes(selected.currentStepKey) && (
+                      <button type="button" disabled={saving} onClick={rejectToDesign} className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-4 py-2 text-sm font-bold text-white hover:bg-amber-500 disabled:opacity-50">
+                        <ArrowLeft className="h-4 w-4" />
+                        退回修改
+                      </button>
+                    )}
+                    <button type="button" disabled={saving} onClick={advance} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500 disabled:opacity-50">
+                      <Check className="h-4 w-4" />
+                      提交下一步
+                    </button>
+                  </div>
                 </div>
               ) : (
-                <div className={`sticky bottom-0 border-t py-4 text-right text-sm text-slate-500 backdrop-blur ${theme === 'dark' ? 'border-slate-800 bg-slate-950/85' : 'border-slate-200 bg-slate-50/85'}`}>
-                  只读模式
+                <div className={`sticky bottom-0 flex items-center justify-between gap-2 border-t py-4 text-sm text-slate-500 backdrop-blur ${theme === 'dark' ? 'border-slate-800 bg-slate-950/85' : 'border-slate-200 bg-slate-50/85'}`}>
+                  <button type="button" onClick={() => setScreen('list')} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600">
+                    <ArrowLeft className="h-4 w-4" />
+                    返回
+                  </button>
+                  <span>只读模式</span>
                 </div>
               )}
             </div>
@@ -2123,6 +2133,90 @@ function TextArea({ label, value, className, disabled, onChange }: { label: stri
   );
 }
 
+function RecipientPicker({
+  title,
+  hint,
+  users,
+  selectedDepartments,
+  selectedUsers,
+  onDepartmentsChange,
+  onUsersChange,
+}: {
+  title: string;
+  hint?: string;
+  users: ManagedUser[];
+  selectedDepartments: string[];
+  selectedUsers: string[];
+  onDepartmentsChange: (departments: string[]) => void;
+  onUsersChange: (users: string[]) => void;
+}) {
+  const departments = useMemo(() => [...new Set(users.map(member => String(member.role || '未分部门').trim() || '未分部门'))], [users]);
+  const [departmentView, setDepartmentView] = useState<string | null>(null);
+  const visibleUsers = useMemo(() => {
+    if (!departmentView) return users;
+    return users.filter(member => (member.role || '未分部门') === departmentView);
+  }, [departmentView, users]);
+  const toggle = (list: string[], value: string) => list.includes(value) ? list.filter(item => item !== value) : [...list, value];
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/30 p-3">
+      <div className="mb-3">
+        <div className="text-sm font-bold text-slate-100">{title}</div>
+        {hint && <div className="mt-1 text-xs text-slate-500">{hint}</div>}
+        <div className="mt-1 text-xs text-slate-500">
+          部门：{selectedDepartments.join('、') || '-'} · 人员：{selectedUsers.join('、') || '-'}
+        </div>
+      </div>
+      <div className="grid gap-3 md:grid-cols-2">
+        <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+          <div className="mb-2 text-xs font-bold text-slate-400">按部门选择</div>
+          <div className="max-h-48 overflow-y-auto divide-y divide-slate-800">
+            {departments.map(department => (
+              <div key={department} className={`flex items-center justify-between gap-2 py-2 text-sm ${departmentView === department ? 'text-sky-300' : ''}`}>
+                <button type="button" onClick={() => setDepartmentView(department)} className="min-w-0 flex-1 truncate text-left font-semibold">
+                  {department}
+                </button>
+                <label className="flex items-center gap-2 text-xs text-slate-500">
+                  全部
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-sky-500"
+                    checked={selectedDepartments.includes(department)}
+                    onChange={() => onDepartmentsChange(toggle(selectedDepartments, department))}
+                  />
+                </label>
+              </div>
+            ))}
+            {!departments.length && <div className="py-4 text-center text-sm text-slate-500">暂无部门</div>}
+          </div>
+        </div>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+          <div className="mb-2 flex items-center justify-between gap-2 text-xs font-bold text-slate-400">
+            <span>{departmentView ? `${departmentView}人员` : '按人员选择'}</span>
+            {departmentView && <button type="button" onClick={() => setDepartmentView(null)} className="text-xs text-sky-400">查看全部</button>}
+          </div>
+          <div className="max-h-48 overflow-y-auto divide-y divide-slate-800">
+            {visibleUsers.map(member => (
+              <label key={member.username} className="flex items-center justify-between gap-2 py-2 text-sm">
+                <span className="min-w-0">
+                  <span className="block truncate font-semibold text-slate-100">{member.username}</span>
+                  <span className="block truncate text-xs text-slate-500">{member.role || '-'}</span>
+                </span>
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 accent-sky-500"
+                  checked={selectedUsers.includes(member.username)}
+                  onChange={() => onUsersChange(toggle(selectedUsers, member.username))}
+                />
+              </label>
+            ))}
+            {!visibleUsers.length && <div className="py-4 text-center text-sm text-slate-500">暂无账号</div>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Section({ title, className, children }: { title: string; className: string; children: React.ReactNode }) {
   return (
     <div className={`rounded-lg border p-5 ${className}`}>
@@ -2152,7 +2246,6 @@ function SettingsEditor({
   const [currentIndex, setCurrentIndex] = useState(opsRotation?.currentIndex || 0);
   const [purchaseUsers, setPurchaseUsers] = useState<string[]>(purchaseNotificationUsers || []);
   const updateStep = (index: number, patch: Partial<StepConfig>) => setLocalSteps(value => value.map((step, i) => i === index ? { ...step, ...patch } : step));
-  const departments = useMemo(() => [...new Set(users.map(member => String(member.role || '未分部门').trim() || '未分部门'))], [users]);
   const opsCandidates = useMemo(() => users.filter(item => /运营/.test(item.role || '') || /运营/.test(item.username || '')), [users]);
   const selectedOps = opsUsers.filter(name => users.some(member => member.username === name));
   const normalizedCurrentIndex = selectedOps.length ? Math.min(Math.max(0, currentIndex), selectedOps.length - 1) : 0;
@@ -2170,20 +2263,6 @@ function SettingsEditor({
   const toggleOpsUser = (username: string, checked: boolean) => {
     setOpsUsers(value => checked ? [...value.filter(Boolean), username].filter((name, index, list) => list.indexOf(name) === index) : value.filter(name => name !== username));
     setCurrentIndex(value => Math.max(0, Math.min(value, Math.max(0, (checked ? opsUsers.length + 1 : opsUsers.length - 1) - 1))));
-  };
-  const toggleStepUser = (stepIndex: number, username: string, checked: boolean) => {
-    updateStep(stepIndex, {
-      assigneeUsernames: checked
-        ? [...new Set([...localSteps[stepIndex].assigneeUsernames, username])]
-        : localSteps[stepIndex].assigneeUsernames.filter(name => name !== username),
-    });
-  };
-  const toggleStepDepartment = (stepIndex: number, department: string, checked: boolean) => {
-    updateStep(stepIndex, {
-      assigneePositions: checked
-        ? [...new Set([...localSteps[stepIndex].assigneePositions, department])]
-        : localSteps[stepIndex].assigneePositions.filter(name => name !== department),
-    });
   };
   const toggleNotificationUser = (username: string, checked: boolean) => setPurchaseUsers(value => checked ? [...new Set([...value, username])] : value.filter(name => name !== username));
   return (
@@ -2242,8 +2321,8 @@ function SettingsEditor({
 
       <div className="rounded-lg border border-slate-800 bg-slate-950/30 p-4">
         <div className="mb-3">
-          <div className="text-base font-bold text-slate-100">每个步骤负责人</div>
-          <div className="text-xs text-slate-400">可以选择整个部门，也可以单独选择某些人；流程到这一步时，会通知选中的负责人。</div>
+          <div className="text-base font-bold text-slate-100">每个步骤的权限和通知</div>
+          <div className="text-xs text-slate-400">负责人决定谁能处理这一步；超时通知人群决定这一步超时后提醒谁。</div>
         </div>
         <div className="space-y-3">
           {localSteps.map((step, index) => (
@@ -2260,32 +2339,25 @@ function SettingsEditor({
                   <input className="w-20 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-100 outline-none focus:border-sky-400" type="number" min={0} value={step.durationHours} onChange={event => updateStep(index, { durationHours: Number(event.target.value || 0) })} />
                 </label>
               </div>
-              <div className="grid gap-3 lg:grid-cols-2">
-                <div>
-                  <div className="mb-2 text-xs font-bold text-slate-400">按部门选择</div>
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    {departments.map(department => (
-                      <label key={department} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/40 p-2 text-sm">
-                        <span>{department}</span>
-                        <input type="checkbox" checked={step.assigneePositions.includes(department)} onChange={event => toggleStepDepartment(index, department, event.target.checked)} />
-                      </label>
-                    ))}
-                  </div>
-                </div>
-                <div>
-                  <div className="mb-2 text-xs font-bold text-slate-400">按人员选择</div>
-                  <div className="grid max-h-48 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
-                    {users.map(member => (
-                      <label key={member.username} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/40 p-2 text-sm">
-                        <span className="min-w-0">
-                          <span className="block truncate font-semibold text-slate-100">{member.username}</span>
-                          <span className="block truncate text-xs text-slate-500">{member.role || '-'}</span>
-                        </span>
-                        <input type="checkbox" checked={step.assigneeUsernames.includes(member.username)} onChange={event => toggleStepUser(index, member.username, event.target.checked)} />
-                      </label>
-                    ))}
-                  </div>
-                </div>
+              <div className="grid gap-3 xl:grid-cols-2">
+                <RecipientPicker
+                  title="步骤负责人"
+                  hint="流程进入这一步时，会通知并允许这些部门/人员处理。"
+                  users={users}
+                  selectedDepartments={step.assigneePositions}
+                  selectedUsers={step.assigneeUsernames}
+                  onDepartmentsChange={assigneePositions => updateStep(index, { assigneePositions })}
+                  onUsersChange={assigneeUsernames => updateStep(index, { assigneeUsernames })}
+                />
+                <RecipientPicker
+                  title="超时通知人群"
+                  hint="这一步超过限时后，会提醒这些部门/人员跟进。"
+                  users={users}
+                  selectedDepartments={step.escalationPositions}
+                  selectedUsers={step.escalationUsernames}
+                  onDepartmentsChange={escalationPositions => updateStep(index, { escalationPositions })}
+                  onUsersChange={escalationUsernames => updateStep(index, { escalationUsernames })}
+                />
               </div>
             </div>
           ))}
