@@ -921,6 +921,18 @@ function mergeCollaborativeNewDevData(oldData: any, nextData: any, username: str
   merged.referenceLinks = referenceLinks;
   merged.sellingPointImages = mergeMapByKeys(oldData?.sellingPointImages, nextData?.sellingPointImages, sellingPoints.filter(Boolean), mergeFilesByPath);
   merged.testItemImages = mergeMapByKeys(oldData?.testItemImages, nextData?.testItemImages, testItems.filter(Boolean), mergeFilesByPath);
+  const nextSellingImages = nextData?.sellingPointImages && typeof nextData.sellingPointImages === 'object' && !Array.isArray(nextData.sellingPointImages)
+    ? nextData.sellingPointImages
+    : {};
+  const nextTestImages = nextData?.testItemImages && typeof nextData.testItemImages === 'object' && !Array.isArray(nextData.testItemImages)
+    ? nextData.testItemImages
+    : {};
+  for (const [key, value] of Object.entries(nextSellingImages)) {
+    if (Array.isArray(value)) merged.sellingPointImages[key] = value.slice(0, 3);
+  }
+  for (const [key, value] of Object.entries(nextTestImages)) {
+    if (Array.isArray(value)) merged.testItemImages[key] = value.slice(0, 3);
+  }
   const oldAuthors = oldData?.sellingPointAuthors && typeof oldData.sellingPointAuthors === 'object' ? oldData.sellingPointAuthors : {};
   const nextAuthors = nextData?.sellingPointAuthors && typeof nextData.sellingPointAuthors === 'object' ? nextData.sellingPointAuthors : {};
   const oldEditors = oldData?.sellingPointEditors && typeof oldData.sellingPointEditors === 'object' ? oldData.sellingPointEditors : {};
