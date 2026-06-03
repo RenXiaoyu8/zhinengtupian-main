@@ -960,6 +960,9 @@ function mergeCollaborativeNewDevData(oldData: any, nextData: any, username: str
     ? nextData.purchaseSellingPointStatus
     : {};
   merged.purchaseSellingPointStatus = { ...nextProposalStatus, ...oldProposalStatus };
+  for (const [point, status] of Object.entries(nextProposalStatus)) {
+    if (status === 'reset') delete merged.purchaseSellingPointStatus[point];
+  }
   const acceptedPurchasePoints = (Array.isArray(oldData?.purchaseSellingPoints) ? oldData.purchaseSellingPoints : [])
     .map((item: any) => String(item || '').trim())
     .filter((point: string) => point && merged.purchaseSellingPointStatus?.[point] === 'accepted');
@@ -1630,26 +1633,39 @@ app.post('/api/newdev/projects/:id/purchase-selling-point', authenticate, (req: 
   const point = String(req.body?.point || '').trim();
   const decision = String(req.body?.decision || '').trim();
   if (!point) return res.status(400).json({ error: '卖点不能为空' });
-  if (decision !== 'accepted' && decision !== 'rejected') return res.status(400).json({ error: '处理结果无效' });
+  if (!['accepted', 'rejected', 'reset'].includes(decision)) return res.status(400).json({ error: '处理结果无效' });
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   const oldData = parseProjectData(row);
   const status = oldData.purchaseSellingPointStatus && typeof oldData.purchaseSellingPointStatus === 'object' && !Array.isArray(oldData.purchaseSellingPointStatus)
     ? { ...oldData.purchaseSellingPointStatus }
     : {};
-  let nextData: any = { ...oldData, purchaseSellingPointStatus: { ...status, [point]: decision } };
+  let nextStatus: any = { ...status, [point]: decision };
+  if (decision === 'reset') {
+    nextStatus = { ...status };
+    delete nextStatus[point];
+  }
+  let nextData: any = { ...oldData, purchaseSellingPointStatus: nextStatus };
   if (decision === 'accepted') {
     const currentPoints = Array.isArray(nextData.sellingPoints) ? nextData.sellingPoints.map((item: any) => String(item || '')) : [];
     if (!currentPoints.map((item: string) => item.trim()).includes(point)) nextData.sellingPoints = [...currentPoints.filter((item: string) => item.trim()), point];
     nextData.sellingPointAuthors = { ...(nextData.sellingPointAuthors || {}), [point]: nextData.sellingPointAuthors?.[point] || username };
     nextData.sellingPointEditors = { ...(nextData.sellingPointEditors || {}), [point]: username };
+  } else if (decision === 'reset') {
+    nextData.sellingPoints = (Array.isArray(nextData.sellingPoints) ? nextData.sellingPoints : []).filter((item: any) => String(item || '').trim() !== point);
+    nextData.sellingPointAuthors = { ...(nextData.sellingPointAuthors || {}) };
+    nextData.sellingPointEditors = { ...(nextData.sellingPointEditors || {}) };
+    nextData.sellingPointImages = { ...(nextData.sellingPointImages || {}) };
+    delete nextData.sellingPointAuthors[point];
+    delete nextData.sellingPointEditors[point];
+    delete nextData.sellingPointImages[point];
   }
   nextData = appendProjectHistory(compactProjectData(nextData), {
     user: username,
     stepKey: row.current_step_key,
     stepLabel: stepLabel(row.current_step_key),
-    action: decision === 'accepted' ? 'accept-purchase-selling-point' : 'reject-purchase-selling-point',
-    summary: `${decision === 'accepted' ? '采纳' : '不采纳'}采购卖点：${point}`,
-    changes: [{ field: 'purchaseSellingPoints', label: '采购添加卖点', from: point, to: decision === 'accepted' ? '已采纳并复制到运营卖点' : '不采纳' }],
+    action: decision === 'accepted' ? 'accept-purchase-selling-point' : decision === 'reset' ? 'reset-purchase-selling-point' : 'reject-purchase-selling-point',
+    summary: `${decision === 'accepted' ? '采纳' : decision === 'reset' ? '取消采纳' : '不采纳'}采购卖点：${point}`,
+    changes: [{ field: 'purchaseSellingPoints', label: '采购添加卖点', from: point, to: decision === 'accepted' ? '已采纳并复制到运营卖点' : decision === 'reset' ? '已取消采纳并从运营卖点删除' : '不采纳' }],
   });
   db.prepare('UPDATE newdev_projects SET data_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(compactProjectData(nextData)), nowIso(), id);
   res.json(projectRowToJson(db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id)));

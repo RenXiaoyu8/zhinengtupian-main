@@ -617,7 +617,7 @@ export default function NewDevelopmentSystem({
     return asArray<FileRef>(data.files);
   }, [user.token]);
 
-  const decidePurchaseSellingPoint = useCallback(async (point: string, decision: 'accepted' | 'rejected') => {
+  const decidePurchaseSellingPoint = useCallback(async (point: string, decision: 'accepted' | 'rejected' | 'reset') => {
     if (!selected || selected.id <= 0) return;
     if (autoSaveRef.current) {
       window.clearTimeout(autoSaveRef.current);
@@ -631,7 +631,7 @@ export default function NewDevelopmentSystem({
       }) as NewDevProject;
       lastAutoSavedKeyRef.current[saved.id] = projectDraftKey(saved);
       setProjects(prev => prev.map(item => item.id === saved.id ? saved : item));
-      setNotice(decision === 'accepted' ? '已采纳并复制到运营卖点' : '已处理');
+      setNotice(decision === 'accepted' ? '已采纳并复制到运营卖点' : decision === 'reset' ? '已取消采纳并删除运营卖点' : '已处理');
     } finally {
       setSaving(false);
     }
@@ -1343,7 +1343,7 @@ function ProjectEditor({
   onNotifyOperationsChange: (value: boolean) => void;
   onProjectPatch: (patch: Partial<NewDevProject>) => void;
   onDataPatch: (patch: Record<string, any>) => void;
-  onPurchaseSellingPointDecision: (point: string, decision: 'accepted' | 'rejected') => void;
+  onPurchaseSellingPointDecision: (point: string, decision: 'accepted' | 'rejected' | 'reset') => void;
   onUpload: (field: string, files: FileList | File[] | null) => void;
   onDeleteUpload: (field: string, index: number) => void;
   onTransfer: (assignee: string) => void;
@@ -1374,9 +1374,15 @@ function ProjectEditor({
                   <div key={`${point}-${index}`} className="flex flex-col gap-2 rounded-lg border border-amber-500/20 bg-slate-950/40 p-3 md:flex-row md:items-center md:justify-between">
                     <div className="min-w-0 text-sm text-slate-100">{point}</div>
                     <div className="flex shrink-0 gap-2">
-                      <button type="button" disabled={!canReviewPurchaseSelling || status === 'accepted'} onClick={() => onPurchaseSellingPointDecision(point, 'accepted')} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-500 disabled:opacity-50">
-                        {status === 'accepted' ? '已采纳' : '采纳复制到卖点'}
-                      </button>
+                      {status === 'accepted' ? (
+                        <button type="button" disabled={!canReviewPurchaseSelling} onClick={() => onPurchaseSellingPointDecision(point, 'reset')} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-500 disabled:opacity-50">
+                          删除采纳
+                        </button>
+                      ) : (
+                        <button type="button" disabled={!canReviewPurchaseSelling} onClick={() => onPurchaseSellingPointDecision(point, 'accepted')} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-500 disabled:opacity-50">
+                          采纳复制到卖点
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
