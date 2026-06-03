@@ -405,6 +405,7 @@ export default function NewDevelopmentSystem({
   const [notice, setNotice] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showRollback, setShowRollback] = useState(false);
   const [screen, setScreen] = useState<'list' | 'create' | 'detail'>('list');
   const [detailStepKey, setDetailStepKey] = useState<string | null>(null);
   const [notifyOperationsOnPurchase, setNotifyOperationsOnPurchase] = useState(true);
@@ -822,18 +823,11 @@ export default function NewDevelopmentSystem({
 
   const rollbackProgress = async () => {
     if (!selected || !canManage) return;
-    const choices = steps
-      .filter(step => step.stepKey !== 'done')
-      .map((step, index) => `${index + 1}. ${step.label}`)
-      .join('\n');
-    const input = window.prompt(`请选择要回退到的步骤序号：\n${choices}`);
-    if (!input) return;
-    const selectedIndex = Number(input.trim()) - 1;
-    const targetStep = steps.filter(step => step.stepKey !== 'done')[selectedIndex];
-    if (!targetStep) {
-      setNotice('请选择有效的步骤序号');
-      return;
-    }
+    setShowRollback(true);
+  };
+
+  const rollbackToStep = async (targetStep: StepConfig) => {
+    if (!selected || !canManage) return;
     if (!window.confirm(`确认把「${selected.title || '未命名新品'}」回退到「${targetStep.label}」吗？`)) return;
     setSaving(true);
     try {
@@ -844,6 +838,7 @@ export default function NewDevelopmentSystem({
       lastAutoSavedKeyRef.current[saved.id] = projectDraftKey(saved);
       setProjects(prev => prev.map(item => item.id === saved.id ? saved : item));
       setDetailStepKey(targetStep.stepKey);
+      setShowRollback(false);
       setNotice(`已回退到：${targetStep.label}`);
     } catch (err: any) {
       setNotice(err.message || '回退失败');
@@ -1256,6 +1251,33 @@ export default function NewDevelopmentSystem({
               </div>
             ))}
             {!asArray(selected.data?.history).length && <div className="text-sm text-slate-500">暂无历史记录</div>}
+          </div>
+        </Modal>
+      )}
+
+      {showRollback && selected && (
+        <Modal title="手动回退进度" onClose={() => setShowRollback(false)}>
+          <div className="space-y-3">
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+              请选择要回退到的步骤。回退后会通知该步骤负责人，流程历史里也会记录本次管理员操作。
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {steps.filter(step => step.stepKey !== 'done').map(step => {
+                const isCurrent = step.stepKey === selected.currentStepKey && !selected.completedAt;
+                return (
+                  <button
+                    key={step.stepKey}
+                    type="button"
+                    disabled={saving || isCurrent}
+                    onClick={() => rollbackToStep(step)}
+                    className={`rounded-lg border px-4 py-3 text-left text-sm transition disabled:cursor-not-allowed disabled:opacity-50 ${isCurrent ? 'border-sky-500/50 bg-sky-500/10 text-sky-100' : theme === 'dark' ? 'border-slate-700 bg-slate-900 text-slate-100 hover:border-amber-400 hover:bg-amber-500/10' : 'border-slate-200 bg-white text-slate-800 hover:border-amber-400 hover:bg-amber-50'}`}
+                  >
+                    <div className="font-bold">{step.stepOrder}. {step.label}</div>
+                    <div className="mt-1 text-xs opacity-70">{isCurrent ? '当前步骤' : '回退到这里'}</div>
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </Modal>
       )}
