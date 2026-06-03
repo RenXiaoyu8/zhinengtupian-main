@@ -255,6 +255,16 @@ function stampAuthors(nextRows: string[], oldRows: string[], previous: any, user
   return next;
 }
 
+function resetAcceptedPurchaseStatuses(data: Record<string, any>, oldRows: string[], nextRows: string[]) {
+  const status = proposalStatusMap(data.purchaseSellingPointStatus);
+  const nextSet = new Set(nextRows.map(row => String(row || '').trim()).filter(Boolean));
+  const patch: Record<string, 'accepted' | 'rejected' | 'reset'> = {};
+  oldRows.map(row => String(row || '').trim()).filter(Boolean).forEach(point => {
+    if (status[point] === 'accepted' && !nextSet.has(point)) patch[point] = 'reset';
+  });
+  return Object.keys(patch).length ? { ...status, ...patch } : status;
+}
+
 function imageGroups(data: Record<string, any>, type: 'selling' | 'test') {
   const rows = normalizeRows(type === 'selling' ? data.sellingPoints : data.testItems);
   const images = type === 'selling' ? data.sellingPointImages : data.testItemImages;
@@ -1410,6 +1420,7 @@ function ProjectEditor({
               sellingPoints: nextRows,
               sellingPointImages: mapImagesByRows(data.sellingPointImages, sellingRows, nextRows),
               sellingPointEditors: stampEditors(nextRows, sellingRows, data.sellingPointEditors, currentUsername),
+              purchaseSellingPointStatus: resetAcceptedPurchaseStatuses(data, sellingRows, nextRows),
             })}
             onLockChange={(key, locked) => onDataPatch({
               editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
