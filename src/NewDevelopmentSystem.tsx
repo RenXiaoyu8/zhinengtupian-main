@@ -90,6 +90,12 @@ const dataLabels: Record<string, string> = {
 };
 
 const stepOrder = ['initiation', 'selling', 'purchase', 'packaging', 'mainDetail', 'leaderReview', 'opsReview', 'done'];
+const rowImageEditorFields: Record<string, string> = {
+  sellingPointImages: 'sellingPointEditors',
+  testItemImages: 'testItemEditors',
+  leaderRejectIssueImages: 'leaderRejectIssueEditors',
+  opsRejectIssueImages: 'opsRejectIssueEditors',
+};
 
 function asArray<T = any>(value: any): T[] {
   return Array.isArray(value) ? value : [];
@@ -344,6 +350,12 @@ function fieldFolder(field: string, label: string) {
   return dataLabels[field] || field;
 }
 
+function canRoleSupplementStep(role: string, stepKey: string) {
+  if ((stepKey === 'selling' || stepKey === 'opsReview') && /运营/.test(role || '')) return true;
+  if (stepKey === 'leaderReview' && /组长|主管|leader/i.test(role || '')) return true;
+  return false;
+}
+
 export default function NewDevelopmentSystem({
   theme,
   user,
@@ -400,7 +412,7 @@ export default function NewDevelopmentSystem({
   const canManage = !!user.permissions?.canManageNewDevelopment || !!user.permissions?.canManageUsers || user.username === '任小雨';
   const canReviewPurchaseSelling = canManage || /运营/.test(user.role || '') || /杩愯惀/.test(user.role || '');
   const viewingCurrentStep = !!selected && (!visibleStepKey || visibleStepKey === selected.currentStepKey);
-  const canEditSelected = !!selected && viewingCurrentStep && !selected.completedAt && (canManage || selected.assignees?.includes(user.username) || (['selling', 'opsReview'].includes(selected.currentStepKey) && /运营/.test(user.role || '')));
+  const canEditSelected = !!selected && viewingCurrentStep && !selected.completedAt && (canManage || selected.assignees?.includes(user.username) || canRoleSupplementStep(user.role || '', selected.currentStepKey));
   const readOnlyReason = selected?.completedAt
     ? '这个新品流程已经完成，只能查看，不能继续编辑。'
     : (!viewingCurrentStep && selected ? '你正在查看历史/其他步骤，只能查看，不能在这里编辑。' : (!canEditSelected && selected ? '你可以查看这个新品流程，但当前步骤不由你处理，不能编辑。' : ''));
@@ -659,17 +671,11 @@ export default function NewDevelopmentSystem({
       if (!response.ok) throw new Error(data?.error || '上传失败');
       const uploaded = asArray<FileRef>(data.files);
       let nextData = { ...(selected.data || {}) };
-      if (field.startsWith('sellingPointImages:') || field.startsWith('testItemImages:') || field.startsWith('leaderRejectIssueImages:') || field.startsWith('opsRejectIssueImages:')) {
+      if (rowImageEditorFields[cleanField]) {
         const [parent, ...rest] = field.split(':');
         const key = rest.join(':');
         const current = nextData[parent] && typeof nextData[parent] === 'object' ? nextData[parent] : {};
-        const editorField = parent === 'sellingPointImages'
-          ? 'sellingPointEditors'
-          : parent === 'testItemImages'
-            ? 'testItemEditors'
-            : parent === 'leaderRejectIssueImages'
-              ? 'leaderRejectIssueEditors'
-              : 'opsRejectIssueEditors';
+        const editorField = rowImageEditorFields[parent];
         nextData = {
           ...nextData,
           [parent]: {
@@ -698,7 +704,7 @@ export default function NewDevelopmentSystem({
       return;
     }
     let nextData = { ...(selected.data || {}) };
-    if (field.startsWith('sellingPointImages:') || field.startsWith('testItemImages:') || field.startsWith('leaderRejectIssueImages:') || field.startsWith('opsRejectIssueImages:')) {
+    if (rowImageEditorFields[field.split(':')[0]]) {
       const [parent, ...rest] = field.split(':');
       const key = rest.join(':');
       const current = nextData[parent] && typeof nextData[parent] === 'object' ? nextData[parent] : {};

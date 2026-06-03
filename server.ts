@@ -549,6 +549,10 @@ function isOpsUser(user: { username?: string; role?: string }) {
   return /运营/.test(String(user.role || '')) || /运营/.test(String(user.username || ''));
 }
 
+function isLeaderReviewUser(user: { username?: string; role?: string }) {
+  return /组长|主管|leader/i.test(String(user.role || '')) || /组长|主管|leader/i.test(String(user.username || ''));
+}
+
 function opsUsernames(): string[] {
   return loadJsonUsers()
     .filter(isOpsUser)
@@ -688,9 +692,14 @@ function canOperateNewDevStep(req: any, stepKey: string): boolean {
 
 function canSupplementNewDevStep(req: any, stepKey: string): boolean {
   if (canOperateNewDevStep(req, stepKey)) return true;
-  if (stepKey !== 'selling' && stepKey !== 'opsReview') return false;
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
-  return !!username && opsUsernames().includes(username);
+  if (!username) return false;
+  if ((stepKey === 'selling' || stepKey === 'opsReview') && opsUsernames().includes(username)) return true;
+  if (stepKey === 'leaderReview') {
+    const currentUser = loadJsonUsers().find(u => String(u.username || '').trim() === username);
+    return isLeaderReviewUser({ username, role: currentUser?.role || (req.user as JwtUser | undefined)?.role || '' });
+  }
+  return false;
 }
 
 function canReviewPurchaseSellingPoint(req: any): boolean {
