@@ -13,17 +13,31 @@ Write-Host 'Stopping scheduled backend task...'
 
 function Stop-ProcessTree {
   param([int]$ProcessId)
-  if ($ProcessId -le 0 -or $ProcessId -eq $PID) { return }
+  if ($ProcessId -le 4 -or $ProcessId -eq $PID) { return }
   try {
-    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    & taskkill.exe /PID $ProcessId /T /F *> $null
   } catch {}
+}
+
+function Get-ListeningPortOwners {
+  param([int]$Port)
+  $owners = New-Object System.Collections.Generic.HashSet[int]
+  try {
+    $pattern = "^\s*TCP\s+\S+:$Port\s+\S+\s+(LISTENING|监听)\s+(\d+)\s*$"
+    & netstat.exe -ano -p tcp 2>$null |
+      ForEach-Object {
+        if ($_ -match $pattern) {
+          [void]$owners.Add([int]$Matches[2])
+        }
+      }
+  } catch {}
+  return @($owners)
 }
 
 Write-Host 'Stopping backend ports...'
 foreach ($port in @(43123, 3000)) {
-  $owners = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
-    Select-Object -ExpandProperty OwningProcess -Unique
-  foreach ($owner in $owners) {
+  Write-Host "  port $port"
+  foreach ($owner in (Get-ListeningPortOwners -Port $port)) {
     Stop-ProcessTree -ProcessId ([int]$owner)
   }
 }
@@ -39,7 +53,7 @@ Get-Process -ErrorAction SilentlyContinue |
   ForEach-Object { Stop-ProcessTree -ProcessId $_.Id }
 
 Write-Host 'Stopping workspace helper processes...'
-$nameFilter = "Name = 'node.exe' OR Name = 'electron.exe' OR Name = 'tsx.exe' OR Name = 'powershell.exe' OR Name = 'pwsh.exe'"
+$nameFilter = "Name = 'node.exe' OR Name = 'electron.exe' OR Name = 'tsx.exe'"
 $rootPattern = [regex]::Escape($Root)
 Get-CimInstance Win32_Process -Filter $nameFilter -ErrorAction SilentlyContinue |
   Where-Object {
@@ -54,3 +68,4 @@ Get-CimInstance Win32_Process -Filter $nameFilter -ErrorAction SilentlyContinue 
   ForEach-Object { Stop-ProcessTree -ProcessId ([int]$_.ProcessId) }
 
 Write-Host 'Close step complete.'
+exit 0
