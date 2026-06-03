@@ -7,6 +7,8 @@ import {
   FileText,
   History,
   Image as ImageIcon,
+  MoveDown,
+  MoveUp,
   PackageOpen,
   Plus,
   Copy,
@@ -2150,45 +2152,165 @@ function SettingsEditor({
   const [currentIndex, setCurrentIndex] = useState(opsRotation?.currentIndex || 0);
   const [purchaseUsers, setPurchaseUsers] = useState<string[]>(purchaseNotificationUsers || []);
   const updateStep = (index: number, patch: Partial<StepConfig>) => setLocalSteps(value => value.map((step, i) => i === index ? { ...step, ...patch } : step));
-  const toggleUser = (username: string, checked: boolean) => setPurchaseUsers(value => checked ? [...new Set([...value, username])] : value.filter(name => name !== username));
+  const departments = useMemo(() => [...new Set(users.map(member => String(member.role || '未分部门').trim() || '未分部门'))], [users]);
+  const opsCandidates = useMemo(() => users.filter(item => /运营/.test(item.role || '') || /运营/.test(item.username || '')), [users]);
+  const selectedOps = opsUsers.filter(name => users.some(member => member.username === name));
+  const normalizedCurrentIndex = selectedOps.length ? Math.min(Math.max(0, currentIndex), selectedOps.length - 1) : 0;
+  const rotateOps = (username: string, direction: -1 | 1) => {
+    setOpsUsers(value => {
+      const list = value.filter(name => users.some(member => member.username === name));
+      const index = list.indexOf(username);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= list.length) return list;
+      const next = [...list];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      return next;
+    });
+  };
+  const toggleOpsUser = (username: string, checked: boolean) => {
+    setOpsUsers(value => checked ? [...value.filter(Boolean), username].filter((name, index, list) => list.indexOf(name) === index) : value.filter(name => name !== username));
+    setCurrentIndex(value => Math.max(0, Math.min(value, Math.max(0, (checked ? opsUsers.length + 1 : opsUsers.length - 1) - 1))));
+  };
+  const toggleStepUser = (stepIndex: number, username: string, checked: boolean) => {
+    updateStep(stepIndex, {
+      assigneeUsernames: checked
+        ? [...new Set([...localSteps[stepIndex].assigneeUsernames, username])]
+        : localSteps[stepIndex].assigneeUsernames.filter(name => name !== username),
+    });
+  };
+  const toggleStepDepartment = (stepIndex: number, department: string, checked: boolean) => {
+    updateStep(stepIndex, {
+      assigneePositions: checked
+        ? [...new Set([...localSteps[stepIndex].assigneePositions, department])]
+        : localSteps[stepIndex].assigneePositions.filter(name => name !== department),
+    });
+  };
+  const toggleNotificationUser = (username: string, checked: boolean) => setPurchaseUsers(value => checked ? [...new Set([...value, username])] : value.filter(name => name !== username));
   return (
-    <div className="space-y-4">
-      <div>
-        <div className="mb-2 text-sm font-bold">运营轮值</div>
-        <div className="grid gap-2 sm:grid-cols-2">
-          {users.filter(item => /运营/.test(item.role || '')).map(member => (
-            <label key={member.username} className="flex items-center gap-2 rounded-lg border border-slate-800 p-2 text-sm">
-              <input type="checkbox" checked={opsUsers.includes(member.username)} onChange={event => setOpsUsers(value => event.target.checked ? [...value, member.username] : value.filter(name => name !== member.username))} />
-              {member.username}
-            </label>
-          ))}
+    <div className="space-y-5">
+      <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-4">
+        <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <div className="text-base font-bold text-sky-100">运营轮值顺序</div>
+            <div className="text-xs text-slate-400">从本周开始依次轮换；可以选择参与人员，也可以上下调整顺序。</div>
+          </div>
+          <div className="text-xs text-slate-400">当前周：{opsRotation?.weekKey || '-'}</div>
         </div>
-        <input className={`${inputClass} mt-2`} type="number" min={0} value={currentIndex} onChange={event => setCurrentIndex(Number(event.target.value || 0))} />
-      </div>
-      <div>
-        <div className="mb-2 text-sm font-bold">采购审核结果通知对象</div>
-        <div className="grid gap-2 sm:grid-cols-2">
-          {users.map(member => (
-            <label key={member.username} className="flex items-center gap-2 rounded-lg border border-slate-800 p-2 text-sm">
-              <input type="checkbox" checked={purchaseUsers.includes(member.username)} onChange={event => toggleUser(member.username, event.target.checked)} />
-              {member.username} / {member.role || '-'}
-            </label>
-          ))}
-        </div>
-      </div>
-      <div className="space-y-3">
-        {localSteps.map((step, index) => (
-          <div key={step.stepKey} className="rounded-lg border border-slate-800 p-3">
-            <div className="mb-2 font-bold">{step.label}</div>
-            <div className="grid gap-2 md:grid-cols-3">
-              <input className={inputClass} type="number" min={0} value={step.durationHours} onChange={event => updateStep(index, { durationHours: Number(event.target.value || 0) })} />
-              <input className={inputClass} placeholder="负责人，逗号分隔" value={step.assigneeUsernames.join(',')} onChange={event => updateStep(index, { assigneeUsernames: event.target.value.split(',').map(v => v.trim()).filter(Boolean) })} />
-              <input className={inputClass} placeholder="负责人岗位，逗号分隔" value={step.assigneePositions.join(',')} onChange={event => updateStep(index, { assigneePositions: event.target.value.split(',').map(v => v.trim()).filter(Boolean) })} />
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,360px)]">
+          <div>
+            <div className="mb-2 text-xs font-bold text-slate-400">参与轮值的运营</div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {opsCandidates.map(member => (
+                <label key={member.username} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/40 p-2 text-sm">
+                  <span>
+                    <span className="font-semibold text-slate-100">{member.username}</span>
+                    <span className="ml-2 text-xs text-slate-500">{member.role || '-'}</span>
+                  </span>
+                  <input type="checkbox" checked={selectedOps.includes(member.username)} onChange={event => toggleOpsUser(member.username, event.target.checked)} />
+                </label>
+              ))}
             </div>
           </div>
-        ))}
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-xs font-bold text-slate-400">轮值顺序</div>
+              <select className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100" value={normalizedCurrentIndex} disabled={!selectedOps.length} onChange={event => setCurrentIndex(Number(event.target.value || 0))}>
+                {selectedOps.map((name, index) => <option key={name} value={index}>本周从 {name} 开始</option>)}
+              </select>
+            </div>
+            <div className="space-y-2">
+              {selectedOps.map((name, index) => (
+                <div key={name} className={`flex items-center gap-2 rounded-lg border p-2 text-sm ${index === normalizedCurrentIndex ? 'border-emerald-500/50 bg-emerald-500/10' : 'border-slate-800 bg-slate-950/40'}`}>
+                  <div className="flex h-7 w-14 shrink-0 items-center justify-center rounded bg-slate-800 text-xs font-bold text-slate-200">{index === normalizedCurrentIndex ? '本周' : `第${index + 1}`}</div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-semibold text-slate-100">{name}</div>
+                    <div className="text-xs text-slate-500">{index === (normalizedCurrentIndex + 1) % selectedOps.length ? '下周' : '轮值成员'}</div>
+                  </div>
+                  <button type="button" title="上移" disabled={index === 0} onClick={() => rotateOps(name, -1)} className="inline-flex h-8 w-8 items-center justify-center rounded bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-40">
+                    <MoveUp className="h-4 w-4" />
+                  </button>
+                  <button type="button" title="下移" disabled={index === selectedOps.length - 1} onClick={() => rotateOps(name, 1)} className="inline-flex h-8 w-8 items-center justify-center rounded bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-40">
+                    <MoveDown className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+              {!selectedOps.length && <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-3 text-sm text-slate-500">请选择参与轮值的运营人员</div>}
+            </div>
+          </div>
+        </div>
       </div>
-      <button type="button" className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500" onClick={() => onSave(localSteps, { usernames: opsUsers, currentIndex }, purchaseUsers)}>
+
+      <div className="rounded-lg border border-slate-800 bg-slate-950/30 p-4">
+        <div className="mb-3">
+          <div className="text-base font-bold text-slate-100">每个步骤负责人</div>
+          <div className="text-xs text-slate-400">可以选择整个部门，也可以单独选择某些人；流程到这一步时，会通知选中的负责人。</div>
+        </div>
+        <div className="space-y-3">
+          {localSteps.map((step, index) => (
+            <div key={step.stepKey} className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+              <div className="mb-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <div className="font-bold text-slate-100">{step.stepOrder}. {step.label}</div>
+                  <div className="text-xs text-slate-500">
+                    部门：{step.assigneePositions.join('、') || '-'} · 人员：{step.assigneeUsernames.join('、') || '-'}
+                  </div>
+                </div>
+                <label className="flex items-center gap-2 text-xs font-bold text-slate-400">
+                  限时小时
+                  <input className="w-20 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-100 outline-none focus:border-sky-400" type="number" min={0} value={step.durationHours} onChange={event => updateStep(index, { durationHours: Number(event.target.value || 0) })} />
+                </label>
+              </div>
+              <div className="grid gap-3 lg:grid-cols-2">
+                <div>
+                  <div className="mb-2 text-xs font-bold text-slate-400">按部门选择</div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {departments.map(department => (
+                      <label key={department} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/40 p-2 text-sm">
+                        <span>{department}</span>
+                        <input type="checkbox" checked={step.assigneePositions.includes(department)} onChange={event => toggleStepDepartment(index, department, event.target.checked)} />
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="mb-2 text-xs font-bold text-slate-400">按人员选择</div>
+                  <div className="grid max-h-48 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
+                    {users.map(member => (
+                      <label key={member.username} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/40 p-2 text-sm">
+                        <span className="min-w-0">
+                          <span className="block truncate font-semibold text-slate-100">{member.username}</span>
+                          <span className="block truncate text-xs text-slate-500">{member.role || '-'}</span>
+                        </span>
+                        <input type="checkbox" checked={step.assigneeUsernames.includes(member.username)} onChange={event => toggleStepUser(index, member.username, event.target.checked)} />
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
+        <div className="mb-3">
+          <div className="text-base font-bold text-amber-100">采购审核结果通知对象</div>
+          <div className="text-xs text-slate-400">采购审核完成后，把通过/不通过和修改内容通知给这些人。</div>
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {users.map(member => (
+            <label key={member.username} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/40 p-2 text-sm">
+              <span>
+                <span className="font-semibold text-slate-100">{member.username}</span>
+                <span className="ml-2 text-xs text-slate-500">{member.role || '-'}</span>
+              </span>
+              <input type="checkbox" checked={purchaseUsers.includes(member.username)} onChange={event => toggleNotificationUser(member.username, event.target.checked)} />
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <button type="button" className="sticky bottom-0 inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white shadow-lg shadow-black/30 hover:bg-sky-500" onClick={() => onSave(localSteps, { usernames: selectedOps, currentIndex: normalizedCurrentIndex }, purchaseUsers)}>
         <Save className="h-4 w-4" />
         保存设置
       </button>
@@ -2199,7 +2321,7 @@ function SettingsEditor({
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div className="max-h-[86vh] w-full max-w-4xl overflow-y-auto rounded-lg border border-slate-800 bg-slate-900 p-5 text-slate-100 shadow-2xl">
+      <div className="max-h-[86vh] w-full max-w-6xl overflow-y-auto rounded-lg border border-slate-800 bg-slate-900 p-5 text-slate-100 shadow-2xl">
         <div className="mb-4 flex items-center justify-between gap-3">
           <div className="text-lg font-bold">{title}</div>
           <button type="button" onClick={onClose} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white">

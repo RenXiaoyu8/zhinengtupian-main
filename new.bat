@@ -38,16 +38,23 @@ timeout /t 1 /nobreak >nul
 
 echo Cleaning native build cache...
 if exist "node_modules\better-sqlite3\build\Release\better_sqlite3.node" (
-  attrib -R "node_modules\better-sqlite3\build\Release\better_sqlite3.node" >nul 2>&1
-  del /f /q "node_modules\better-sqlite3\build\Release\better_sqlite3.node" >nul 2>&1
-  if exist "node_modules\better-sqlite3\build\Release\better_sqlite3.node" (
-    echo.
-    echo [ERROR] better_sqlite3.node is still locked.
-    echo Please close the app/backend windows, or reboot this computer, then publish again.
-    pause
-    exit /b 1
+  for /l %%i in (1,1,5) do (
+    attrib -R "node_modules\better-sqlite3\build\Release\better_sqlite3.node" >nul 2>&1
+    del /f /q "node_modules\better-sqlite3\build\Release\better_sqlite3.node" >nul 2>&1
+    if not exist "node_modules\better-sqlite3\build\Release\better_sqlite3.node" goto native_cache_cleaned
+    echo better_sqlite3.node is locked, retrying close step %%i/5...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\stop-running-app.ps1" -Root "%~dp0" >nul 2>&1
+    timeout /t 1 /nobreak >nul
   )
+  echo.
+  echo [ERROR] better_sqlite3.node is still locked.
+  echo Please close the app/backend windows, or reboot this computer, then publish again.
+  echo You can also run as Administrator:
+  echo   taskkill /F /T /IM node.exe
+  pause
+  exit /b 1
 )
+:native_cache_cleaned
 if exist "node_modules\better-sqlite3\build" rmdir /s /q "node_modules\better-sqlite3\build" >nul 2>&1
 if exist "node_modules\canvas\build" rmdir /s /q "node_modules\canvas\build" >nul 2>&1
 

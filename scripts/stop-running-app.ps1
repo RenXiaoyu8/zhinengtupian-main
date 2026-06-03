@@ -15,8 +15,23 @@ function Stop-ProcessTree {
   param([int]$ProcessId)
   if ($ProcessId -le 4 -or $ProcessId -eq $PID) { return }
   try {
-    & taskkill.exe /PID $ProcessId /T /F *> $null
+    & cmd.exe /c "taskkill /PID $ProcessId /T /F >nul 2>nul"
   } catch {}
+}
+
+function Stop-PortOwnerAndWatcher {
+  param([int]$ProcessId)
+  if ($ProcessId -le 4 -or $ProcessId -eq $PID) { return }
+  try {
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
+    if ($proc -and [int]$proc.ParentProcessId -gt 4 -and [int]$proc.ParentProcessId -ne $PID) {
+      $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$proc.ParentProcessId)" -ErrorAction SilentlyContinue
+      if ($parent -and ([string]$parent.Name).ToLowerInvariant() -in @('powershell.exe', 'pwsh.exe', 'cmd.exe')) {
+        Stop-ProcessTree -ProcessId ([int]$parent.ProcessId)
+      }
+    }
+  } catch {}
+  Stop-ProcessTree -ProcessId $ProcessId
 }
 
 function Get-ListeningPortOwners {
@@ -35,11 +50,17 @@ function Get-ListeningPortOwners {
 }
 
 Write-Host 'Stopping backend ports...'
-foreach ($port in @(43123, 3000)) {
-  Write-Host "  port $port"
-  foreach ($owner in (Get-ListeningPortOwners -Port $port)) {
-    Stop-ProcessTree -ProcessId ([int]$owner)
+for ($attempt = 1; $attempt -le 5; $attempt++) {
+  $stoppedAny = $false
+  foreach ($port in @(43123, 3000)) {
+    if ($attempt -eq 1) { Write-Host "  port $port" }
+    foreach ($owner in (Get-ListeningPortOwners -Port $port)) {
+      $stoppedAny = $true
+      Stop-PortOwnerAndWatcher -ProcessId ([int]$owner)
+    }
   }
+  if (-not $stoppedAny) { break }
+  Start-Sleep -Milliseconds 500
 }
 
 Write-Host 'Stopping Shangpin app processes...'
