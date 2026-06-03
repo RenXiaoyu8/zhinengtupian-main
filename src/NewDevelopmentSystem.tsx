@@ -820,6 +820,38 @@ export default function NewDevelopmentSystem({
     }
   };
 
+  const rollbackProgress = async () => {
+    if (!selected || !canManage) return;
+    const choices = steps
+      .filter(step => step.stepKey !== 'done')
+      .map((step, index) => `${index + 1}. ${step.label}`)
+      .join('\n');
+    const input = window.prompt(`请选择要回退到的步骤序号：\n${choices}`);
+    if (!input) return;
+    const selectedIndex = Number(input.trim()) - 1;
+    const targetStep = steps.filter(step => step.stepKey !== 'done')[selectedIndex];
+    if (!targetStep) {
+      setNotice('请选择有效的步骤序号');
+      return;
+    }
+    if (!window.confirm(`确认把「${selected.title || '未命名新品'}」回退到「${targetStep.label}」吗？`)) return;
+    setSaving(true);
+    try {
+      const saved = await api(`/newdev/projects/${selected.id}/rollback`, {
+        method: 'POST',
+        body: JSON.stringify({ targetStepKey: targetStep.stepKey, data: selected.data }),
+      });
+      lastAutoSavedKeyRef.current[saved.id] = projectDraftKey(saved);
+      setProjects(prev => prev.map(item => item.id === saved.id ? saved : item));
+      setDetailStepKey(targetStep.stepKey);
+      setNotice(`已回退到：${targetStep.label}`);
+    } catch (err: any) {
+      setNotice(err.message || '回退失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const transfer = async (assignee: string) => {
     if (!selected || !assignee) return;
     if (!canEditSelected) {
@@ -1093,10 +1125,16 @@ export default function NewDevelopmentSystem({
                       历史
                     </button>
                     {canManage && (
-                      <button type="button" onClick={removeProject} className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-3 py-2 text-sm font-bold text-white hover:bg-red-500">
-                        <Trash2 className="h-4 w-4" />
-                        删除
-                      </button>
+                      <>
+                        <button type="button" disabled={saving} onClick={rollbackProgress} className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-3 py-2 text-sm font-bold text-white hover:bg-amber-500 disabled:opacity-50">
+                          <RotateCcw className="h-4 w-4" />
+                          回退进度
+                        </button>
+                        <button type="button" onClick={removeProject} className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-3 py-2 text-sm font-bold text-white hover:bg-red-500">
+                          <Trash2 className="h-4 w-4" />
+                          删除
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -1304,6 +1342,9 @@ function ProjectEditor({
         {!!purchaseProposalRows.length && (
           <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
             <div className="mb-3 text-sm font-bold text-amber-200">采购添加卖点</div>
+            <div className="mb-3 rounded-lg border border-amber-400/40 bg-amber-400/15 px-3 py-2 text-sm font-bold text-amber-100">
+              提示：运营只有点击采纳后，这些采购卖点才会进入后续流程；未采纳的卖点，后面的包装、主图详情页和审核流程都不会显示。
+            </div>
             <div className="space-y-2">
               {purchaseProposalRows.map((point, index) => {
                 const status = purchaseProposalStatus[point];

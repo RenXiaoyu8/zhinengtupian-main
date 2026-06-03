@@ -1722,6 +1722,36 @@ app.post('/api/newdev/projects/:id/reject', authenticate, (req: any, res) => {
   res.json(projectRowToJson(db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id)));
 });
 
+app.post('/api/newdev/projects/:id/rollback', authenticate, (req: any, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
+  if (!row) return res.status(404).json({ error: '项目不存在' });
+  const username = String((req.user as JwtUser | undefined)?.username || '').trim();
+  const perms = getReqPermissions(req);
+  const canRollback = username === '任小雨' || !!perms.canManageNewDevelopment || canManageUsers(req);
+  if (!canRollback) return res.status(403).json({ error: '只有管理员可以手动回退进度' });
+
+  const targetStepKey = String(req.body?.targetStepKey || '').trim();
+  const targetStep = getStepConfigs().find(step => step.stepKey === targetStepKey);
+  if (!targetStep || targetStep.stepKey === 'done') return res.status(400).json({ error: '请选择有效的回退步骤' });
+  if (!row.completed_at && targetStep.stepKey === row.current_step_key) return res.status(400).json({ error: '当前已经在这个步骤' });
+
+  const oldData = parseProjectData(row);
+  const requestData = req.body?.data && typeof req.body.data === 'object' ? compactProjectData(req.body.data) : oldData;
+  const nextData = appendProjectHistory(requestData, {
+    user: username,
+    stepKey: row.current_step_key,
+    stepLabel: stepLabel(row.current_step_key),
+    action: 'rollback',
+    summary: `管理员手动回退进度：${stepLabel(row.current_step_key)} → ${stepLabel(targetStep.stepKey)}`,
+    changes: [],
+  });
+  db.prepare('UPDATE newdev_projects SET current_step_key = ?, due_at = ?, data_json = ?, updated_at = ?, completed_at = NULL WHERE id = ?')
+    .run(targetStep.stepKey, calculateDueAt(targetStep.stepKey), JSON.stringify(compactProjectData(nextData)), nowIso(), id);
+  createStepNotification(id, row.title, targetStep.stepKey);
+  res.json(projectRowToJson(db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id)));
+});
+
 app.post('/api/newdev/projects/:id/broadcast', authenticate, (req: any, res) => {
   const id = Number(req.params.id);
   const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
