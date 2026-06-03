@@ -981,6 +981,17 @@ function mergeCollaborativeNewDevData(oldData: any, nextData: any, username: str
     merged.testItemAuthors[item] = oldTestAuthors[item] || nextTestAuthors[item] || username;
     merged.testItemEditors[item] = nextTestEditors[item] || oldTestEditors[item] || username;
   }
+  const oldReferenceAuthors = oldData?.referenceLinkAuthors && typeof oldData.referenceLinkAuthors === 'object' ? oldData.referenceLinkAuthors : {};
+  const nextReferenceAuthors = nextData?.referenceLinkAuthors && typeof nextData.referenceLinkAuthors === 'object' ? nextData.referenceLinkAuthors : {};
+  const oldReferenceEditors = oldData?.referenceLinkEditors && typeof oldData.referenceLinkEditors === 'object' ? oldData.referenceLinkEditors : {};
+  const nextReferenceEditors = nextData?.referenceLinkEditors && typeof nextData.referenceLinkEditors === 'object' ? nextData.referenceLinkEditors : {};
+  merged.referenceLinkAuthors = {};
+  merged.referenceLinkEditors = {};
+  for (const link of referenceLinks) {
+    if (!link) continue;
+    merged.referenceLinkAuthors[link] = oldReferenceAuthors[link] || nextReferenceAuthors[link] || username;
+    merged.referenceLinkEditors[link] = nextReferenceEditors[link] || oldReferenceEditors[link] || username;
+  }
   return merged;
 }
 

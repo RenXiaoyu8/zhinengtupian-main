@@ -410,6 +410,7 @@ export default function NewDevelopmentSystem({
   const [notifyOperationsOnPurchase, setNotifyOperationsOnPurchase] = useState(true);
   const [draft, setDraft] = useState({ title: '', barcode: '', standard: '', brand: '', brandId: '', alias: '', spec: '', purchaseSellingPoints: [''] });
   const [draftTestReports, setDraftTestReports] = useState<File[]>([]);
+  const [draftReportDragging, setDraftReportDragging] = useState(false);
   const autoSaveRef = useRef<number | null>(null);
   const lastAutoSavedKeyRef = useRef<Record<number, string>>({});
 
@@ -998,10 +999,46 @@ export default function NewDevelopmentSystem({
         <div className="mt-4 rounded-lg border border-violet-500/30 bg-violet-500/10 p-4">
           <div className="mb-2 text-sm font-bold text-violet-100">已有检测报告</div>
           <div className="text-xs text-slate-400">厂家已有检测报告可在这里上传，创建后会保存到产品文件夹的「检测报告」里，运营、包装设计、主图详情页设计都能查看。</div>
-          <label className="mt-3 flex min-h-24 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-violet-700 bg-slate-950/50 p-4 text-center hover:border-violet-400">
+          <label
+            data-newdev-upload="draft-existing-test-reports"
+            onDragEnter={event => {
+              event.preventDefault();
+              event.stopPropagation();
+              setDraftReportDragging(true);
+              (window as any).__newdevUploadDragActive = true;
+            }}
+            onDragOver={event => {
+              event.preventDefault();
+              event.stopPropagation();
+              setDraftReportDragging(true);
+              if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+            }}
+            onDragLeave={event => {
+              event.preventDefault();
+              event.stopPropagation();
+              setDraftReportDragging(false);
+              window.setTimeout(() => { (window as any).__newdevUploadDragActive = false; }, 200);
+            }}
+            onDrop={event => {
+              event.preventDefault();
+              event.stopPropagation();
+              setDraftReportDragging(false);
+              (window as any).__newdevUploadDragActive = false;
+              setDraftTestReports(prev => mergeDraftFiles(prev, Array.from(event.dataTransfer.files || []) as File[]));
+            }}
+            onPaste={event => {
+              const files = Array.from(event.clipboardData.files || []) as File[];
+              if (!files.length) return;
+              event.preventDefault();
+              event.stopPropagation();
+              setDraftTestReports(prev => mergeDraftFiles(prev, files));
+            }}
+            tabIndex={0}
+            className={`mt-3 flex min-h-28 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-4 text-center transition ${draftReportDragging ? 'border-violet-300 bg-violet-500/15 ring-2 ring-violet-300/40' : 'border-violet-700 bg-slate-950/50 hover:border-violet-400'}`}
+          >
             <Upload className="h-6 w-6 text-violet-300" />
-            <div className="mt-2 text-sm font-bold text-slate-100">点击选择检测报告</div>
-            <div className="mt-1 text-xs text-slate-500">可多选 PDF、图片或其他报告文件</div>
+            <div className="mt-2 text-sm font-bold text-slate-100">拖拽 / 粘贴 / 点击上传检测报告</div>
+            <div className="mt-1 text-xs text-slate-500">鼠标移动到框内后按 Ctrl+V 粘贴文件；也可多选 PDF、图片或其他报告文件</div>
             <input
               className="hidden"
               type="file"
@@ -1127,7 +1164,7 @@ export default function NewDevelopmentSystem({
               />
 
               {canEditSelected ? (
-                <div className={`sticky bottom-0 flex flex-wrap items-center justify-between gap-2 border-t py-4 backdrop-blur ${theme === 'dark' ? 'border-slate-800 bg-slate-950/85' : 'border-slate-200 bg-slate-50/85'}`}>
+                <div className={`sticky bottom-0 -mx-5 -mb-5 flex flex-wrap items-center justify-between gap-2 border-t px-5 py-4 backdrop-blur ${theme === 'dark' ? 'border-slate-800 bg-slate-950/85' : 'border-slate-200 bg-slate-50/85'}`}>
                   <button type="button" onClick={() => setScreen('list')} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600">
                     <ArrowLeft className="h-4 w-4" />
                     返回
@@ -1154,7 +1191,7 @@ export default function NewDevelopmentSystem({
                   </div>
                 </div>
               ) : (
-                <div className={`sticky bottom-0 flex items-center justify-between gap-2 border-t py-4 text-sm text-slate-500 backdrop-blur ${theme === 'dark' ? 'border-slate-800 bg-slate-950/85' : 'border-slate-200 bg-slate-50/85'}`}>
+                <div className={`sticky bottom-0 -mx-5 -mb-5 flex items-center justify-between gap-2 border-t px-5 py-4 text-sm text-slate-500 backdrop-blur ${theme === 'dark' ? 'border-slate-800 bg-slate-950/85' : 'border-slate-200 bg-slate-50/85'}`}>
                   <button type="button" onClick={() => setScreen('list')} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600">
                     <ArrowLeft className="h-4 w-4" />
                     返回
@@ -1342,8 +1379,8 @@ function ProjectEditor({
           label="参考链接"
           tone="reference"
           rows={normalizeRows(data.referenceLinks)}
-          authors={{}}
-          editors={{}}
+          authors={data.referenceLinkAuthors || {}}
+          editors={data.referenceLinkEditors || {}}
           imagesByText={{}}
           imageFieldPrefix="referenceLinks"
           inputClass={inputClass}
@@ -1354,7 +1391,11 @@ function ProjectEditor({
           token={token}
           placeholder="粘贴参考链接"
           showImages={false}
-          onRowsChange={nextRows => onDataPatch({ referenceLinks: nextRows })}
+          onRowsChange={nextRows => onDataPatch({
+            referenceLinks: nextRows,
+            referenceLinkAuthors: stampAuthors(nextRows, normalizeRows(data.referenceLinks), data.referenceLinkAuthors, currentUsername),
+            referenceLinkEditors: stampEditors(nextRows, normalizeRows(data.referenceLinks), data.referenceLinkEditors, currentUsername),
+          })}
           onLockChange={(key, locked) => onDataPatch({
             editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
           })}
