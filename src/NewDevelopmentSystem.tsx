@@ -1682,8 +1682,14 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
   const name = file.name || file.path || '文件';
   const isImage = /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
   const href = downloadUrl(file.path, token);
-  const openFile = () => {
+  const openFile = async () => {
     if (!href) return;
+    const electron = (window as any).electron;
+    if (electron?.openFile && file.path) {
+      const absoluteUrl = `${window.location.origin}${href}`;
+      const result = await electron.openFile(file.path, absoluteUrl);
+      if (result?.ok) return;
+    }
     const opened = window.open(href, '_blank');
     if (!opened) window.location.href = href;
   };
@@ -1693,7 +1699,9 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
       onDoubleClick={event => {
         event.preventDefault();
         event.stopPropagation();
-        openFile();
+        openFile().catch(() => {
+          if (href) window.open(href, '_blank');
+        });
       }}
       title="双击打开"
     >
