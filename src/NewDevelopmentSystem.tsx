@@ -79,6 +79,7 @@ const dataLabels: Record<string, string> = {
   skuImages: 'SKU 图',
   mainImages: '主图',
   detailImages: '详情页',
+  existingTestReports: '已有检测报告',
   leaderReviewComment: '组长审核意见',
   leaderRejectItems: '组长有问题的点',
   leaderRejectIssueImages: '组长问题点图片',
@@ -197,6 +198,18 @@ function mergeFileLists(...lists: any[][]) {
       seen.add(key);
       result.push(file);
     }
+  }
+  return result;
+}
+
+function mergeDraftFiles(current: File[], nextFiles: File[]) {
+  const result: File[] = [];
+  const seen = new Set<string>();
+  for (const file of [...current, ...nextFiles]) {
+    const key = `${file.name}:${file.size}:${file.lastModified}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(file);
   }
   return result;
 }
@@ -338,6 +351,13 @@ async function cloneClipboardFiles(files: File[]) {
   return cloned;
 }
 
+function uploadTargetPath(project: Pick<NewDevProject, 'title' | 'data'>, field: string, label?: string) {
+  const cleanField = field.split(':')[0];
+  const folderLabel = label || field.split(':').slice(1).join(':') || dataLabels[cleanField] || cleanField;
+  const folder = fieldFolder(field, folderLabel);
+  return `${project.data?.productFolderPath || `新品开发/${safePathName(project.title)}`}/${folder.split('/').map(safePathName).join('/')}`;
+}
+
 function fieldFolder(field: string, label: string) {
   if (field.startsWith('sellingPointImages:')) return `运营寻找卖点/卖点图片/${safePathName(label)}`;
   if (field.startsWith('testItemImages:')) return `运营寻找卖点/检测项图片/${safePathName(label)}`;
@@ -349,6 +369,7 @@ function fieldFolder(field: string, label: string) {
   if (field === 'skuImages') return 'sku';
   if (field === 'mainImages') return '产品图片/主图';
   if (field === 'detailImages') return '产品图片/详情页';
+  if (field === 'existingTestReports') return '检测报告';
   return dataLabels[field] || field;
 }
 
@@ -388,6 +409,7 @@ export default function NewDevelopmentSystem({
   const [detailStepKey, setDetailStepKey] = useState<string | null>(null);
   const [notifyOperationsOnPurchase, setNotifyOperationsOnPurchase] = useState(true);
   const [draft, setDraft] = useState({ title: '', barcode: '', standard: '', brand: '', brandId: '', alias: '', spec: '', purchaseSellingPoints: [''] });
+  const [draftTestReports, setDraftTestReports] = useState<File[]>([]);
   const autoSaveRef = useRef<number | null>(null);
   const lastAutoSavedKeyRef = useRef<Record<number, string>>({});
 
@@ -415,6 +437,8 @@ export default function NewDevelopmentSystem({
   const canReviewPurchaseSelling = canManage || /运营/.test(user.role || '') || /杩愯惀/.test(user.role || '');
   const viewingCurrentStep = !!selected && (!visibleStepKey || visibleStepKey === selected.currentStepKey);
   const canEditSelected = !!selected && viewingCurrentStep && !selected.completedAt && (canManage || selected.assignees?.includes(user.username) || canRoleSupplementStep(user.role || '', selected.currentStepKey));
+  const canSubmitSelected = !!selected && (canManage || selected.assignees?.includes(user.username));
+  const currentStepAutosaves = !!selected && ['selling', 'leaderReview', 'opsReview'].includes(selected.currentStepKey);
   const readOnlyReason = selected?.completedAt
     ? '这个新品流程已经完成，只能查看，不能继续编辑。'
     : (!viewingCurrentStep && selected ? '你正在查看历史/其他步骤，只能查看，不能在这里编辑。' : (!canEditSelected && selected ? '你可以查看这个新品流程，但当前步骤不由你处理，不能编辑。' : ''));
@@ -550,7 +574,7 @@ export default function NewDevelopmentSystem({
         lastAutoSavedKeyRef.current[saved.id] = projectDraftKey(saved);
         setProjects(prev => prev.map(item => item.id === saved.id ? saved : item));
       }).catch(err => setNotice(err.message || '自动保存失败'));
-    }, 450);
+    }, 1200);
   }, [api, canEditSelected]);
 
   const patchData = useCallback((patch: Record<string, any>) => {
@@ -574,6 +598,22 @@ export default function NewDevelopmentSystem({
       setNotice('复制失败');
     }
   }, []);
+
+  const uploadProjectFiles = useCallback(async (project: Pick<NewDevProject, 'title' | 'data'>, field: string, files: File[]) => {
+    if (!files.length) return [];
+    const formData = new FormData();
+    files.forEach((file, index) => formData.append('files', file, file.name || `upload-${Date.now()}-${index + 1}`));
+    formData.append('path', uploadTargetPath(project, field));
+    const response = await fetch(`${API_BASE}/upload`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${user.token}` },
+      body: formData,
+    });
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : {};
+    if (!response.ok) throw new Error(data?.error || '上传失败');
+    return asArray<FileRef>(data.files);
+  }, [user.token]);
 
   const decidePurchaseSellingPoint = useCallback(async (point: string, decision: 'accepted' | 'rejected') => {
     if (!selected || selected.id <= 0) return;
@@ -607,6 +647,10 @@ export default function NewDevelopmentSystem({
     setSaving(true);
     try {
       const brand = brands.find(item => String(item.id) === String(draft.brandId));
+      const draftProductFolderPath = `${safePathName(brand?.name || draft.brand || '未分类品牌')}/${safePathName(draft.title)}`;
+      const uploadedReports = draftTestReports.length
+        ? await uploadProjectFiles({ title: draft.title, data: { productFolderPath: draftProductFolderPath } }, 'existingTestReports', draftTestReports)
+        : [];
       const created = await api('/newdev/projects', {
         method: 'POST',
         body: JSON.stringify({
@@ -622,14 +666,17 @@ export default function NewDevelopmentSystem({
             alias: draft.alias,
             initiationSellingPoints: [''],
             purchaseSellingPoints: normalizeRows(draft.purchaseSellingPoints),
+            existingTestReports: uploadedReports,
           },
         }),
       });
-      setProjects(prev => [created, ...prev.filter(item => item.id !== created.id)]);
-      lastAutoSavedKeyRef.current[created.id] = projectDraftKey(created);
-      setSelectedId(created.id);
+      let nextCreated = created as NewDevProject;
+      setProjects(prev => [nextCreated, ...prev.filter(item => item.id !== nextCreated.id)]);
+      lastAutoSavedKeyRef.current[nextCreated.id] = projectDraftKey(nextCreated);
+      setSelectedId(nextCreated.id);
       setScreen('detail');
       setDraft({ title: '', barcode: '', standard: '', brand: '', brandId: '', alias: '', spec: '', purchaseSellingPoints: [''] });
+      setDraftTestReports([]);
       setNotice('新品项目已创建');
     } catch (err: any) {
       setNotice(err.message || '创建失败');
@@ -651,8 +698,7 @@ export default function NewDevelopmentSystem({
       const label = field.split(':').slice(1).join(':') || dataLabels[cleanField] || cleanField;
       const formData = new FormData();
       fileList.forEach((file, index) => formData.append('files', file, file.name || `upload-${Date.now()}-${index + 1}`));
-      const folder = fieldFolder(field, label);
-      formData.append('path', `${selected.data?.productFolderPath || `新品开发/${safePathName(selected.title)}`}/${folder.split('/').map(safePathName).join('/')}`);
+      formData.append('path', uploadTargetPath(selected, field, label));
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), 300000);
       let response: Response;
@@ -692,7 +738,7 @@ export default function NewDevelopmentSystem({
       const nextProject = { ...selected, data: nextData };
       setProjects(prev => prev.map(item => item.id === selected.id ? nextProject : item));
       await saveProject(nextProject);
-      setNotice('图片已上传并保存');
+      setNotice('文件已上传并保存');
     } catch (err: any) {
       setNotice(err.message || '上传失败');
     } finally {
@@ -949,6 +995,36 @@ export default function NewDevelopmentSystem({
             onChange={value => setDraft(v => ({ ...v, purchaseSellingPoints: value }))}
           />
         </div>
+        <div className="mt-4 rounded-lg border border-violet-500/30 bg-violet-500/10 p-4">
+          <div className="mb-2 text-sm font-bold text-violet-100">已有检测报告</div>
+          <div className="text-xs text-slate-400">厂家已有检测报告可在这里上传，创建后会保存到产品文件夹的「检测报告」里，运营、包装设计、主图详情页设计都能查看。</div>
+          <label className="mt-3 flex min-h-24 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-violet-700 bg-slate-950/50 p-4 text-center hover:border-violet-400">
+            <Upload className="h-6 w-6 text-violet-300" />
+            <div className="mt-2 text-sm font-bold text-slate-100">点击选择检测报告</div>
+            <div className="mt-1 text-xs text-slate-500">可多选 PDF、图片或其他报告文件</div>
+            <input
+              className="hidden"
+              type="file"
+              multiple
+              onChange={event => {
+                const files = Array.from(event.target.files || []) as File[];
+                setDraftTestReports(prev => mergeDraftFiles(prev, files));
+                event.currentTarget.value = '';
+              }}
+            />
+          </label>
+          <div className="mt-3 space-y-2">
+            {draftTestReports.map((file, index) => (
+              <div key={`${file.name}-${file.size}-${index}`} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2 text-sm">
+                <span className="min-w-0 truncate">{file.name}</span>
+                <button type="button" onClick={() => setDraftTestReports(prev => prev.filter((_, i) => i !== index))} className="inline-flex h-7 w-7 items-center justify-center rounded bg-red-600 text-white hover:bg-red-500">
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))}
+            {!draftTestReports.length && <div className="text-xs text-slate-500">暂无选择文件</div>}
+          </div>
+        </div>
         <div className="mt-4 flex justify-end gap-2">
           <button type="button" className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-bold" onClick={() => setScreen('list')}>返回</button>
           <button type="button" disabled={saving} onClick={createProject} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500 disabled:opacity-60">
@@ -1057,20 +1133,24 @@ export default function NewDevelopmentSystem({
                     返回
                   </button>
                   <div className="flex flex-wrap justify-end gap-2">
-                    <button type="button" disabled={saving} onClick={() => saveProject()} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600 disabled:opacity-50">
-                      <Save className="h-4 w-4" />
-                      {saving ? '保存中...' : '保存'}
-                    </button>
+                    {!currentStepAutosaves && (
+                      <button type="button" disabled={saving} onClick={() => saveProject()} className="inline-flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-bold text-white hover:bg-slate-600 disabled:opacity-50">
+                        <Save className="h-4 w-4" />
+                        {saving ? '保存中...' : '保存'}
+                      </button>
+                    )}
                     {['leaderReview', 'opsReview'].includes(selected.currentStepKey) && (
                       <button type="button" disabled={saving} onClick={rejectToDesign} className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-4 py-2 text-sm font-bold text-white hover:bg-amber-500 disabled:opacity-50">
                         <ArrowLeft className="h-4 w-4" />
                         退回修改
                       </button>
                     )}
-                    <button type="button" disabled={saving} onClick={advance} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500 disabled:opacity-50">
-                      <Check className="h-4 w-4" />
-                      提交下一步
-                    </button>
+                    {canSubmitSelected && (
+                      <button type="button" disabled={saving} onClick={advance} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500 disabled:opacity-50">
+                        <Check className="h-4 w-4" />
+                        提交下一步
+                      </button>
+                    )}
                   </div>
                 </div>
               ) : (
@@ -1183,6 +1263,7 @@ function ProjectEditor({
     const purchaseProposalStatus = proposalStatusMap(data.purchaseSellingPointStatus);
     return (
       <Section title="运营寻找卖点/检测项" className={panel}>
+        <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
         {!!purchaseProposalRows.length && (
           <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
             <div className="mb-3 text-sm font-bold text-amber-200">采购添加卖点</div>
@@ -1306,6 +1387,7 @@ function ProjectEditor({
       <Section title="包装设计 / 白底图" className={panel}>
         <DesignerTransfer designers={designers} disabled={!canEdit} inputClass={inputClass} onTransfer={onTransfer} current={data.transferredTo} />
         <TextArea label="文案和检测项目确认" value={data.copywritingConfirm || buildPackagingConfirm(data)} onChange={value => onDataPatch({ copywritingConfirm: value })} {...fieldProps} />
+        <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
         <div className="rounded-lg border border-slate-700 bg-slate-950/40 p-4">
           <MainDetailBrief data={data} token={token} onCopy={onCopy} />
         </div>
@@ -1320,6 +1402,7 @@ function ProjectEditor({
     return (
       <Section title="主图详情页设计" className={panel}>
         <DesignerTransfer designers={designers} disabled={!canEdit} inputClass={inputClass} onTransfer={onTransfer} current={data.transferredTo} />
+        <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
         <div className="rounded-lg border border-slate-700 bg-slate-950/40 p-4">
           <MainDetailBrief data={data} token={token} onCopy={onCopy} />
         </div>
@@ -1517,8 +1600,15 @@ function CollaborativeList({
         text: 'text-emerald-200',
       };
   const valueRows = rows.length ? rows : [''];
+  const [draftRows, setDraftRows] = useState<string[]>(valueRows);
+  const composingRef = useRef(false);
   const [dragField, setDragField] = useState<string | null>(null);
   const hoverRef = useRef<{ field: string; remaining: number } | null>(null);
+
+  useEffect(() => {
+    if (composingRef.current) return;
+    setDraftRows(rows.length ? rows : []);
+  }, [rows]);
 
   useEffect(() => {
     if (disabled) return;
@@ -1536,24 +1626,30 @@ function CollaborativeList({
   }, [disabled, onUpload]);
 
   const update = (index: number, value: string) => {
-    onRowsChange(valueRows.map((row, i) => i === index ? value : row));
+    const nextRows = (draftRows.length ? draftRows : ['']).map((row, i) => i === index ? value : row);
+    setDraftRows(nextRows);
+    if (!composingRef.current) onRowsChange(nextRows);
   };
 
   const remove = (index: number) => {
-    onRowsChange(valueRows.filter((_, i) => i !== index));
+    const nextRows = (draftRows.length ? draftRows : ['']).filter((_, i) => i !== index);
+    setDraftRows(nextRows);
+    onRowsChange(nextRows);
   };
 
   const addRow = () => {
-    const nextRows = [...valueRows, ''];
+    const nextRows = [...(draftRows.length ? draftRows : []), ''];
+    setDraftRows(nextRows);
     onRowsChange(nextRows);
     window.setTimeout(() => onLockChange(rowKey(imageFieldPrefix, nextRows.length - 1, ''), true), 0);
   };
+  const displayRows = draftRows.length ? draftRows : [''];
 
   return (
     <div className={`rounded-lg border p-4 ${color.shell}`}>
       <div className={`mb-3 text-sm font-bold ${color.text}`}>{label}</div>
       <div className="space-y-3">
-        {valueRows.map((text, index) => {
+        {displayRows.map((text, index) => {
           const clean = String(text || '').trim();
           const key = rowKey(imageFieldPrefix, index, clean);
           const blankKey = rowKey(imageFieldPrefix, index, '');
@@ -1573,7 +1669,18 @@ function CollaborativeList({
                       value={text}
                       placeholder={lockedByOther ? `${lock?.username} 正在编辑这一行` : placeholder}
                       onFocus={() => onLockChange(key, true)}
-                      onBlur={() => onLockChange(key, false)}
+                      onBlur={() => {
+                        composingRef.current = false;
+                        onRowsChange(draftRows);
+                        onLockChange(key, false);
+                      }}
+                      onCompositionStart={() => { composingRef.current = true; }}
+                      onCompositionEnd={event => {
+                        composingRef.current = false;
+                        const nextRows = (draftRows.length ? draftRows : ['']).map((row, i) => i === index ? event.currentTarget.value : row);
+                        setDraftRows(nextRows);
+                        onRowsChange(nextRows);
+                      }}
                       onChange={event => update(index, event.target.value)}
                     />
                     {!disabled && !lockedByOther && (
@@ -1823,6 +1930,22 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
         <button type="button" onClick={event => { event.stopPropagation(); onDelete?.(); }} className="absolute right-2 top-2 rounded bg-red-600/90 p-1 text-white opacity-0 transition group-hover:opacity-100">
           <X className="h-4 w-4" />
         </button>
+      )}
+    </div>
+  );
+}
+
+function ExistingTestReports({ files, token }: { files: FileRef[]; token?: string }) {
+  return (
+    <div className="rounded-lg border border-violet-500/30 bg-violet-500/10 p-4">
+      <div className="mb-2 text-sm font-bold text-violet-100">已有检测报告</div>
+      <div className="mb-3 text-xs text-slate-400">采购创建新品时提供的厂家检测报告，可作为卖点和设计参考。双击文件用电脑默认工具打开。</div>
+      {files.length ? (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {files.map((file, index) => <FileCard key={`${file.path || file.name}-${index}`} file={file} token={token} />)}
+        </div>
+      ) : (
+        <div className="text-xs text-slate-500">暂无检测报告</div>
       )}
     </div>
   );

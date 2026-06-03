@@ -1106,6 +1106,7 @@ function buildProjectChanges(row: any, body: any, oldData: any, nextData: any) {
     skuImages: 'SKU 图',
     mainImages: '主图',
     detailImages: '详情页',
+    existingTestReports: '已有检测报告',
     leaderReviewComment: '组长审核意见',
     leaderRejectItems: '组长有问题的点',
     leaderRejectIssueImages: '组长问题点图片',
