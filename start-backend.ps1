@@ -55,6 +55,34 @@ function Exit-WithMessage {
   exit $Code
 }
 
+function Get-ListeningPortOwners {
+  param([int]$ListenPort)
+  $owners = New-Object System.Collections.Generic.HashSet[int]
+  try {
+    $pattern = "^\s*TCP\s+\S+:$ListenPort\s+\S+\s+(LISTENING|监听)\s+(\d+)\s*$"
+    & netstat.exe -ano -p tcp 2>$null |
+      ForEach-Object {
+        if ($_ -match $pattern) {
+          [void]$owners.Add([int]$Matches[2])
+        }
+      }
+  } catch {}
+  return @($owners)
+}
+
+function Test-PortListening {
+  param([int]$ListenPort)
+  return @((Get-ListeningPortOwners -ListenPort $ListenPort)).Count -gt 0
+}
+
+function Stop-ProcessTreeQuietly {
+  param([int]$ProcessId)
+  if ($ProcessId -le 4 -or $ProcessId -eq $PID) { return }
+  try {
+    & cmd.exe /c "taskkill /PID $ProcessId /T /F >nul 2>nul"
+  } catch {}
+}
+
 Write-Host '========================================'
 Write-Host '  Shangpin Cloud Assets - Backend'
 Write-Host '========================================'
@@ -119,13 +147,20 @@ try {
   if ($Port -ne 3000) { $listenPorts += 3000 }
   $listeners = @()
   foreach ($listenPort in $listenPorts) {
-    $listeners += Get-NetTCPConnection -LocalPort $listenPort -State Listen -ErrorAction SilentlyContinue |
-      Select-Object -ExpandProperty OwningProcess -Unique
+    $listeners += Get-ListeningPortOwners -ListenPort $listenPort
   }
   $listeners = $listeners | Select-Object -Unique
   foreach ($processId in $listeners) {
+    if ([int]$processId -le 4) { continue }
     Write-Host "Stopping old backend PID $processId"
-    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$processId)" -ErrorAction SilentlyContinue
+    if ($proc -and [int]$proc.ParentProcessId -gt 4) {
+      $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$proc.ParentProcessId)" -ErrorAction SilentlyContinue
+      if ($parent -and ([string]$parent.Name).ToLowerInvariant() -eq 'powershell.exe') {
+        Stop-ProcessTreeQuietly -ProcessId ([int]$parent.ProcessId)
+      }
+    }
+    Stop-ProcessTreeQuietly -ProcessId ([int]$processId)
   }
 } catch {
   Write-Host "Port cleanup skipped: $($_.Exception.Message)"
@@ -164,8 +199,7 @@ if ($Detached) {
   }
   for ($i = 1; $i -le 60; $i++) {
     Start-Sleep -Seconds 1
-    $listening = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    if ($listening) {
+    if (Test-PortListening -ListenPort $Port) {
       Write-Host "[OK] Backend is listening on port $Port."
       Write-LaunchLog "Backend is listening on port $Port."
       exit 0
