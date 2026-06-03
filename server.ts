@@ -975,6 +975,40 @@ function mergeCollaborativeNewDevData(oldData: any, nextData: any, username: str
   return merged;
 }
 
+function mergeReviewIssueData(oldData: any, nextData: any, username: string, prefix: 'leader' | 'ops') {
+  const itemField = `${prefix}RejectItems`;
+  const textField = `${prefix}RejectText`;
+  const imageField = `${prefix}RejectIssueImages`;
+  const authorField = `${prefix}RejectIssueAuthors`;
+  const editorField = `${prefix}RejectIssueEditors`;
+  const merged = { ...oldData, ...nextData };
+  const fallbackOld = String(oldData?.[textField] || '').trim().split(/\r?\n/).map((row: string) => row.trim()).filter(Boolean);
+  const fallbackNext = String(nextData?.[textField] || '').trim().split(/\r?\n/).map((row: string) => row.trim()).filter(Boolean);
+  const oldRows = Array.isArray(oldData?.[itemField]) ? oldData[itemField] : fallbackOld;
+  const nextRows = Array.isArray(nextData?.[itemField]) ? nextData[itemField] : fallbackNext;
+  const rows = mergeEditableStringsByIndex(oldRows, nextRows);
+  merged[itemField] = rows;
+  merged[textField] = rows.map((row: any) => String(row || '').trim()).filter(Boolean).join('\n');
+  merged[imageField] = mergeMapByKeys(oldData?.[imageField], nextData?.[imageField], rows.filter(Boolean), mergeFilesByPath);
+  const nextImages = nextData?.[imageField] && typeof nextData[imageField] === 'object' && !Array.isArray(nextData[imageField]) ? nextData[imageField] : {};
+  for (const [key, value] of Object.entries(nextImages)) {
+    if (Array.isArray(value)) merged[imageField][key] = value.slice(0, 3);
+  }
+  const oldAuthors = oldData?.[authorField] && typeof oldData[authorField] === 'object' ? oldData[authorField] : {};
+  const nextAuthors = nextData?.[authorField] && typeof nextData[authorField] === 'object' ? nextData[authorField] : {};
+  const oldEditors = oldData?.[editorField] && typeof oldData[editorField] === 'object' ? oldData[editorField] : {};
+  const nextEditors = nextData?.[editorField] && typeof nextData[editorField] === 'object' ? nextData[editorField] : {};
+  merged[authorField] = {};
+  merged[editorField] = {};
+  for (const row of rows) {
+    const text = String(row || '').trim();
+    if (!text) continue;
+    merged[authorField][text] = oldAuthors[text] || nextAuthors[text] || username;
+    merged[editorField][text] = nextEditors[text] || oldEditors[text] || username;
+  }
+  return merged;
+}
+
 function buildSellingPointAuthorChanges(oldData: any, nextData: any, username: string) {
   const oldPoints = new Set((Array.isArray(oldData?.sellingPoints) ? oldData.sellingPoints : []).map((item: any) => String(item || '').trim()).filter(Boolean));
   const nextPoints = (Array.isArray(nextData?.sellingPoints) ? nextData.sellingPoints : []).map((item: any) => String(item || '').trim()).filter(Boolean);
@@ -1064,9 +1098,13 @@ function buildProjectChanges(row: any, body: any, oldData: any, nextData: any) {
     mainImages: '主图',
     detailImages: '详情页',
     leaderReviewComment: '组长审核意见',
+    leaderRejectItems: '组长有问题的点',
+    leaderRejectIssueImages: '组长问题点图片',
     leaderRejectText: '组长退回修改内容',
     leaderRejectImages: '组长退回图片',
     opsReviewComment: '运营审核意见',
+    opsRejectItems: '运营有问题的点',
+    opsRejectIssueImages: '运营问题点图片',
     opsRejectText: '运营退回修改内容',
     opsRejectImages: '运营退回图片',
   };
@@ -1540,6 +1578,10 @@ app.put('/api/newdev/projects/:id', authenticate, (req: any, res) => {
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   if (row.current_step_key === 'selling') {
     nextData = mergeCollaborativeNewDevData(oldData, nextData, username);
+  } else if (row.current_step_key === 'leaderReview') {
+    nextData = mergeReviewIssueData(oldData, nextData, username, 'leader');
+  } else if (row.current_step_key === 'opsReview') {
+    nextData = mergeReviewIssueData(oldData, nextData, username, 'ops');
   }
   nextData = attachSellingPointAuthors(oldData, nextData, username);
   const changes = buildProjectChanges(row, body, oldData, { ...nextData, __changeUser: username });

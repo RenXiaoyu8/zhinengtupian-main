@@ -78,9 +78,13 @@ const dataLabels: Record<string, string> = {
   mainImages: '主图',
   detailImages: '详情页',
   leaderReviewComment: '组长审核意见',
+  leaderRejectItems: '组长有问题的点',
+  leaderRejectIssueImages: '组长问题点图片',
   leaderRejectText: '组长退回修改内容',
   leaderRejectImages: '组长退回图片',
   opsReviewComment: '运营审核意见',
+  opsRejectItems: '运营有问题的点',
+  opsRejectIssueImages: '运营问题点图片',
   opsRejectText: '运营退回修改内容',
   opsRejectImages: '运营退回图片',
 };
@@ -93,6 +97,13 @@ function asArray<T = any>(value: any): T[] {
 
 function normalizeRows(value: any): string[] {
   return Array.isArray(value) ? value.map(item => String(item ?? '')) : [];
+}
+
+function reviewIssueRows(value: any, legacyText: any): string[] {
+  const rows = normalizeRows(value);
+  if (rows.length) return rows;
+  const text = String(legacyText || '').trim();
+  return text ? text.split(/\r?\n/).map(row => row.trim()).filter(Boolean) : [''];
 }
 
 function safePathName(value: string) {
@@ -211,6 +222,18 @@ function stampEditors(nextRows: string[], oldRows: string[], previous: any, user
   return next;
 }
 
+function stampAuthors(nextRows: string[], oldRows: string[], previous: any, username: string) {
+  const source = previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {};
+  const next: Record<string, string> = {};
+  nextRows.forEach((row, index) => {
+    const text = String(row || '').trim();
+    if (!text) return;
+    const oldText = String(oldRows[index] || '').trim();
+    next[text] = text !== oldText ? username : (source[text] || username);
+  });
+  return next;
+}
+
 function imageGroups(data: Record<string, any>, type: 'selling' | 'test') {
   const rows = normalizeRows(type === 'selling' ? data.sellingPoints : data.testItems);
   const images = type === 'selling' ? data.sellingPointImages : data.testItemImages;
@@ -310,6 +333,8 @@ async function cloneClipboardFiles(files: File[]) {
 function fieldFolder(field: string, label: string) {
   if (field.startsWith('sellingPointImages:')) return `运营寻找卖点/卖点图片/${safePathName(label)}`;
   if (field.startsWith('testItemImages:')) return `运营寻找卖点/检测项图片/${safePathName(label)}`;
+  if (field.startsWith('leaderRejectIssueImages:')) return `审核退回/组长问题图片/${safePathName(label)}`;
+  if (field.startsWith('opsRejectIssueImages:')) return `审核退回/运营问题图片/${safePathName(label)}`;
   if (field === 'packagingSourceFiles' || field === 'packagingPreviewImages') return '包装/定稿源文件';
   if (field === 'whiteBackgroundImages') return '产品图片/白底图';
   if (field === 'mainDetailSourceFiles') return '产品图片/PSD源文件';
@@ -501,7 +526,7 @@ export default function NewDevelopmentSystem({
 
   const scheduleSellingAutosave = useCallback((project: NewDevProject) => {
     if (!canEditSelected) return;
-    if (project.currentStepKey !== 'selling' || project.id <= 0) return;
+    if (!['selling', 'leaderReview', 'opsReview'].includes(project.currentStepKey) || project.id <= 0) return;
     if (autoSaveRef.current) window.clearTimeout(autoSaveRef.current);
     autoSaveRef.current = window.setTimeout(() => {
       api(`/newdev/projects/${project.id}`, {
@@ -634,18 +659,24 @@ export default function NewDevelopmentSystem({
       if (!response.ok) throw new Error(data?.error || '上传失败');
       const uploaded = asArray<FileRef>(data.files);
       let nextData = { ...(selected.data || {}) };
-      if (field.startsWith('sellingPointImages:') || field.startsWith('testItemImages:')) {
+      if (field.startsWith('sellingPointImages:') || field.startsWith('testItemImages:') || field.startsWith('leaderRejectIssueImages:') || field.startsWith('opsRejectIssueImages:')) {
         const [parent, ...rest] = field.split(':');
         const key = rest.join(':');
         const current = nextData[parent] && typeof nextData[parent] === 'object' ? nextData[parent] : {};
+        const editorField = parent === 'sellingPointImages'
+          ? 'sellingPointEditors'
+          : parent === 'testItemImages'
+            ? 'testItemEditors'
+            : parent === 'leaderRejectIssueImages'
+              ? 'leaderRejectIssueEditors'
+              : 'opsRejectIssueEditors';
         nextData = {
           ...nextData,
           [parent]: {
             ...current,
             [key]: mergeFileLists(current[key], uploaded).slice(0, 3),
           },
-          ...(parent === 'sellingPointImages' ? { sellingPointEditors: { ...(nextData.sellingPointEditors || {}), [key]: user.username } } : {}),
-          ...(parent === 'testItemImages' ? { testItemEditors: { ...(nextData.testItemEditors || {}), [key]: user.username } } : {}),
+          [editorField]: { ...(nextData[editorField] || {}), [key]: user.username },
         };
       } else {
         nextData = { ...nextData, [field]: mergeFileLists(nextData[field], uploaded) };
@@ -667,7 +698,7 @@ export default function NewDevelopmentSystem({
       return;
     }
     let nextData = { ...(selected.data || {}) };
-    if (field.startsWith('sellingPointImages:') || field.startsWith('testItemImages:')) {
+    if (field.startsWith('sellingPointImages:') || field.startsWith('testItemImages:') || field.startsWith('leaderRejectIssueImages:') || field.startsWith('opsRejectIssueImages:')) {
       const [parent, ...rest] = field.split(':');
       const key = rest.join(':');
       const current = nextData[parent] && typeof nextData[parent] === 'object' ? nextData[parent] : {};
@@ -1274,13 +1305,7 @@ function ProjectEditor({
         <div className="rounded-lg border border-slate-700 bg-slate-950/40 p-4">
           <MainDetailBrief data={data} token={token} onCopy={onCopy} />
         </div>
-        {(data.leaderRejectText || data.opsRejectText || asArray(data.leaderRejectImages).length || asArray(data.opsRejectImages).length) && (
-          <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm">
-            <div className="mb-2 font-bold text-amber-300">退回意见</div>
-            {data.leaderRejectText && <p>组长退回：{data.leaderRejectText}</p>}
-            {data.opsRejectText && <p className="mt-1">运营退回：{data.opsRejectText}</p>}
-          </div>
-        )}
+        <RejectIssueSummary data={data} token={token} />
         <FileUploader label="主图详情页源文件" field="mainDetailSourceFiles" files={asArray(data.mainDetailSourceFiles)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
         <FileUploader label="SKU 图" field="skuImages" files={asArray(data.skuImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
         <FileUploader label="主图" field="mainImages" files={asArray(data.mainImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
@@ -1290,23 +1315,77 @@ function ProjectEditor({
   }
 
   if (visibleStepKey === 'leaderReview') {
+    const issueRows = reviewIssueRows(data.leaderRejectItems, data.leaderRejectText);
     return (
       <Section title="组长审核" className={panel}>
         <ReviewUploads data={data} token={token} />
         <TextArea label="审核意见" value={data.leaderReviewComment || ''} onChange={value => onDataPatch({ leaderReviewComment: value })} {...fieldProps} />
-        <TextArea label="退回修改内容" value={data.leaderRejectText || ''} onChange={value => onDataPatch({ leaderRejectText: value })} {...fieldProps} />
-        <FileUploader label="退回参考图片" field="leaderRejectImages" files={asArray(data.leaderRejectImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
+        <CollaborativeList
+          label="有问题的点"
+          tone="review"
+          rows={issueRows}
+          authors={data.leaderRejectIssueAuthors || {}}
+          editors={data.leaderRejectIssueEditors || {}}
+          imagesByText={data.leaderRejectIssueImages || {}}
+          imageFieldPrefix="leaderRejectIssueImages"
+          inputClass={inputClass}
+          disabled={!canEdit}
+          uploadingField={uploadingField}
+          currentUsername={currentUsername}
+          editLocks={data.editLocks || {}}
+          token={token}
+          placeholder="填写一个需要退回修改的问题"
+          onRowsChange={nextRows => onDataPatch({
+            leaderRejectItems: nextRows,
+            leaderRejectText: nextRows.map(row => row.trim()).filter(Boolean).join('\n'),
+            leaderRejectIssueImages: mapImagesByRows(data.leaderRejectIssueImages, issueRows, nextRows),
+            leaderRejectIssueAuthors: stampAuthors(nextRows, issueRows, data.leaderRejectIssueAuthors, currentUsername),
+            leaderRejectIssueEditors: stampEditors(nextRows, issueRows, data.leaderRejectIssueEditors, currentUsername),
+          })}
+          onLockChange={(key, locked) => onDataPatch({
+            editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
+          })}
+          onUpload={onUpload}
+          onDeleteUpload={onDeleteUpload}
+        />
       </Section>
     );
   }
 
   if (visibleStepKey === 'opsReview') {
+    const issueRows = reviewIssueRows(data.opsRejectItems, data.opsRejectText);
     return (
       <Section title="运营审核" className={panel}>
         <ReviewUploads data={data} token={token} />
         <TextArea label="审核意见" value={data.opsReviewComment || ''} onChange={value => onDataPatch({ opsReviewComment: value })} {...fieldProps} />
-        <TextArea label="退回修改内容" value={data.opsRejectText || ''} onChange={value => onDataPatch({ opsRejectText: value })} {...fieldProps} />
-        <FileUploader label="退回参考图片" field="opsRejectImages" files={asArray(data.opsRejectImages)} canEdit={canEdit} uploadingField={uploadingField} token={token} onUpload={onUpload} onDelete={onDeleteUpload} />
+        <CollaborativeList
+          label="有问题的点"
+          tone="review"
+          rows={issueRows}
+          authors={data.opsRejectIssueAuthors || {}}
+          editors={data.opsRejectIssueEditors || {}}
+          imagesByText={data.opsRejectIssueImages || {}}
+          imageFieldPrefix="opsRejectIssueImages"
+          inputClass={inputClass}
+          disabled={!canEdit}
+          uploadingField={uploadingField}
+          currentUsername={currentUsername}
+          editLocks={data.editLocks || {}}
+          token={token}
+          placeholder="填写一个需要退回修改的问题"
+          onRowsChange={nextRows => onDataPatch({
+            opsRejectItems: nextRows,
+            opsRejectText: nextRows.map(row => row.trim()).filter(Boolean).join('\n'),
+            opsRejectIssueImages: mapImagesByRows(data.opsRejectIssueImages, issueRows, nextRows),
+            opsRejectIssueAuthors: stampAuthors(nextRows, issueRows, data.opsRejectIssueAuthors, currentUsername),
+            opsRejectIssueEditors: stampEditors(nextRows, issueRows, data.opsRejectIssueEditors, currentUsername),
+          })}
+          onLockChange={(key, locked) => onDataPatch({
+            editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
+          })}
+          onUpload={onUpload}
+          onDeleteUpload={onDeleteUpload}
+        />
       </Section>
     );
   }
@@ -1367,7 +1446,7 @@ function CollaborativeList({
   onDeleteUpload,
 }: {
   label: string;
-  tone: 'selling' | 'test' | 'reference';
+  tone: 'selling' | 'test' | 'reference' | 'review';
   rows: string[];
   authors: Record<string, string>;
   editors: Record<string, string>;
@@ -1402,6 +1481,14 @@ function CollaborativeList({
         upload: 'border-violet-700 bg-violet-950/50 hover:border-violet-400',
         active: 'border-violet-300 bg-violet-500/15 ring-2 ring-violet-300/40',
         text: 'text-violet-200',
+      }
+    : tone === 'review' ? {
+        shell: 'border-amber-500/35 bg-amber-500/10',
+        row: 'border-amber-500/20 bg-amber-950/30',
+        button: 'bg-amber-600 hover:bg-amber-500',
+        upload: 'border-amber-700 bg-amber-950/50 hover:border-amber-400',
+        active: 'border-amber-300 bg-amber-500/15 ring-2 ring-amber-300/40',
+        text: 'text-amber-200',
       }
     : {
         shell: 'border-emerald-500/35 bg-emerald-500/10',
@@ -1780,6 +1867,63 @@ function MainDetailBrief({ data, token, onCopy }: { data: Record<string, any>; t
       <div className="space-y-4">
         {renderRows('卖点', sellingRows, sellingMap)}
         {renderRows('检测项目', testRows, testMap)}
+      </div>
+    </div>
+  );
+}
+
+function RejectIssueSummary({ data, token }: { data: Record<string, any>; token?: string }) {
+  const groups = [
+    {
+      title: '组长退回问题点',
+      rows: reviewIssueRows(data.leaderRejectItems, data.leaderRejectText).map(row => row.trim()).filter(Boolean),
+      imageMap: data.leaderRejectIssueImages && typeof data.leaderRejectIssueImages === 'object' && !Array.isArray(data.leaderRejectIssueImages) ? data.leaderRejectIssueImages : {},
+      legacyFiles: asArray<FileRef>(data.leaderRejectImages),
+    },
+    {
+      title: '运营退回问题点',
+      rows: reviewIssueRows(data.opsRejectItems, data.opsRejectText).map(row => row.trim()).filter(Boolean),
+      imageMap: data.opsRejectIssueImages && typeof data.opsRejectIssueImages === 'object' && !Array.isArray(data.opsRejectIssueImages) ? data.opsRejectIssueImages : {},
+      legacyFiles: asArray<FileRef>(data.opsRejectImages),
+    },
+  ].filter(group => group.rows.length || group.legacyFiles.length);
+
+  if (!groups.length) return null;
+
+  return (
+    <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm">
+      <div className="mb-3 font-bold text-amber-300">退回重新制作的问题点</div>
+      <div className="space-y-4">
+        {groups.map(group => (
+          <div key={group.title} className="rounded-lg border border-amber-500/20 bg-slate-950/40 p-3">
+            <div className="mb-3 text-sm font-bold">{group.title}</div>
+            <div className="space-y-3">
+              {group.rows.map((text, index) => {
+                const files = asArray<FileRef>(group.imageMap[text]);
+                return (
+                  <div key={`${group.title}-${text}-${index}`} className="grid gap-3 rounded-lg border border-slate-800 bg-slate-900/60 p-3 lg:grid-cols-[minmax(0,1fr)_280px]">
+                    <div className="select-text whitespace-pre-wrap break-words text-sm leading-6 text-slate-100">
+                      {index + 1}. {text}
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {files.length ? files.map((file, fileIndex) => (
+                        <FileCard key={`${file.path || file.name}-${fileIndex}`} file={file} token={token} />
+                      )) : <div className="col-span-3 text-xs text-slate-500">暂无图片</div>}
+                    </div>
+                  </div>
+                );
+              })}
+              {!!group.legacyFiles.length && (
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+                  <div className="mb-2 text-xs font-bold text-slate-400">旧版退回参考图片</div>
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {group.legacyFiles.map((file, index) => <FileCard key={`${file.path || file.name}-${index}`} file={file} token={token} />)}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );

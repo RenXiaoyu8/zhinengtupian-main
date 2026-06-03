@@ -32,13 +32,9 @@ if %errorlevel% neq 0 (
 )
 
 echo Closing possible running app/dev server processes...
-schtasks /End /TN "ShangpinCloudAssets-Server" >nul 2>&1
-for %%P in (electron.exe node.exe tsx.exe) do taskkill /F /IM "%%P" >nul 2>&1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process | Where-Object { $_.ProcessName -like '*Shangpin*' -or $_.ProcessName -like '*CloudAssets*' } | Stop-Process -Force -ErrorAction SilentlyContinue" >nul 2>&1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$self=$PID; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -ne $self -and ($_.CommandLine -match 'start-backend\.ps1' -or $_.CommandLine -match 'server-bundle\.cjs' -or $_.CommandLine -match 'ShangpinCloudAssets') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$pids = Get-NetTCPConnection -LocalPort 43123 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; foreach ($processId in $pids) { taskkill /PID $processId /T /F | Out-Null }" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\stop-running-app.ps1" -Root "%~dp0"
 
-timeout /t 4 /nobreak >nul
+timeout /t 1 /nobreak >nul
 
 echo Cleaning native build cache...
 if exist "node_modules\better-sqlite3\build\Release\better_sqlite3.node" (
