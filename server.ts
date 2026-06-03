@@ -508,8 +508,9 @@ ensureUsersJsonExists();
 
 const NEWDEV_STEPS = [
   { key: 'initiation', label: '立项', hours: 24 },
-  { key: 'selling', label: '运营寻找卖点/检测项', hours: 24 },
+  { key: 'selling', label: '需要检测项目', hours: 24 },
   { key: 'purchase', label: '采购审核检测项', hours: 24 },
+  { key: 'opsSynthesis', label: '运营综合卖点', hours: 24 },
   { key: 'packaging', label: '包装设计/白底图', hours: 48 },
   { key: 'mainDetail', label: '主图详情页设计', hours: 48 },
   { key: 'leaderReview', label: '组长审核', hours: 12 },
@@ -674,7 +675,7 @@ function getStepConfig(stepKey: string) {
 }
 
 function resolveStepAssignees(stepKey: string): string[] {
-  if (stepKey === 'selling' || stepKey === 'opsReview') {
+  if (stepKey === 'selling' || stepKey === 'opsSynthesis' || stepKey === 'opsReview') {
     const current = getOpsRotation().currentUsername;
     return current ? [current] : opsUsernames();
   }
@@ -694,7 +695,7 @@ function canSupplementNewDevStep(req: any, stepKey: string): boolean {
   if (canOperateNewDevStep(req, stepKey)) return true;
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   if (!username) return false;
-  if ((stepKey === 'selling' || stepKey === 'opsReview') && opsUsernames().includes(username)) return true;
+  if ((stepKey === 'selling' || stepKey === 'opsSynthesis' || stepKey === 'opsReview') && opsUsernames().includes(username)) return true;
   if (stepKey === 'leaderReview') {
     const currentUser = loadJsonUsers().find(u => String(u.username || '').trim() === username);
     return isLeaderReviewUser({ username, role: currentUser?.role || (req.user as JwtUser | undefined)?.role || '' });
@@ -1600,7 +1601,7 @@ app.put('/api/newdev/projects/:id', authenticate, (req: any, res) => {
   const oldData = parseProjectData(row);
   let nextData = body.data && typeof body.data === 'object' ? compactProjectData(body.data) : oldData;
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
-  if (row.current_step_key === 'selling') {
+  if (row.current_step_key === 'selling' || row.current_step_key === 'opsSynthesis') {
     nextData = mergeCollaborativeNewDevData(oldData, nextData, username);
   } else if (row.current_step_key === 'leaderReview') {
     nextData = mergeReviewIssueData(oldData, nextData, username, 'leader');

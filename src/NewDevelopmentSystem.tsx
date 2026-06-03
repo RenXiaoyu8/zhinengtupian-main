@@ -92,7 +92,7 @@ const dataLabels: Record<string, string> = {
   opsRejectImages: '运营退回图片',
 };
 
-const stepOrder = ['initiation', 'selling', 'purchase', 'packaging', 'mainDetail', 'leaderReview', 'opsReview', 'done'];
+const stepOrder = ['initiation', 'selling', 'purchase', 'opsSynthesis', 'packaging', 'mainDetail', 'leaderReview', 'opsReview', 'done'];
 const rowImageEditorFields: Record<string, string> = {
   sellingPointImages: 'sellingPointEditors',
   testItemImages: 'testItemEditors',
@@ -384,7 +384,7 @@ function fieldFolder(field: string, label: string) {
 }
 
 function canRoleSupplementStep(role: string, stepKey: string) {
-  if ((stepKey === 'selling' || stepKey === 'opsReview') && /运营/.test(role || '')) return true;
+  if ((stepKey === 'selling' || stepKey === 'opsSynthesis' || stepKey === 'opsReview') && /运营/.test(role || '')) return true;
   if (stepKey === 'leaderReview' && /组长|主管|leader/i.test(role || '')) return true;
   return false;
 }
@@ -450,7 +450,7 @@ export default function NewDevelopmentSystem({
   const viewingCurrentStep = !!selected && (!visibleStepKey || visibleStepKey === selected.currentStepKey);
   const canEditSelected = !!selected && viewingCurrentStep && !selected.completedAt && (canManage || selected.assignees?.includes(user.username) || canRoleSupplementStep(user.role || '', selected.currentStepKey));
   const canSubmitSelected = !!selected && (canManage || selected.assignees?.includes(user.username));
-  const currentStepAutosaves = !!selected && ['selling', 'leaderReview', 'opsReview'].includes(selected.currentStepKey);
+  const currentStepAutosaves = !!selected && ['selling', 'opsSynthesis', 'leaderReview', 'opsReview'].includes(selected.currentStepKey);
   const readOnlyReason = selected?.completedAt
     ? '这个新品流程已经完成，只能查看，不能继续编辑。'
     : (!viewingCurrentStep && selected ? '你正在查看历史/其他步骤，只能查看，不能在这里编辑。' : (!canEditSelected && selected ? '你可以查看这个新品流程，但当前步骤不由你处理，不能编辑。' : ''));
@@ -458,10 +458,11 @@ export default function NewDevelopmentSystem({
     initiation: <span>1</span>,
     selling: <span>2</span>,
     purchase: <span>3</span>,
-    packaging: <span>4</span>,
-    mainDetail: <span>5</span>,
-    leaderReview: <span>6</span>,
-    opsReview: <span>7</span>,
+    opsSynthesis: <span>4</span>,
+    packaging: <span>5</span>,
+    mainDetail: <span>6</span>,
+    leaderReview: <span>7</span>,
+    opsReview: <span>8</span>,
     done: <Check className="h-3.5 w-3.5" />,
   };
 
@@ -576,7 +577,7 @@ export default function NewDevelopmentSystem({
 
   const scheduleSellingAutosave = useCallback((project: NewDevProject) => {
     if (!canEditSelected) return;
-    if (!['selling', 'leaderReview', 'opsReview'].includes(project.currentStepKey) || project.id <= 0) return;
+    if (!['selling', 'opsSynthesis', 'leaderReview', 'opsReview'].includes(project.currentStepKey) || project.id <= 0) return;
     if (autoSaveRef.current) window.clearTimeout(autoSaveRef.current);
     autoSaveRef.current = window.setTimeout(() => {
       api(`/newdev/projects/${project.id}`, {
@@ -787,7 +788,7 @@ export default function NewDevelopmentSystem({
     try {
       const currentIndex = stepOrder.indexOf(selected.currentStepKey);
       const nextStep = stepOrder[currentIndex + 1] || 'done';
-      const projectData = selected.currentStepKey === 'purchase' && !selected.data.copywritingConfirm
+      const projectData = selected.currentStepKey === 'opsSynthesis' && !selected.data.copywritingConfirm
         ? { ...(selected.data || {}), copywritingConfirm: buildPackagingConfirm(selected.data || {}) }
         : selected.data;
       const saved = await api(`/newdev/projects/${selected.id}/advance`, {
@@ -1364,70 +1365,11 @@ function ProjectEditor({
   const panel = theme === 'dark' ? 'border-slate-800 bg-slate-900/80' : 'border-slate-200 bg-white';
 
   if (visibleStepKey === 'selling') {
-    const sellingRows = normalizeRows(data.sellingPoints);
     const testRows = normalizeRows(data.testItems);
-    const purchaseProposalRows = normalizeRows(data.purchaseSellingPoints).map(row => row.trim()).filter(Boolean);
-    const purchaseProposalStatus = proposalStatusMap(data.purchaseSellingPointStatus);
     return (
-      <Section title="运营寻找卖点/检测项" className={panel}>
+      <Section title="需要检测项目" className={panel}>
         <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
-        {!!purchaseProposalRows.length && (
-          <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
-            <div className="mb-3 text-sm font-bold text-amber-200">采购添加卖点</div>
-            <div className="mb-3 rounded-lg border border-amber-400/40 bg-amber-400/15 px-3 py-2 text-sm font-bold text-amber-100">
-              提示：运营只有点击采纳后，这些采购卖点才会进入后续流程；未采纳的卖点，后面的包装、主图详情页和审核流程都不会显示。
-            </div>
-            <div className="space-y-2">
-              {purchaseProposalRows.map((point, index) => {
-                const status = purchaseProposalStatus[point];
-                return (
-                  <div key={`${point}-${index}`} className="flex flex-col gap-2 rounded-lg border border-amber-500/20 bg-slate-950/40 p-3 md:flex-row md:items-center md:justify-between">
-                    <div className="min-w-0 text-sm text-slate-100">{point}</div>
-                    <div className="flex shrink-0 gap-2">
-                      {status === 'accepted' ? (
-                        <button type="button" disabled={!canReviewPurchaseSelling} onClick={() => onPurchaseSellingPointDecision(point, 'reset')} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-500 disabled:opacity-50">
-                          删除采纳
-                        </button>
-                      ) : (
-                        <button type="button" disabled={!canReviewPurchaseSelling} onClick={() => onPurchaseSellingPointDecision(point, 'accepted')} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-500 disabled:opacity-50">
-                          采纳复制到卖点
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-        <div className="grid gap-4 xl:grid-cols-2">
-          <CollaborativeList
-            label="卖点信息"
-            tone="selling"
-            rows={sellingRows}
-            authors={data.sellingPointAuthors || {}}
-            editors={data.sellingPointEditors || {}}
-            imagesByText={data.sellingPointImages || {}}
-            imageFieldPrefix="sellingPointImages"
-            inputClass={inputClass}
-            disabled={!canEdit}
-            uploadingField={uploadingField}
-            currentUsername={currentUsername}
-            editLocks={data.editLocks || {}}
-            token={token}
-            placeholder="填写一个卖点"
-            onRowsChange={nextRows => onDataPatch({
-              sellingPoints: nextRows,
-              sellingPointImages: mapImagesByRows(data.sellingPointImages, sellingRows, nextRows),
-              sellingPointEditors: stampEditors(nextRows, sellingRows, data.sellingPointEditors, currentUsername),
-              purchaseSellingPointStatus: resetAcceptedPurchaseStatuses(data, sellingRows, nextRows),
-            })}
-            onLockChange={(key, locked) => onDataPatch({
-              editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
-            })}
-            onUpload={onUpload}
-            onDeleteUpload={onDeleteUpload}
-          />
+        <div className="grid gap-4">
           <CollaborativeList
             label="需要检测项目"
             tone="test"
@@ -1499,6 +1441,77 @@ function ProjectEditor({
         <PurchaseItems items={items} authors={data.testItemAuthors || {}} editors={data.testItemEditors || {}} inputClass={inputClass} disabled={!canEdit} onChange={next => onDataPatch({ purchaseItems: next })} />
         <ImageReview title="运营上传的检测项图片" groups={imageGroups(data, 'test')} token={token} />
         <TextArea label="采购补充说明" value={data.purchaseReview || ''} onChange={value => onDataPatch({ purchaseReview: value })} {...fieldProps} />
+      </Section>
+    );
+  }
+
+  if (visibleStepKey === 'opsSynthesis') {
+    const sellingRows = normalizeRows(data.sellingPoints);
+    const purchaseProposalRows = normalizeRows(data.purchaseSellingPoints).map(row => row.trim()).filter(Boolean);
+    const purchaseProposalStatus = proposalStatusMap(data.purchaseSellingPointStatus);
+    return (
+      <Section title="运营综合卖点" className={panel}>
+        <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
+        <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 p-4">
+          <div className="mb-2 text-sm font-bold text-emerald-100">采购审核通过的检测项目</div>
+          <PurchaseResultBrief data={data} />
+        </div>
+        {!!purchaseProposalRows.length && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
+            <div className="mb-3 text-sm font-bold text-amber-200">采购添加卖点</div>
+            <div className="mb-3 rounded-lg border border-amber-400/40 bg-amber-400/15 px-3 py-2 text-sm font-bold text-amber-100">
+              提示：运营只有点击采纳后，这些采购卖点才会进入后续流程；未采纳的卖点，后面的包装、主图详情页和审核流程都不会显示。
+            </div>
+            <div className="space-y-2">
+              {purchaseProposalRows.map((point, index) => {
+                const status = purchaseProposalStatus[point];
+                return (
+                  <div key={`${point}-${index}`} className="flex flex-col gap-2 rounded-lg border border-amber-500/20 bg-slate-950/40 p-3 md:flex-row md:items-center md:justify-between">
+                    <div className="min-w-0 text-sm text-slate-100">{point}</div>
+                    <div className="flex shrink-0 gap-2">
+                      {status === 'accepted' ? (
+                        <button type="button" disabled={!canReviewPurchaseSelling} onClick={() => onPurchaseSellingPointDecision(point, 'reset')} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-500 disabled:opacity-50">
+                          删除采纳
+                        </button>
+                      ) : (
+                        <button type="button" disabled={!canReviewPurchaseSelling} onClick={() => onPurchaseSellingPointDecision(point, 'accepted')} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-500 disabled:opacity-50">
+                          采纳复制到卖点
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        <CollaborativeList
+          label="卖点信息"
+          tone="selling"
+          rows={sellingRows}
+          authors={data.sellingPointAuthors || {}}
+          editors={data.sellingPointEditors || {}}
+          imagesByText={data.sellingPointImages || {}}
+          imageFieldPrefix="sellingPointImages"
+          inputClass={inputClass}
+          disabled={!canEdit}
+          uploadingField={uploadingField}
+          currentUsername={currentUsername}
+          editLocks={data.editLocks || {}}
+          token={token}
+          placeholder="根据采购确认可做的检测项目填写卖点"
+          onRowsChange={nextRows => onDataPatch({
+            sellingPoints: nextRows,
+            sellingPointImages: mapImagesByRows(data.sellingPointImages, sellingRows, nextRows),
+            sellingPointEditors: stampEditors(nextRows, sellingRows, data.sellingPointEditors, currentUsername),
+            purchaseSellingPointStatus: resetAcceptedPurchaseStatuses(data, sellingRows, nextRows),
+          })}
+          onLockChange={(key, locked) => onDataPatch({
+            editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
+          })}
+          onUpload={onUpload}
+          onDeleteUpload={onDeleteUpload}
+        />
       </Section>
     );
   }
@@ -2078,7 +2091,7 @@ function MainDetailBrief({ data, token, onCopy }: { data: Record<string, any>; t
   const sellingMap = new Map(sellingGroups.map(group => [group.text, group.files]));
   const testMap = new Map(testGroups.map(group => [group.text, group.files]));
   const sellingRows = normalizeRows(data.sellingPoints).map(row => row.trim()).filter(Boolean);
-  const testRows = normalizeRows(data.testItems).map(row => row.trim()).filter(Boolean);
+  const testRows = approvedPurchaseItemNames(data);
   const allText = [
     '卖点：',
     ...(sellingRows.length ? sellingRows.map((text, index) => `${index + 1}. ${text}`) : ['无']),
@@ -2130,6 +2143,50 @@ function MainDetailBrief({ data, token, onCopy }: { data: Record<string, any>; t
         {renderRows('卖点', sellingRows, sellingMap)}
         {renderRows('检测项目', testRows, testMap)}
       </div>
+    </div>
+  );
+}
+
+function approvedPurchaseItemNames(data: Record<string, any>) {
+  const purchaseItems = asArray<any>(data.purchaseItems);
+  if (!purchaseItems.length) return normalizeRows(data.testItems).map(row => row.trim()).filter(Boolean);
+  return purchaseItems
+    .filter(item => item?.status !== 'fail')
+    .map(item => String(item?.detail || item?.name || item?.sourceName || '').trim())
+    .filter(Boolean);
+}
+
+function PurchaseResultBrief({ data }: { data: Record<string, any> }) {
+  const purchaseItems = asArray<any>(data.purchaseItems);
+  const passed = purchaseItems.filter(item => item?.status !== 'fail');
+  const failed = purchaseItems.filter(item => item?.status === 'fail');
+  return (
+    <div className="space-y-3 text-sm">
+      <div>
+        <div className="mb-1 text-xs font-bold text-emerald-200">可做项目</div>
+        {passed.length ? (
+          <div className="space-y-1">
+            {passed.map((item, index) => (
+              <div key={`passed-${index}`} className="rounded border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-emerald-50">
+                {index + 1}. {String(item?.detail || item?.name || item?.sourceName || '').trim()}
+              </div>
+            ))}
+          </div>
+        ) : <div className="text-xs text-slate-500">暂无通过项目</div>}
+      </div>
+      {!!failed.length && (
+        <div>
+          <div className="mb-1 text-xs font-bold text-red-200">不可做项目（写卖点时不要使用）</div>
+          <div className="space-y-1">
+            {failed.map((item, index) => (
+              <div key={`failed-${index}`} className="rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-red-50">
+                {index + 1}. {String(item?.name || item?.sourceName || '').trim()}{item?.reason ? `：${item.reason}` : ''}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {data.purchaseReview && <div className="text-xs text-slate-400">采购补充说明：{data.purchaseReview}</div>}
     </div>
   );
 }
