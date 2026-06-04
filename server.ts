@@ -779,6 +779,9 @@ function compactHistoryValue(value: any): any {
   }
   if (Array.isArray(value)) return value.slice(0, 20).map(compactHistoryValue);
   if (value && typeof value === 'object') {
+    if ('name' in value || 'path' in value) {
+      return [String((value as any).name || '').trim(), String((value as any).path || '').trim()].filter(Boolean).join(' - ') || '[file]';
+    }
     const result: Record<string, any> = {};
     for (const [key, item] of Object.entries(value)) {
       if (key === 'snapshot' || key === 'history') continue;
@@ -1549,7 +1552,8 @@ app.post('/api/newdev/projects', authenticate, (req: any, res) => {
   } catch (err: any) {
     return res.status(400).json({ error: err?.message || '创建产品资料失败' });
   }
-  const data = appendProjectHistory(compactProjectData({ ...(body.data || {}), ...linkedProduct }), {
+  const initialData = compactProjectData({ ...(body.data || {}), ...linkedProduct });
+  const data = appendProjectHistory(initialData, {
     user: createdBy,
     stepKey: creationStepKey,
     stepLabel: stepLabel(creationStepKey),
@@ -1561,6 +1565,15 @@ app.post('/api/newdev/projects', authenticate, (req: any, res) => {
       ...(body.standard ? [{ field: 'standard', label: '执行标准', from: '', to: String(body.standard || '') }] : []),
       ...(body.brand ? [{ field: 'brand', label: '品牌', from: '', to: String(body.brand || '') }] : []),
       ...(body.spec ? [{ field: 'spec', label: '货号', from: '', to: String(body.spec || '') }] : []),
+      ...(Array.isArray(initialData.initiationSellingPoints) && initialData.initiationSellingPoints.some((item: any) => String(item || '').trim())
+        ? [{ field: 'initiationSellingPoints', label: '立项卖点参考', from: '', to: initialData.initiationSellingPoints }]
+        : []),
+      ...(Array.isArray(initialData.purchaseSellingPoints) && initialData.purchaseSellingPoints.some((item: any) => String(item || '').trim())
+        ? [{ field: 'purchaseSellingPoints', label: '采购添加卖点', from: '', to: initialData.purchaseSellingPoints }]
+        : []),
+      ...(Array.isArray(initialData.existingTestReports) && initialData.existingTestReports.length
+        ? [{ field: 'existingTestReports', label: '已有检测报告', from: '', to: initialData.existingTestReports }]
+        : []),
     ],
   });
   const result = db.prepare(`
