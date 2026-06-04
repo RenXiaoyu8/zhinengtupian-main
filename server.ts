@@ -1106,8 +1106,11 @@ function buildProjectChanges(row: any, body: any, oldData: any, nextData: any) {
   if (oldNote !== nextNote) changes.push({ field: 'note', label: '当前步骤备注', from: oldNote, to: nextNote });
   const dataLabels: Record<string, string> = {
     __changeUser: '修改人',
+    initiationSellingPoints: '立项卖点参考',
+    purchaseSellingPoints: '采购添加卖点',
     sellingPoints: '卖点信息',
     testItems: '需要检测项目',
+    referenceLinks: '参考链接',
     feasibleTestItems: '可做检测项目',
     purchaseItems: '采购审核项目',
     purchaseReview: '采购审核说明',
@@ -1687,13 +1690,14 @@ app.post('/api/newdev/projects/:id/advance', authenticate, (req: any, res) => {
   const dataForNextStep = next === 'packaging' && !requestData.copywritingConfirm
     ? { ...requestData, copywritingConfirm: buildPackagingConfirmText(requestData) }
     : requestData;
+  const changes = buildProjectChanges(row, {}, oldData, { ...dataForNextStep, __changeUser: username });
   const nextData = appendProjectHistory(dataForNextStep, {
     user: username,
     stepKey: row.current_step_key,
     stepLabel: stepLabel(row.current_step_key),
     action: done ? 'complete' : 'advance',
     summary: done ? '完成新品开发' : `提交到下一步：${stepLabel(row.current_step_key)} → ${stepLabel(next)}`,
-    changes: [],
+    changes,
   });
   db.prepare('UPDATE newdev_projects SET current_step_key = ?, due_at = ?, data_json = ?, updated_at = ?, completed_at = ? WHERE id = ?')
     .run(next, done ? null : calculateDueAt(next), JSON.stringify(compactProjectData(nextData)), nowIso(), done ? nowIso() : null, id);
@@ -1754,8 +1758,7 @@ app.post('/api/newdev/projects/:id/rollback', authenticate, (req: any, res) => {
   if (!row.completed_at && targetStep.stepKey === row.current_step_key) return res.status(400).json({ error: '当前已经在这个步骤' });
 
   const oldData = parseProjectData(row);
-  const requestData = req.body?.data && typeof req.body.data === 'object' ? compactProjectData(req.body.data) : oldData;
-  const nextData = appendProjectHistory(requestData, {
+  const nextData = appendProjectHistory(oldData, {
     user: username,
     stepKey: row.current_step_key,
     stepLabel: stepLabel(row.current_step_key),
