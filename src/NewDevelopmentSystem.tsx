@@ -1397,33 +1397,6 @@ function ProjectEditor({
             onDeleteUpload={onDeleteUpload}
           />
         </div>
-        <CollaborativeList
-          label="参考链接"
-          tone="reference"
-          rows={normalizeRows(data.referenceLinks)}
-          authors={data.referenceLinkAuthors || {}}
-          editors={data.referenceLinkEditors || {}}
-          imagesByText={{}}
-          imageFieldPrefix="referenceLinks"
-          inputClass={inputClass}
-          disabled={!canEdit}
-          uploadingField={uploadingField}
-          currentUsername={currentUsername}
-          editLocks={data.editLocks || {}}
-          token={token}
-          placeholder="粘贴参考链接"
-          showImages={false}
-          onRowsChange={nextRows => onDataPatch({
-            referenceLinks: nextRows,
-            referenceLinkAuthors: stampAuthors(nextRows, normalizeRows(data.referenceLinks), data.referenceLinkAuthors, currentUsername),
-            referenceLinkEditors: stampEditors(nextRows, normalizeRows(data.referenceLinks), data.referenceLinkEditors, currentUsername),
-          })}
-          onLockChange={(key, locked) => onDataPatch({
-            editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
-          })}
-          onUpload={onUpload}
-          onDeleteUpload={onDeleteUpload}
-        />
       </Section>
     );
   }
@@ -1505,6 +1478,33 @@ function ProjectEditor({
             sellingPointImages: mapImagesByRows(data.sellingPointImages, sellingRows, nextRows),
             sellingPointEditors: stampEditors(nextRows, sellingRows, data.sellingPointEditors, currentUsername),
             purchaseSellingPointStatus: resetAcceptedPurchaseStatuses(data, sellingRows, nextRows),
+          })}
+          onLockChange={(key, locked) => onDataPatch({
+            editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
+          })}
+          onUpload={onUpload}
+          onDeleteUpload={onDeleteUpload}
+        />
+        <CollaborativeList
+          label="参考链接"
+          tone="reference"
+          rows={normalizeRows(data.referenceLinks)}
+          authors={data.referenceLinkAuthors || {}}
+          editors={data.referenceLinkEditors || {}}
+          imagesByText={{}}
+          imageFieldPrefix="referenceLinks"
+          inputClass={inputClass}
+          disabled={!canEdit}
+          uploadingField={uploadingField}
+          currentUsername={currentUsername}
+          editLocks={data.editLocks || {}}
+          token={token}
+          placeholder="粘贴参考链接"
+          showImages={false}
+          onRowsChange={nextRows => onDataPatch({
+            referenceLinks: nextRows,
+            referenceLinkAuthors: stampAuthors(nextRows, normalizeRows(data.referenceLinks), data.referenceLinkAuthors, currentUsername),
+            referenceLinkEditors: stampEditors(nextRows, normalizeRows(data.referenceLinks), data.referenceLinkEditors, currentUsername),
           })}
           onLockChange={(key, locked) => onDataPatch({
             editLocks: { ...(data.editLocks || {}), [key]: locked ? { username: currentUsername, at: Date.now() } : undefined },
