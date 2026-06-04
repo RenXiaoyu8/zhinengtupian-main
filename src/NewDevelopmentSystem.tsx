@@ -890,8 +890,8 @@ export default function NewDevelopmentSystem({
     await removeProjectById(selected.id, selected.title);
   };
 
-  const shell = theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900';
-  const panel = theme === 'dark' ? 'border-slate-800 bg-slate-900/80' : 'border-slate-200 bg-white';
+  const shell = theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'newdev-light bg-slate-50 text-slate-900';
+  const panel = theme === 'dark' ? 'border-slate-800 bg-slate-900/80' : 'border-slate-200 bg-white shadow-sm shadow-slate-200/70';
   const inputClass = theme === 'dark'
     ? 'w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-sky-500 disabled:cursor-not-allowed disabled:opacity-60'
     : 'w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:ring-2 focus:ring-sky-500 disabled:cursor-not-allowed disabled:opacity-60';
