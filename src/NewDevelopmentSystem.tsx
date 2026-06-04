@@ -1652,9 +1652,21 @@ function ProjectEditor({
             {brands.map(brand => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
           </select>
         </label>
+        <Input label="别名" value={data.alias || ''} onChange={value => onDataPatch({ alias: value })} {...fieldProps} />
         <Input label="货号" value={project.spec} onChange={value => onProjectPatch({ spec: value })} {...fieldProps} />
       </div>
       <LineList label="立项卖点参考" value={asArray<string>(data.initiationSellingPoints)} inputClass={inputClass} disabled={!canEdit} placeholder="填写立项参考卖点" onChange={value => onDataPatch({ initiationSellingPoints: value })} />
+      <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
+        <LineList
+          label="采购添加卖点"
+          value={asArray<string>(data.purchaseSellingPoints)}
+          inputClass={inputClass}
+          disabled={!canEdit}
+          placeholder="填写采购建议卖点"
+          onChange={value => onDataPatch({ purchaseSellingPoints: value })}
+        />
+      </div>
+      <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
     </Section>
   );
 }
