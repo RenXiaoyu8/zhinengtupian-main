@@ -85,40 +85,7 @@ function loadServerConfig() {
   return null;
 }
 
-/** 静默请求 check_update，返回 { ok, version, downloadUrl } 或 { ok: false, reason } */
-function fetchCheckUpdate(baseUrl, timeoutMs = CHECK_UPDATE_TIMEOUT_MS) {
-  const url = baseUrl.replace(/\/$/, '') + '/check_update';
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve({ ok: false, reason: 'timeout' }), timeoutMs);
-    const protocol = url.startsWith('https') ? require('https') : require('http');
-    const req = protocol.get(url, { timeout: timeoutMs }, (res) => {
-      clearTimeout(timer);
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        const loc = res.headers.location;
-        if (loc) return fetchCheckUpdate(loc, timeoutMs).then(resolve);
-      }
-      if (res.statusCode !== 200) {
-        resolve({ ok: false, reason: 'status ' + res.statusCode });
-        return;
-      }
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const j = JSON.parse(data);
-          resolve({ ok: true, version: j.version, downloadUrl: j.downloadUrl || '', releaseNotes: j.releaseNotes, fileName: j.fileName || '' });
-        } catch (e) {
-          resolve({ ok: false, reason: 'parse' });
-        }
-      });
-    });
-    req.on('error', (err) => {
-      clearTimeout(timer);
-      resolve({ ok: false, reason: err && err.code ? err.code : 'error' });
-    });
-    req.on('timeout', () => { req.destroy(); clearTimeout(timer); resolve({ ok: false, reason: 'timeout' }); });
-  });
-}
+const { selectServer, fetchCheckUpdate, updatePackageUrl } = require('./server-route.cjs');
 
 /** 比较版本号，返回 true 表示 serverVersion > localVersion */
 function isNewerVersion(serverVersion, localVersion) {
@@ -134,21 +101,15 @@ function isNewerVersion(serverVersion, localVersion) {
   return false;
 }
 
-/** 双链路：开发环境只试本机（省时），生产环境先试局域网/公网再本机 */
 async function resolveBaseUrl(config) {
-  const lan = (config.lanBaseUrl || '').replace(/\/$/, '');
-  const pub = (config.publicBaseUrl || '').replace(/\/$/, '');
-  const local = 'http://127.0.0.1:43123';
-  const urls = isDev
-    ? [local]
-    : [lan, pub, local].filter(Boolean);
-  for (const u of urls) {
-    const timeout = u === local ? LOCALHOST_TIMEOUT_MS : CHECK_UPDATE_TIMEOUT_MS;
-    const r = await fetchCheckUpdate(u, timeout);
-    if (r.ok) return u;
-    startupLog('try ' + u + ' fail: ' + (r.reason || 'unknown'));
-  }
-  return null;
+  const local = 'http://127.0.0.1:' + PORT;
+  const probe = async (url, localOnly) => {
+    const result = await fetchCheckUpdate(url, url === local ? LOCALHOST_TIMEOUT_MS : CHECK_UPDATE_TIMEOUT_MS, localOnly);
+    if (!result.ok) startupLog('try ' + url + ' fail: ' + result.reason);
+    return result.ok;
+  };
+  if (isDev) return { base: await probe(local, true) ? local : null, localOnly: true };
+  return selectServer(config, local, probe);
 }
 
 /**
@@ -177,7 +138,7 @@ function shouldSkipUpdate(version) {
 }
 
 /** 启动更新程序并退出当前应用 */
-function runUpdaterAndQuit(currentExePath, downloadUrl) {
+function runUpdaterAndQuit(currentExePath, downloadUrl, localOnly) {
   const dir = path.dirname(currentExePath);
   const updaterPath = path.join(dir, 'updater.exe');
   if (!downloadUrl) {
@@ -197,7 +158,7 @@ function runUpdaterAndQuit(currentExePath, downloadUrl) {
 
     const updater = spawn(tempUpdaterPath, [
       '--current-exe', currentExePath, '--url', downloadUrl,
-      '--parent-pid', String(process.pid), '--restart',
+      '--parent-pid', String(process.pid), '--restart', ...(localOnly ? ['--lan-only'] : []),
     ], { detached: true, stdio: 'ignore', cwd: tempDir });
     updater.once('error', err => {
       dialog.showErrorBox('启动更新程序失败', err.message);
@@ -1275,18 +1236,33 @@ app.whenReady().then(async () => {
     const serverConfig = loadServerConfig();
     startupLog('5. serverConfig: ' + (serverConfig ? '有' : '无'));
     let updateCheckBaseUrl = null;
+    let localOnly = true;
 
     if (serverConfig) {
       startupLog('6. 远程模式，正在连接服务器...');
-      const baseUrl = await resolveBaseUrl(serverConfig);
+      let route = await resolveBaseUrl(serverConfig);
+      while (!isDev && route.localOnly && !route.base) {
+        const { response } = await dialog.showMessageBox({
+          type: 'warning', title: '局域网连接失败',
+          message: '检测到公司局域网，暂时无法连接资产服务器。',
+          detail: '请确认公司主机服务已启动。本地模式只显示本机资产。',
+          buttons: ['重试局域网', '使用本地模式', '退出'], defaultId: 0, cancelId: 2,
+        });
+        if (response === 2) { app.quit(); return; }
+        if (response === 1) break;
+        route = await resolveBaseUrl(serverConfig);
+      }
+      const baseUrl = route.base;
+      localOnly = route.localOnly;
       startupLog('7. resolveBaseUrl 结果: ' + (baseUrl || 'null'));
       if (baseUrl) {
         startupLog('8. 创建窗口(远程)');
+        if (localOnly) await require('electron').session.defaultSession.setProxy({ mode: 'direct' });
         createWindow(baseUrl, true);
         updateCheckBaseUrl = baseUrl;
       } else {
         startupLog('7b. 远程连接失败，切换到本地模式（见上方各 try xxx fail 原因）');
-        if (!isDev) {
+        if (!isDev && !localOnly) {
           try {
             dialog.showMessageBoxSync({
               type: 'warning',
@@ -1309,8 +1285,11 @@ app.whenReady().then(async () => {
         port = await startServerProd();
       }
       startupLog('8. 创建窗口(本地) port=' + port);
+      if (localOnly) await require('electron').session.defaultSession.setProxy({ mode: 'direct' });
       createWindow(port, false);
-      if (serverConfig && serverConfig.publicBaseUrl) {
+      if (serverConfig && localOnly) {
+        updateCheckBaseUrl = 'http://127.0.0.1:' + port;
+      } else if (serverConfig?.publicBaseUrl) {
         updateCheckBaseUrl = (serverConfig.publicBaseUrl || '').replace(/\/$/, '');
       }
     }
@@ -1318,7 +1297,7 @@ app.whenReady().then(async () => {
     if (updateCheckBaseUrl) {
       setTimeout(async () => {
         try {
-          const r = await fetchCheckUpdate(updateCheckBaseUrl);
+          const r = await fetchCheckUpdate(updateCheckBaseUrl, CHECK_UPDATE_TIMEOUT_MS, localOnly);
           const localVer = app.getVersion();
           if (!r.ok) return;
           if (!isNewerVersion(r.version, localVer)) return;
@@ -1349,12 +1328,7 @@ app.whenReady().then(async () => {
           // - 立即更新：若升级失败 exe 版本未变，也避免重启后循环弹窗
           writeUpdateSkip(r.version);
           if (response === 0) {
-            // 优先用本次实际连通的 baseUrl 拼接下载地址，避免路由器不支持 hairpin NAT
-            // 时局域网客户端去请求公网 IP 导致下载卡死不动
-            const effectiveDownloadUrl = (r.fileName && updateCheckBaseUrl)
-              ? updateCheckBaseUrl.replace(/\/$/, '') + '/releases/' + encodeURIComponent(r.fileName)
-              : r.downloadUrl;
-            runUpdaterAndQuit(process.execPath, effectiveDownloadUrl);
+            runUpdaterAndQuit(process.execPath, updatePackageUrl(updateCheckBaseUrl, r, localOnly), localOnly);
           }
         } catch (e) {}
       }, 2000);

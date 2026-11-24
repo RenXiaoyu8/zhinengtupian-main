@@ -18,9 +18,22 @@ import zipfile
 from urllib.parse import urlsplit
 
 
-def download(url, dest, log):
+class LanRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        def origin(url):
+            parts = urlsplit(url)
+            return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80)
+        if origin(req.full_url) != origin(newurl):
+            raise OSError('局域网更新地址跳转到了其他服务器，请检查更新包地址')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download(url, dest, log, lan_only=False):
     request = urllib.request.Request(url, headers={'User-Agent': 'ShangpinUpdater/1.0'})
-    with urllib.request.urlopen(request, timeout=300) as response, dest.open('wb') as output:
+    open_url = urllib.request.urlopen
+    if lan_only:
+        open_url = urllib.request.build_opener(urllib.request.ProxyHandler({}), LanRedirectHandler()).open
+    with open_url(request, timeout=300) as response, dest.open('wb') as output:
         total = int(response.headers.get('Content-Length', 0))
         received = 0
         next_report = 0
@@ -121,7 +134,7 @@ def install(staged, target, backup, log):
         raise
 
 
-def install_package(current_exe, url, parent_pid, log):
+def install_package(current_exe, url, parent_pid, log, lan_only=False):
     # 在安装盘暂存，替换文件用同卷重命名，也可在失败时恢复原文件。
     with tempfile.TemporaryDirectory(prefix='.shangpin-update-', dir=current_exe.parent,
                                      ignore_cleanup_errors=True) as tmp:
@@ -130,7 +143,7 @@ def install_package(current_exe, url, parent_pid, log):
         staged.mkdir()
         if urlsplit(url).path.lower().endswith('.zip'):
             archive = work / 'download.zip'
-            download(url, archive, log)
+            download(url, archive, log, lan_only)
             with zipfile.ZipFile(archive) as package:
                 members = package.infolist()
                 next_report = 0
@@ -143,7 +156,7 @@ def install_package(current_exe, url, parent_pid, log):
             if len(children) == 1 and children[0].is_dir():
                 staged = children[0]
         else:
-            download(url, staged / current_exe.name, log)
+            download(url, staged / current_exe.name, log, lan_only)
         if not (staged / current_exe.name).is_file():
             raise ValueError(f'更新包中缺少主程序 {current_exe.name}')
         wait_for_client(parent_pid, log)
@@ -196,6 +209,7 @@ def main():
     parser.add_argument('--url', required=True)
     parser.add_argument('--restart', action='store_true')
     parser.add_argument('--parent-pid', type=int)
+    parser.add_argument('--lan-only', action='store_true')
     args = parser.parse_args()
     exe = Path(args.current_exe).resolve()
     events = SimpleQueue()
@@ -214,7 +228,7 @@ def main():
             if not exe.is_file():
                 raise FileNotFoundError(f'找不到原客户端 {exe}')
             log('正在准备更新…')
-            install_package(exe, args.url, args.parent_pid, log)
+            install_package(exe, args.url, args.parent_pid, log, args.lan_only)
         except Exception as exc:
             log(f'更新失败：{exc}\n详情见 {log_file}')
             return 1

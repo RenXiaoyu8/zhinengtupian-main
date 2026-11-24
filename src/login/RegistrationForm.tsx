@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react';
+import { registrationDepartments } from '../../user-manager/departments';
 
 export default function RegistrationForm({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
@@ -30,9 +31,14 @@ export default function RegistrationForm({ onBack }: { onBack: () => void }) {
     {sent ? <p role="status" className="text-sm leading-6 text-slate-200">申请已受理。如已提交过，无需重复申请。审批和授权完成后即可登录。</p> : (
       <form onSubmit={submit}>
         <label htmlFor="register-name">用户名</label>
-        <div className="nebula-login__field"><input id="register-name" name="username" autoComplete="username" required minLength={2} maxLength={32} placeholder="可使用中文姓名" /></div>
+        <div className="nebula-login__field"><input id="register-name" name="username" autoComplete="username" required minLength={2} maxLength={32} placeholder="用中文姓名" /></div>
         <label htmlFor="register-dept">所在部门</label>
-        <div className="nebula-login__field"><input id="register-dept" name="department" autoComplete="organization" required maxLength={40} placeholder="供审批人核对身份" /></div>
+        <div className="nebula-login__field">
+          <select id="register-dept" name="department" required defaultValue="">
+            <option value="" disabled>请选择所在部门</option>
+            {registrationDepartments.map(department => <option key={department} value={department}>{department}</option>)}
+          </select>
+        </div>
         <label htmlFor="register-password">密码</label>
         <div className="nebula-login__field"><input id="register-password" name="password" type="password" autoComplete="new-password" required minLength={8} maxLength={128} placeholder="至少 8 个字符" /></div>
         <label htmlFor="register-confirm">确认密码</label>

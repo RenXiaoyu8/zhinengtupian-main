@@ -43,12 +43,12 @@
 .nebula-login header p { color: #9aacc3; font-size: 13px; letter-spacing: 1.4px; }
 .nebula-login label { display: block; color: #a5b5cb; font-size: 13px; margin-bottom: 6px; }
 .nebula-login__field { position: relative; margin-bottom: 16px; }
-.nebula-login__field input {
+.nebula-login__field input, .nebula-login__field select {
   width: 100%; height: 44px; padding: 0 14px; font: inherit; color: #edf3fa;
   background: rgba(20,32,56,.74); border: 1px solid #728bad50; border-radius: 8px;
 }
 .nebula-login__field input::placeholder { color: #8191a8; }
-.nebula-login input:focus-visible, .nebula-login button:focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
+.nebula-login input:focus-visible, .nebula-login select:focus-visible, .nebula-login button:focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
 .nebula-login #login-password { padding-right: 44px; }
 .nebula-login__eye {
   position: absolute; inset: 0 0 0 auto; width: 44px; display: grid; place-items: center;

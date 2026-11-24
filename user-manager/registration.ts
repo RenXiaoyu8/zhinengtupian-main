@@ -1,6 +1,7 @@
 import express from 'express';
 import { createHash, randomUUID } from 'node:crypto';
 import passwords from './registration-password.cjs';
+import { registrationDepartments } from './departments';
 
 export function mountRegistrationRoutes(app, { db, authenticate, canApprove, canManage, loadUsers, saveUsers, validScopes, permissionBodyLimit }) {
   db.exec(`
@@ -48,7 +49,7 @@ export function mountRegistrationRoutes(app, { db, authenticate, canApprove, can
     if (!/^[\p{L}\p{N}_-]{2,32}$/u.test(username) || ['任小雨','管理员','admin'].includes(key)) {
       return res.status(400).json({ error: '请使用 2–32 位的个人用户名，可用中文、字母、数字、下划线或短横线' });
     }
-    if (!department || department.length > 40 || /[\x00-\x1f]/.test(department)) return res.status(400).json({ error: '请填写部门，最多 40 个字符' });
+    if (!registrationDepartments.includes(department)) return res.status(400).json({ error: '请选择有效的所在部门' });
     if (typeof pass !== 'string' || pass.length < 8 || pass.length > 128 || pass !== pass.trim()) {
       return res.status(400).json({ error: '密码须为 8–128 个字符，首尾不能有空格' });
     }

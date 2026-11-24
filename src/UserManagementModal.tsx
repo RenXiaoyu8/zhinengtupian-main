@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Plus, Trash2, X } from 'lucide-react';
 import { User, UserPermissions } from './types';
+import { registrationDepartments } from '../user-manager/departments';
 
 import { chooseScope } from '../user-manager/scope-picker.mjs';
 import { folderActions, scopeOf } from '../user-manager/asset-scopes.mjs';
@@ -50,7 +51,7 @@ const permissionLabels: Array<[PermissionKey, string]> = [
   ['canSendNotification', '发送通知'],
 ];
 
-const departmentOptions = ['Admin', '设计部', '采购部', '运营部', '抖音部', '客服部', '摄影部', '经理', '经理助理', 'Viewer'];
+const departmentOptions = ['Admin', ...registrationDepartments, 'Viewer'];
 
 const cloneManagedUser = (value: ManagedUser): ManagedUser => ({
   ...value,
@@ -144,7 +145,7 @@ export default function UserManagementModal({ theme, user, onClose }: { theme: '
 
   function openCreate(row: Registration | null) {
     setActivation(row);
-    setNewUser({ username: row?.username || '', password: '', role: 'Viewer',
+    setNewUser({ username: row?.username || '', password: '', role: row && registrationDepartments.includes(row.department) ? row.department : 'Viewer',
       permissions: { ...basePermissions, canDownload: !row } });
     setShowCreatePanel(true);
   }

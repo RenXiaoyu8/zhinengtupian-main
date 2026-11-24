@@ -143906,6 +143906,11 @@ var import_express2 = __toESM(require_express2(), 1);
 var import_express = __toESM(require_express2(), 1);
 var import_node_crypto = require("node:crypto");
 var import_registration_password = __toESM(require_registration_password(), 1);
+
+// user-manager/departments.ts
+var registrationDepartments = ["\u8BBE\u8BA1\u90E8", "\u91C7\u8D2D\u90E8", "\u8FD0\u8425\u90E8", "\u6296\u97F3\u90E8", "\u5BA2\u670D\u90E8", "\u6444\u5F71\u90E8", "\u7ECF\u7406", "\u7ECF\u7406\u52A9\u7406"];
+
+// user-manager/registration.ts
 function mountRegistrationRoutes(app2, { db: db2, authenticate: authenticate2, canApprove, canManage, loadUsers, saveUsers, validScopes: validScopes2, permissionBodyLimit }) {
   db2.exec(`
     CREATE TABLE IF NOT EXISTS registration_requests (
@@ -143952,7 +143957,7 @@ function mountRegistrationRoutes(app2, { db: db2, authenticate: authenticate2, c
     if (!/^[\p{L}\p{N}_-]{2,32}$/u.test(username) || ["\u4EFB\u5C0F\u96E8", "\u7BA1\u7406\u5458", "admin"].includes(key)) {
       return res.status(400).json({ error: "\u8BF7\u4F7F\u7528 2\u201332 \u4F4D\u7684\u4E2A\u4EBA\u7528\u6237\u540D\uFF0C\u53EF\u7528\u4E2D\u6587\u3001\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u4E0B\u5212\u7EBF\u6216\u77ED\u6A2A\u7EBF" });
     }
-    if (!department || department.length > 40 || /[\x00-\x1f]/.test(department)) return res.status(400).json({ error: "\u8BF7\u586B\u5199\u90E8\u95E8\uFF0C\u6700\u591A 40 \u4E2A\u5B57\u7B26" });
+    if (!registrationDepartments.includes(department)) return res.status(400).json({ error: "\u8BF7\u9009\u62E9\u6709\u6548\u7684\u6240\u5728\u90E8\u95E8" });
     if (typeof pass !== "string" || pass.length < 8 || pass.length > 128 || pass !== pass.trim()) {
       return res.status(400).json({ error: "\u5BC6\u7801\u987B\u4E3A 8\u2013128 \u4E2A\u5B57\u7B26\uFF0C\u9996\u5C3E\u4E0D\u80FD\u6709\u7A7A\u683C" });
     }

@@ -220,9 +220,16 @@ def main() -> None:
     cfg.update(version=version, fileName=zip_name, releaseNotes=release_notes)
     write_json(UPDATE_CONFIG, cfg)
     print(f"Publish complete. Version: {version}\nPackage: {zip_path}")
+    client_config = PROJECT_ROOT / "server_config.json"
+    try:
+        lan_base_url = read_json(client_config).get("lanBaseUrl")
+        if lan_base_url:
+            print(f"LAN download URL: {lan_base_url.rstrip('/')}/releases/{zip_name}")
+    except (OSError, ValueError):
+        pass
     public_base_url = str(cfg.get("publicBaseUrl", "")).rstrip("/")
     if public_base_url:
-        print(f"Download URL: {public_base_url}/releases/{zip_name}")
+        print(f"External download URL: {public_base_url}/releases/{zip_name}")
 
 
 def build_archive(pkg: dict, version: str, zip_path: Path) -> None:
