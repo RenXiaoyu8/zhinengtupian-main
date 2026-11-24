@@ -1,352 +1,270 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""
-尚品易站云资产 - 轻量更新程序
-用法:
-  exe: updater.exe --current-exe "C:\...\尚品易站云资产.exe" --url "http://server/releases/app-1.0.1.exe" [--restart]
-  zip: updater.exe --current-exe "C:\...\尚品易站云资产.exe" --url "http://server/releases/shangpin-1.0.1.zip" [--restart]
-zip 时：下载 zip -> 解压到临时目录 -> 将解压内容覆盖到 exe 所在目录 -> 可选重启
-"""
+"""下载便携版，等待旧客户端退出，替换文件并按需重新启动。"""
 import argparse
+import ctypes
+import filecmp
 import os
-import sys
-import time
+from pathlib import Path
+from queue import Empty, SimpleQueue
 import shutil
-import urllib.request
 import subprocess
-import zipfile
+import sys
 import tempfile
-import math
-
-RETRY_SECONDS = 30
-
-
-def make_logger(log_path):
-    """简单日志函数：同时打印到控制台并写入文件。"""
-    def _log(*args):
-        msg = " ".join(str(a) for a in args)
-        try:
-            print(msg, flush=True)
-        except Exception:
-            pass
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(msg + "\n")
-        except Exception:
-            pass
-    return _log
+import threading
+import time
+import urllib.request
+import zipfile
+from urllib.parse import urlsplit
 
 
-def render_progress(downloaded, total):
-    if not total:
-        return f"已下载 {downloaded // 1024} KB"
-    pct = min(100, int(downloaded * 100 / total))
-    filled = max(0, min(30, math.floor(pct / 100 * 30)))
-    bar = "█" * filled + "░" * (30 - filled)
-    return f"[{bar}] {pct:3d}%  {downloaded // 1024} KB / {total // 1024} KB"
+def download(url, dest, log):
+    request = urllib.request.Request(url, headers={'User-Agent': 'ShangpinUpdater/1.0'})
+    with urllib.request.urlopen(request, timeout=300) as response, dest.open('wb') as output:
+        total = int(response.headers.get('Content-Length', 0))
+        received = 0
+        next_report = 0
+        while chunk := response.read(256 * 1024):
+            output.write(chunk)
+            received += len(chunk)
+            if time.monotonic() >= next_report:
+                percent = f'（{received * 100 // total}%）' if total else ''
+                log(f'正在下载新版，已接收 {received // 1024} KB{percent}')
+                next_report = time.monotonic() + 1
+        if total and received != total:
+            raise OSError('下载的文件不完整，请重试')
 
 
-def download_file(url, dest, log=None):
-    req = urllib.request.Request(url, headers={'User-Agent': 'ShangpinUpdater/1.0'})
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        total = resp.headers.get('Content-Length')
-        total = int(total) if total else None
-        downloaded = 0
-        last_pct = -1
-        last_report_at = time.time()
-        if log:
-          log('下载进度:')
-          log('  ' + render_progress(0, total))
-        with open(dest, 'wb') as f:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if log:
-                    pct = int(downloaded * 100 / total) if total else -1
-                    now = time.time()
-                    if (total and pct != last_pct and (pct % 5 == 0 or pct == 100)) or (not total and now - last_report_at >= 2):
-                        log('  ' + render_progress(downloaded, total))
-                        last_pct = pct
-                        last_report_at = now
-        if log:
-            log('  ' + render_progress(downloaded, total))
-            log('下载完成。')
-
-
-def retry_file_op(fn, log, desc):
-    last_err = None
-    for _ in range(RETRY_SECONDS):
-        try:
-            return fn()
-        except Exception as e:
-            last_err = e
-            time.sleep(1)
-    log(desc, '失败:', last_err)
-    raise last_err
-
-
-def same_path(a, b):
-    try:
-        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
-    except Exception:
-        return False
-
-
-def wait_for_main_process_exit(current_exe, exe_name, log):
-    log('等待主程序彻底退出...')
-    time.sleep(2)
-    if os.name != 'nt':
+def wait_for_client(pid, log):
+    if os.name != 'nt' or not pid:
+        # 旧版客户端没有传入 PID，文件替换时仍会检查占用。
         return
-
-    def is_running():
-        try:
-            result = subprocess.run(
-                ['tasklist', '/FI', f'IMAGENAME eq {exe_name}'],
-                capture_output=True,
-                text=True,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-            )
-            return exe_name.lower() in (result.stdout or '').lower()
-        except Exception:
-            return False
-
-    for _ in range(15):
-        if not is_running():
+    import _winapi
+    try:
+        handle = _winapi.OpenProcess(_winapi.SYNCHRONIZE, False, pid)
+    except OSError as exc:
+        if exc.winerror == 87:  # 主进程已退出
             return
-        time.sleep(1)
-
-    log('主程序仍未退出，尝试强制关闭...', exe_name)
+        raise
     try:
-        subprocess.run(
-            ['taskkill', '/F', '/T', '/IM', exe_name],
-            capture_output=True,
-            text=True,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-        )
-    except Exception as e:
-        log('强制关闭主程序失败:', e)
-    time.sleep(2)
+        log('正在等待旧版云资产退出…')
+        if _winapi.WaitForSingleObject(handle, 30000) == _winapi.WAIT_TIMEOUT:
+            raise OSError('旧版客户端仍在运行，请完全退出后重试')
+    finally:
+        _winapi.CloseHandle(handle)
 
 
-def copy_entry(src, dst, current_updater_path, log):
-    if os.path.isdir(src):
-        os.makedirs(dst, exist_ok=True)
-        for name in os.listdir(src):
-            copy_entry(os.path.join(src, name), os.path.join(dst, name), current_updater_path, log)
-        return
-
-    if same_path(dst, current_updater_path):
-        log('跳过当前运行中的升级器:', dst)
-        return
-
-    parent = os.path.dirname(dst)
-    if parent and not os.path.exists(parent):
-        os.makedirs(parent, exist_ok=True)
-
-    if os.path.isdir(dst):
-        retry_file_op(lambda d=dst: shutil.rmtree(d, ignore_errors=False), log, '删除旧目录 ' + dst)
-
-    retry_file_op(lambda s=src, d=dst: shutil.copy2(s, d), log, '复制文件 ' + os.path.basename(dst))
-
-
-def update_from_zip(download_url, dir_name, current_exe, restart, log):
-    log('=' * 60)
-    log('  正在升级中，请勿关闭窗口')
-    log('  下载完成后将自动完成升级并重新打开软件，请耐心等待...')
-    log('=' * 60)
-    log('')
-    log('正在下载新版本 (zip)...', download_url)
-    tmp_dir = tempfile.mkdtemp(prefix='shangpin_update_')
-    zip_path = os.path.join(tmp_dir, 'update.zip')
-    try:
-        download_file(download_url, zip_path, log)
-    except Exception as e:
-        log('下载失败:', e)
-        log('>>> 升级失败，请检查网络后重试。<<<')
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return 1
-
-    log('下载完成，正在解压...')
-    extract_dir = os.path.join(tmp_dir, 'extract')
-    os.mkdir(extract_dir)
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as z:
-            z.extractall(extract_dir)
-    except Exception as e:
-        log('解压失败:', e)
-        log('>>> 升级失败，请重新下载后重试。<<<')
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return 1
-
-    # 解压后可能有一层子目录（例如 win-unpacked 或 尚品易站云资产-1.0.1）
-    root = extract_dir
-    items = os.listdir(extract_dir)
-    if len(items) == 1 and os.path.isdir(os.path.join(extract_dir, items[0])):
-        root = os.path.join(extract_dir, items[0])
-
-    log('正在覆盖安装目录...', 'root =', root, 'dir_name =', dir_name)
-    log('(此步骤可能需要 10-30 秒，请勿关闭窗口)')
-    current_updater_path = os.path.abspath(sys.executable) if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
-
-    fail_count = 0
-    fail_items = []
-    for name in os.listdir(root):
-        src = os.path.join(root, name)
-        dst = os.path.join(dir_name, name)
+def move_when_available(src, dst, log):
+    deadline = time.monotonic() + 30
+    while True:
         try:
-            log(f'  处理: {name}')
-            copy_entry(src, dst, current_updater_path, log)
-        except Exception as e:
-            fail_count += 1
-            fail_items.append(name)
-            log(f'  [失败] 复制 {name}: {e}')
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    if fail_count > 0:
-        log('')
-        log(f'警告：有 {fail_count} 个文件/目录复制失败: {", ".join(fail_items)}')
-        log('升级可能不完整，建议重新运行软件后再次尝试升级。')
-    else:
-        log('')
-        log('所有文件复制完成。')
-
-    if fail_count == 0:
-        log('升级完成！')
-    else:
-        log('升级未完成。')
-
-    if restart and fail_count == 0:
-        log('')
-        log('正在启动主程序...', current_exe)
-        log('(启动后此窗口将自动关闭)')
-        time.sleep(1)
-        subprocess.Popen([current_exe], cwd=dir_name, shell=False, close_fds=True)
-
-    return 0 if fail_count == 0 else 1
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            if time.monotonic() >= deadline:
+                raise OSError(f'无法替换 {src.name}，请检查文件是否被占用或目录是否可写') from exc
+            log(f'正在等待文件解除占用：{src.name}')
+            time.sleep(1)
 
 
-def update_from_exe(download_url, dir_name, current_exe, exe_name, name_no_ext, restart, log):
-    log('=' * 60)
-    log('  正在升级中，请勿关闭窗口')
-    log('  下载完成后将自动完成升级并重新打开软件，请耐心等待...')
-    log('=' * 60)
-    log('')
-
-    new_file = os.path.join(dir_name, name_no_ext + '_new.exe')
-    old_backup = os.path.join(dir_name, name_no_ext + '_old.exe')
-    log('正在下载新版本 (exe)...', download_url)
+def install(staged, target, backup, log):
+    entries = list(staged.rglob('*'))
+    files = [p for p in entries if p.is_file()]
+    journal = []
+    created_dirs = []
+    next_report = 0
     try:
-        download_file(download_url, new_file, log)
-    except Exception as e:
-        log('下载失败:', e)
-        log('>>> 升级失败，请检查网络后重试。<<<')
-        return 1
+        for directory in sorted(p for p in entries if p.is_dir()):
+            dest = target / directory.relative_to(staged)
+            if not dest.is_dir():
+                dest.mkdir()
+                created_dirs.append(dest)
+        for index, src in enumerate(files, 1):
+            relative = src.relative_to(staged)
+            dest = target / relative
+            if time.monotonic() >= next_report or index == len(files):
+                log(f'正在安装 {index}/{len(files)}：{relative}')
+                next_report = time.monotonic() + 0.5
+            if dest.is_dir():
+                raise OSError(f'同名目录阻止安装：{dest}')
+            saved = None
+            if dest.exists():
+                # 旧启动器可能直接运行安装目录中的 updater.exe。
+                if getattr(sys, 'frozen', False) and os.path.samefile(dest, sys.executable):
+                    continue
+                saved = backup / relative
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.replace(dest, saved)
+                except PermissionError:
+                    if filecmp.cmp(src, dest, shallow=False):
+                        continue
+                    move_when_available(dest, saved, log)
+            journal.append((dest, saved))
+            move_when_available(src, dest, log)
+    except Exception:
+        log('安装中断，正在恢复旧版本…')
+        try:
+            for dest, saved in reversed(journal):
+                if saved is None:
+                    dest.unlink(missing_ok=True)
+                else:
+                    move_when_available(saved, dest, log)
+            for directory in reversed(created_dirs):
+                directory.rmdir()
+        except OSError as exc:
+            if backup.exists():
+                recovery = target / (backup.parent.name + '-backup')
+                backup.rename(recovery)
+                raise OSError(f'恢复未完成，旧文件保存在 {recovery}') from exc
+            raise
+        raise
 
-    if not os.path.isfile(new_file):
-        log('下载后未找到文件:', new_file)
-        log('>>> 升级失败。<<<')
-        return 1
 
-    log('替换旧版本...', 'current_exe =', current_exe)
-    try:
-        if os.path.isfile(old_backup):
-            try:
-                os.remove(old_backup)
-            except OSError:
-                pass
-        retry_file_op(lambda: os.rename(current_exe, old_backup), log, '备份旧 exe')
-        retry_file_op(lambda: shutil.move(new_file, current_exe), log, '替换新 exe')
-    except Exception as e:
-        log('替换失败:', e)
-        log('>>> 升级失败，程序文件可能被占用，请关闭软件后重试。<<<')
-        if os.path.isfile(new_file):
-            try:
-                os.remove(new_file)
-            except OSError:
-                pass
-        return 1
+def install_package(current_exe, url, parent_pid, log):
+    # 在安装盘暂存，替换文件用同卷重命名，也可在失败时恢复原文件。
+    with tempfile.TemporaryDirectory(prefix='.shangpin-update-', dir=current_exe.parent,
+                                     ignore_cleanup_errors=True) as tmp:
+        work = Path(tmp)
+        staged = work / 'new'
+        staged.mkdir()
+        if urlsplit(url).path.lower().endswith('.zip'):
+            archive = work / 'download.zip'
+            download(url, archive, log)
+            with zipfile.ZipFile(archive) as package:
+                members = package.infolist()
+                next_report = 0
+                for i, member in enumerate(members, 1):
+                    if time.monotonic() >= next_report:
+                        log(f'正在解压 {i}/{len(members)}…')
+                        next_report = time.monotonic() + 0.5
+                    package.extract(member, staged)
+            children = list(staged.iterdir())
+            if len(children) == 1 and children[0].is_dir():
+                staged = children[0]
+        else:
+            download(url, staged / current_exe.name, log)
+        if not (staged / current_exe.name).is_file():
+            raise ValueError(f'更新包中缺少主程序 {current_exe.name}')
+        wait_for_client(parent_pid, log)
+        install(staged, current_exe.parent, work / 'backup', log)
+        log('文件安装完成，正在清理临时文件…')
 
-    try:
-        os.remove(old_backup)
-    except OSError:
-        pass
 
-    log('')
-    log('升级完成！')
-    if restart:
-        log('')
-        log('正在启动主程序...', current_exe)
-        log('(启动后此窗口将自动关闭)')
-        time.sleep(1)
-        subprocess.Popen([current_exe], cwd=dir_name, shell=False, close_fds=True)
-    return 0
+def has_visible_window(pid):
+    from ctypes import wintypes
+    found = False
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32 = ctypes.windll.user32
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+
+    @enum_proc
+    def visit(hwnd, _):
+        nonlocal found
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        found = owner.value == pid and bool(user32.IsWindowVisible(hwnd))
+        return not found
+
+    user32.EnumWindows(visit, 0)
+    return found
+
+
+def restart_client(exe, log):
+    log('新版已安装，正在打开云资产…')
+    if os.name == 'nt' and getattr(sys, 'frozen', False):
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+    flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+    process = subprocess.Popen([str(exe)], cwd=exe.parent, close_fds=True, creationflags=flags,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.name == 'nt':
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if has_visible_window(process.pid):
+                log(f'云资产窗口已打开（PID {process.pid}）')
+                return
+            if process.poll() is not None:
+                raise OSError(f'启动进程已退出，退出码 {process.returncode}')
+            time.sleep(0.2)
+        raise TimeoutError(f'新版进程已启动（PID {process.pid}），20 秒内尚未看到窗口')
 
 
 def main():
-    parser = argparse.ArgumentParser(description='尚品易站云资产 更新程序')
-    parser.add_argument('--current-exe', required=True, help='当前主程序 exe 完整路径')
-    parser.add_argument('--url', required=True, help='新版本下载地址 (.exe 或 .zip)')
-    parser.add_argument('--restart', action='store_true', help='更新完成后启动主程序')
+    parser = argparse.ArgumentParser(description='尚品易站云资产更新程序')
+    parser.add_argument('--current-exe', required=True)
+    parser.add_argument('--url', required=True)
+    parser.add_argument('--restart', action='store_true')
+    parser.add_argument('--parent-pid', type=int)
     args = parser.parse_args()
+    exe = Path(args.current_exe).resolve()
+    events = SimpleQueue()
+    log_file = exe.parent / 'updater.log'
 
-    current_exe = os.path.abspath(args.current_exe)
-    download_url = args.url.strip()
-    dir_name = os.path.dirname(current_exe)
-    exe_name = os.path.basename(current_exe)
-    name_no_ext, _ = os.path.splitext(exe_name)
-
-    log_path = os.path.join(dir_name, "updater.log")
-    log = make_logger(log_path)
-    log("==== 启动更新程序 ====")
-    log("current_exe =", current_exe)
-    log("download_url =", download_url)
-
-    if not os.path.isfile(current_exe):
-        log('错误: 找不到当前程序', current_exe)
-        sys.exit(1)
-
-    wait_for_main_process_exit(current_exe, exe_name, log)
-
-    if download_url.lower().endswith('.zip'):
-        code = update_from_zip(download_url, dir_name, current_exe, args.restart, log)
-    else:
-        code = update_from_exe(download_url, dir_name, current_exe, exe_name, name_no_ext, args.restart, log)
-
-    if code != 0:
-        log('')
-        log('升级未能完成。请将此窗口截图发给管理员，或查看 updater.log 了解详情。')
-        log('按 Enter 键关闭窗口...')
+    def log(msg):
+        events.put(msg)
         try:
-            input()
-        except Exception:
-            time.sleep(10)
-    else:
-        log('')
-        log('升级流程结束，窗口即将关闭。')
-        time.sleep(1)
+            with log_file.open('a', encoding='utf-8') as output:
+                output.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}\n')
+        except OSError:
+            pass
 
-    sys.exit(code)
+    def update():
+        try:
+            if not exe.is_file():
+                raise FileNotFoundError(f'找不到原客户端 {exe}')
+            log('正在准备更新…')
+            install_package(exe, args.url, args.parent_pid, log)
+        except Exception as exc:
+            log(f'更新失败：{exc}\n详情见 {log_file}')
+            return 1
+        if args.restart:
+            try:
+                restart_client(exe, log)
+            except Exception as exc:
+                log(f'新版已安装，自动打开失败：{exc}\n可手动打开 {exe.name}')
+                return 2
+        return 0
+
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+        root = tk.Tk()
+    except Exception:
+        return update()
+
+    root.title('尚品易站云资产更新')
+    root.resizable(False, False)
+    status = tk.StringVar(value='正在准备更新…')
+    ttk.Label(root, text='云资产版本更新', font=('Microsoft YaHei UI', 13, 'bold')).pack(anchor='w', padx=20, pady=(16, 6))
+    ttk.Label(root, textvariable=status, wraplength=420, width=55).pack(anchor='w', padx=20, pady=(0, 16))
+    root.protocol('WM_DELETE_WINDOW', root.iconify)
+    result = []
+
+    def work():
+        result.append(update())
+
+    thread = threading.Thread(target=work)
+    thread.start()
+
+    def refresh():
+        finished = not thread.is_alive()
+        try:
+            while True:
+                status.set(events.get_nowait())
+        except Empty:
+            pass
+        if finished:
+            root.protocol('WM_DELETE_WINDOW', root.destroy)
+            root.after(150 if result == [0] else 12000, root.destroy)
+        else:
+            root.after(100, refresh)
+
+    refresh()
+    root.mainloop()
+    thread.join()
+    return result[0]
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        # 若发生未捕获异常，也写入日志方便排查
-        try:
-            dir_name = os.path.dirname(os.path.abspath(sys.argv[0]))
-            log_path = os.path.join(dir_name, "updater_fatal.log")
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write("FATAL: %s\n" % e)
-        except Exception:
-            pass
-        try:
-            print(f"\n[严重错误] {e}\n升级失败，请截图发给管理员。")
-            input("按 Enter 键关闭...")
-        except Exception:
-            pass
-        raise
+    sys.exit(main())

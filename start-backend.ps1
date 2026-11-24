@@ -1,6 +1,7 @@
 param(
   [switch]$Detached,
   [switch]$Watch,
+  [switch]$EnsureRunning,
   [switch]$NoPause
 )
 
@@ -21,7 +22,10 @@ $releaseApp = Get-ChildItem -Path $Root -Filter '*.exe' -File -ErrorAction Silen
   Select-Object -First 1
 if ($releaseApp) {
   $AppExe = $releaseApp.FullName
-  $StaticDir = Join-Path $Root 'resources\app.asar\dist'
+  # Plain Node serves the external dist folder. Only Electron can read inside app.asar.
+  if (-not (Test-Path (Join-Path $StaticDir 'index.html'))) {
+    $StaticDir = Join-Path $Root 'resources\app.asar\dist'
+  }
   $externalServerBundle = Join-Path $Root 'electron\server-bundle.cjs'
   if (Test-Path $externalServerBundle) {
     $ServerBundle = $externalServerBundle
@@ -70,16 +74,11 @@ function Get-ListeningPortOwners {
   return @($owners)
 }
 
-function Test-PortListening {
-  param([int]$ListenPort)
-  return @((Get-ListeningPortOwners -ListenPort $ListenPort)).Count -gt 0
-}
-
 function Stop-ProcessTreeQuietly {
   param([int]$ProcessId)
   if ($ProcessId -le 4 -or $ProcessId -eq $PID) { return }
   try {
-    & cmd.exe /c "taskkill /PID $ProcessId /T /F >nul 2>nul"
+    & taskkill.exe /PID $ProcessId /T /F *> $null
   } catch {}
 }
 
@@ -110,87 +109,58 @@ if (-not (Test-Path $ServerBundle)) {
 
 New-Item -ItemType Directory -Force -Path $AppDataDir | Out-Null
 
-function Test-BetterSqlite3Binding {
-  $bindingRoots = @(
-    Join-Path $Root 'node_modules\better-sqlite3\build\Release\better_sqlite3.node'
-    Join-Path $Root 'node_modules\better-sqlite3\build\Debug\better_sqlite3.node'
-    Join-Path $Root 'node_modules\better-sqlite3\build\default\better_sqlite3.node'
-    Join-Path $Root 'node_modules\better-sqlite3\compiled\24.14.0\win32\x64\better_sqlite3.node'
-    Join-Path $Root 'node_modules\better-sqlite3\addon-build\release\install-root\better_sqlite3.node'
-    Join-Path $Root 'node_modules\better-sqlite3\addon-build\debug\install-root\better_sqlite3.node'
-    Join-Path $Root 'node_modules\better-sqlite3\addon-build\default\install-root\better_sqlite3.node'
-    Join-Path $Root 'node_modules\better-sqlite3\lib\binding\node-v137-win32-x64\better_sqlite3.node'
-  )
-  foreach ($path in $bindingRoots) {
-    if (Test-Path $path) {
-      return $true
-    }
-  }
-  return $false
+function Test-BackendReady {
+  try {
+    $api = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/config" -TimeoutSec 3
+    return $api.port -eq $Port -and ($null -ne $api.PSObject.Properties['lanBaseUrl'])
+  } catch { return $false }
 }
 
-try {
-  $selfPid = $PID
-  $oldWatchers = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
-    Where-Object {
-      $_.ProcessId -ne $selfPid -and
-      $_.CommandLine -match 'start-backend\.ps1' -and
-      $_.CommandLine -match '\-Watch'
-    } |
-    Select-Object -ExpandProperty ProcessId -Unique
-  foreach ($processId in $oldWatchers) {
-    Write-Host "Stopping old backend watcher PID $processId"
-    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
-  }
-
-  $listenPorts = @($Port)
-  if ($Port -ne 3000) { $listenPorts += 3000 }
-  $listeners = @()
-  foreach ($listenPort in $listenPorts) {
-    $listeners += Get-ListeningPortOwners -ListenPort $listenPort
-  }
-  $listeners = $listeners | Select-Object -Unique
-  foreach ($processId in $listeners) {
-    if ([int]$processId -le 4) { continue }
-    Write-Host "Stopping old backend PID $processId"
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$processId)" -ErrorAction SilentlyContinue
-    if ($proc -and [int]$proc.ParentProcessId -gt 4) {
-      $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$proc.ParentProcessId)" -ErrorAction SilentlyContinue
-      if ($parent -and ([string]$parent.Name).ToLowerInvariant() -eq 'powershell.exe') {
-        Stop-ProcessTreeQuietly -ProcessId ([int]$parent.ProcessId)
-      }
-    }
-    Stop-ProcessTreeQuietly -ProcessId ([int]$processId)
-  }
-} catch {
-  Write-Host "Port cleanup skipped: $($_.Exception.Message)"
-}
-Start-Sleep -Seconds 1
-
-if ($ServerBundle -and (Test-Path $ServerBundle)) {
-  $node = Get-Command node -ErrorAction SilentlyContinue
-  if (-not $node) {
-    Exit-WithMessage 1 '[ERROR] node.exe not found. Please install Node.js 20+.'
-  }
-  $needsNativeRebuild = $env:REBUILD_NATIVE_DEPS -eq '1' -or -not (Test-BetterSqlite3Binding)
-  if ($needsNativeRebuild -and (Test-Path (Join-Path $Root 'package.json'))) {
-    Write-Host 'Rebuilding better-sqlite3 for current Node runtime...'
-    Push-Location $Root
-    try {
+$useNode = (Test-Path -LiteralPath $ServerBundle) -and (Test-Path -LiteralPath (Join-Path $StaticDir 'index.html'))
+if ($EnsureRunning -and (Test-BackendReady)) { exit 0 }
+if ($useNode) {
+  Push-Location $Root
+  try {
+    $check = "new (require('better-sqlite3'))(':memory:').close()"
+    & node -e $check
+    if ($LASTEXITCODE -ne 0 -or $env:REBUILD_NATIVE_DEPS -eq '1') {
       & npm.cmd rebuild better-sqlite3
-    } catch {
-      Write-Host "npm rebuild skipped/failed: $($_.Exception.Message)"
-    } finally {
-      Pop-Location
+      if ($LASTEXITCODE -ne 0) { Exit-WithMessage 1 'Cannot rebuild the SQLite binding for Node.' }
+      & node -e $check
+      if ($LASTEXITCODE -ne 0) { Exit-WithMessage 1 'Cannot open an in-memory SQLite database.' }
     }
+  } finally { Pop-Location }
+} elseif (-not $AppExe) { Exit-WithMessage 1 'No usable backend runtime found.' }
+
+if (-not $Watch) {
+  $watchers = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and
+      $_.CommandLine.IndexOf($PSCommandPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+      $_.CommandLine -match '\s-Watch\b' })
+  if ($EnsureRunning -and $watchers.Count) {
+    for ($i = 0; $i -lt 10; $i++) {
+      if (Test-BackendReady) { exit 0 }
+      Start-Sleep -Seconds 1
+    }
+    Exit-WithMessage 1 'Current backend watcher is running but the API is unavailable.'
+  }
+  foreach ($watcher in $watchers) { Stop-ProcessTreeQuietly -ProcessId $watcher.ProcessId }
+  foreach ($listenerId in (Get-ListeningPortOwners -ListenPort $Port)) {
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $listenerId" -ErrorAction SilentlyContinue
+    $isOurNode = $proc.CommandLine -and $proc.CommandLine.IndexOf($ServerBundle, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    $isOurApp = $AppExe -and $proc.ExecutablePath -eq $AppExe -and $proc.CommandLine -match '--server-only'
+    if ($EnsureRunning -or (-not $isOurNode -and -not $isOurApp)) {
+      Exit-WithMessage 1 "Port $Port is already occupied. Leaving its owner running."
+    }
+    Stop-ProcessTreeQuietly -ProcessId $listenerId
   }
 }
 
 if ($Detached) {
   Write-Host 'Starting backend in background...'
   Write-LaunchLog "Detached start requested. Root=$Root StaticDir=$StaticDir ServerBundle=$ServerBundle AppExe=$AppExe"
-  if ($ServerBundle -and (Test-Path $ServerBundle)) {
-    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Watch', '-NoPause')
+  if ($useNode) {
+    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $PSCommandPath + '"'), '-Watch', '-NoPause')
     $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WorkingDirectory $Root -WindowStyle Hidden -PassThru
     Write-LaunchLog "Started powershell backend PID=$($child.Id)"
   } else {
@@ -199,7 +169,7 @@ if ($Detached) {
   }
   for ($i = 1; $i -le 60; $i++) {
     Start-Sleep -Seconds 1
-    if (Test-PortListening -ListenPort $Port) {
+    if (Test-BackendReady) {
       Write-Host "[OK] Backend is listening on port $Port."
       Write-LaunchLog "Backend is listening on port $Port."
       exit 0
@@ -233,7 +203,7 @@ $env:DATABASE_PATH = $DatabasePath
 if ($AppExe) {
   "AppExe=$AppExe --server-only" | Add-Content -Path $LogFile -Encoding UTF8
 }
-if ($ServerBundle -and (Test-Path $ServerBundle)) {
+if ($useNode) {
   (& node -v) | Add-Content -Path $LogFile -Encoding UTF8
 }
 
@@ -245,7 +215,7 @@ if ($Watch) {
   while ($true) {
     $restart += 1
     "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Watch start #$restart" | Add-Content -Path $LogFile -Encoding UTF8
-    if ($ServerBundle -and (Test-Path $ServerBundle)) {
+    if ($useNode) {
       & node $ServerBundle *>> $LogFile
     } else {
       & $AppExe --server-only *>> $LogFile
@@ -256,7 +226,7 @@ if ($Watch) {
   }
 }
 
-if ($ServerBundle -and (Test-Path $ServerBundle)) {
+if ($useNode) {
   & node $ServerBundle *>> $LogFile
 } else {
   & $AppExe --server-only *>> $LogFile

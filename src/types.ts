@@ -17,6 +17,7 @@ export interface Product {
   names: string; // 别名，逗号分隔
   brand_id?: number;
   brand_name?: string;
+  productFolderPath?: string;
   image_path: string;
   variants?: ProductVariant[];
 }
@@ -37,6 +38,10 @@ export interface FileItem {
 }
 
 export interface UserPermissions {
+  canRename?: boolean;
+  canMove?: boolean;
+  folderScopes?: Partial<Record<'canUpload' | 'canDownload' | 'canDelete' | 'canMove' | 'canRename' | 'canCreateFolder' | 'canTag', 'all' | string[]>>;
+  canCreateFolder?: boolean;
   canUpload: boolean;
   canDownload: boolean;
   canDelete: boolean;
@@ -44,7 +49,9 @@ export interface UserPermissions {
   canManageBrands: boolean;
   canTag: boolean;
   canManageUsers?: boolean;
+  canApproveRegistrations?: boolean;
   canManageNewDevelopment?: boolean;
+  canSendNotification?: boolean;
 }
 
 export interface User {

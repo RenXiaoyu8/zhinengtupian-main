@@ -5,6 +5,7 @@ import {
   Check,
   Clock,
   FileText,
+  Film,
   History,
   Image as ImageIcon,
   MoveDown,
@@ -22,8 +23,9 @@ import {
 import { User } from './types';
 
 const API_BASE = '/api';
+const NEWDEV_CREATE_DRAFT_KEY = 'newdev_create_draft_v1';
 
-type ManagedUser = { username: string; role: string };
+type ManagedUser = { username: string; role: string; permissions?: { canManageNewDevelopment?: boolean } };
 type BrandOption = { id: number; name: string };
 type OpsRotation = { usernames: string[]; currentIndex: number; currentUsername: string; weekKey: string };
 type StepConfig = {
@@ -63,6 +65,10 @@ type HistoryEntry = {
   action?: string;
   summary?: string;
 };
+
+function makeEmptyNewDevDraft() {
+  return { title: '', barcode: '', standard: '', brand: '', brandId: '', alias: '', spec: '', purchaseSellingPoints: [''] };
+}
 
 const dataLabels: Record<string, string> = {
   initiationSellingPoints: '立项卖点',
@@ -108,6 +114,23 @@ function normalizeRows(value: any): string[] {
   return Array.isArray(value) ? value.map(item => String(item ?? '')) : [];
 }
 
+function loadNewDevCreateDraft() {
+  if (typeof window === 'undefined') return makeEmptyNewDevDraft();
+  try {
+    const raw = window.localStorage.getItem(NEWDEV_CREATE_DRAFT_KEY);
+    if (!raw) return makeEmptyNewDevDraft();
+    const parsed = JSON.parse(raw);
+    const rows = normalizeRows(parsed?.purchaseSellingPoints);
+    return {
+      ...makeEmptyNewDevDraft(),
+      ...(parsed && typeof parsed === 'object' ? parsed : {}),
+      purchaseSellingPoints: rows.length ? rows : [''],
+    };
+  } catch (_) {
+    return makeEmptyNewDevDraft();
+  }
+}
+
 function reviewIssueRows(value: any, legacyText: any): string[] {
   const rows = normalizeRows(value);
   if (rows.length) return rows;
@@ -131,8 +154,9 @@ function formatRemaining(value?: string | null) {
   const diff = new Date(value).getTime() - Date.now();
   if (!Number.isFinite(diff)) return '未设置';
   if (diff <= 0) return '已超时';
-  const hours = Math.floor(diff / 36e5);
-  const minutes = Math.max(0, Math.round((diff % 36e5) / 60000));
+  const totalMinutes = Math.ceil(diff / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
   return `${hours}小时${minutes}分钟`;
 }
 
@@ -376,7 +400,7 @@ function fieldFolder(field: string, label: string) {
   if (field === 'packagingSourceFiles' || field === 'packagingPreviewImages') return '包装/定稿源文件';
   if (field === 'whiteBackgroundImages') return '产品图片/白底图';
   if (field === 'mainDetailSourceFiles') return '产品图片/PSD源文件';
-  if (field === 'skuImages') return 'sku';
+  if (field === 'skuImages') return '产品图片/SKU';
   if (field === 'mainImages') return '产品图片/主图';
   if (field === 'detailImages') return '产品图片/详情页';
   if (field === 'existingTestReports') return '检测报告';
@@ -384,7 +408,7 @@ function fieldFolder(field: string, label: string) {
 }
 
 function canRoleSupplementStep(role: string, stepKey: string) {
-  if ((stepKey === 'selling' || stepKey === 'opsSynthesis' || stepKey === 'opsReview') && /运营/.test(role || '')) return true;
+  if ((stepKey === 'selling' || stepKey === 'opsSynthesis') && /运营/.test(role || '')) return true;
   if (stepKey === 'leaderReview' && /组长|主管|leader/i.test(role || '')) return true;
   return false;
 }
@@ -419,7 +443,7 @@ export default function NewDevelopmentSystem({
   const [screen, setScreen] = useState<'list' | 'create' | 'detail'>('list');
   const [detailStepKey, setDetailStepKey] = useState<string | null>(null);
   const [notifyOperationsOnPurchase, setNotifyOperationsOnPurchase] = useState(true);
-  const [draft, setDraft] = useState({ title: '', barcode: '', standard: '', brand: '', brandId: '', alias: '', spec: '', purchaseSellingPoints: [''] });
+  const [draft, setDraft] = useState(loadNewDevCreateDraft);
   const [draftTestReports, setDraftTestReports] = useState<File[]>([]);
   const [draftReportDragging, setDraftReportDragging] = useState(false);
   const autoSaveRef = useRef<number | null>(null);
@@ -440,11 +464,28 @@ export default function NewDevelopmentSystem({
     return data;
   }, [user.token]);
 
+  const saveCreateDraft = useCallback((showNotice = true) => {
+    try {
+      window.localStorage.setItem(NEWDEV_CREATE_DRAFT_KEY, JSON.stringify(draft));
+      if (showNotice) setNotice('新建新品草稿已保存');
+    } catch (_) {
+      if (showNotice) setNotice('草稿保存失败，请检查浏览器存储权限');
+    }
+  }, [draft]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(NEWDEV_CREATE_DRAFT_KEY, JSON.stringify(draft));
+    } catch (_) {
+      // Best-effort local draft only.
+    }
+  }, [draft]);
+
   const selected = useMemo(() => projects.find(project => project.id === selectedId) || null, [projects, selectedId]);
   const stepMap = useMemo(() => new Map(steps.map(step => [step.stepKey, step])), [steps]);
-  const designers = useMemo(() => users.filter(item => /设计|美工|designer/i.test(item.role || '') || user.permissions?.canManageNewDevelopment), [users, user.permissions]);
+  const designers = useMemo(() => users.filter(item => /设计|美工|designer/i.test(item.role || '') || item.permissions?.canManageNewDevelopment), [users]);
   const visibleStepKey = selected ? (detailStepKey || selected.currentStepKey) : null;
-  const currentStep = visibleStepKey ? stepMap.get(visibleStepKey) : null;
+  const currentStep = selected ? stepMap.get(selected.currentStepKey) : null;
   const canManage = !!user.permissions?.canManageNewDevelopment || !!user.permissions?.canManageUsers || user.username === '任小雨';
   const canReviewPurchaseSelling = canManage || /运营/.test(user.role || '') || /杩愯惀/.test(user.role || '');
   const viewingCurrentStep = !!selected && (!visibleStepKey || visibleStepKey === selected.currentStepKey);
@@ -612,10 +653,12 @@ export default function NewDevelopmentSystem({
     }
   }, []);
 
-  const uploadProjectFiles = useCallback(async (project: Pick<NewDevProject, 'title' | 'data'>, field: string, files: File[]) => {
+  const uploadProjectFiles = useCallback(async (project: Pick<NewDevProject, 'title' | 'data'>, field: string, files: File[], sku: string) => {
     if (!files.length) return [];
     const formData = new FormData();
     files.forEach((file, index) => formData.append('files', file, file.name || `upload-${Date.now()}-${index + 1}`));
+    formData.append('newDevProject', 'draft');
+    formData.append('draftSku', sku.trim());
     formData.append('path', uploadTargetPath(project, field));
     const response = await fetch(`${API_BASE}/upload`, {
       method: 'POST',
@@ -662,7 +705,7 @@ export default function NewDevelopmentSystem({
       const brand = brands.find(item => String(item.id) === String(draft.brandId));
       const draftProductFolderPath = `${safePathName(brand?.name || draft.brand || '未分类品牌')}/${safePathName(draft.title)}`;
       const uploadedReports = draftTestReports.length
-        ? await uploadProjectFiles({ title: draft.title, data: { productFolderPath: draftProductFolderPath } }, 'existingTestReports', draftTestReports)
+        ? await uploadProjectFiles({ title: draft.title, data: { productFolderPath: draftProductFolderPath } }, 'existingTestReports', draftTestReports, draft.spec.trim() || draft.barcode.trim())
         : [];
       const created = await api('/newdev/projects', {
         method: 'POST',
@@ -688,8 +731,9 @@ export default function NewDevelopmentSystem({
       lastAutoSavedKeyRef.current[nextCreated.id] = projectDraftKey(nextCreated);
       setSelectedId(nextCreated.id);
       setScreen('detail');
-      setDraft({ title: '', barcode: '', standard: '', brand: '', brandId: '', alias: '', spec: '', purchaseSellingPoints: [''] });
+      setDraft(makeEmptyNewDevDraft());
       setDraftTestReports([]);
+      window.localStorage.removeItem(NEWDEV_CREATE_DRAFT_KEY);
       setNotice('新品项目已创建');
     } catch (err: any) {
       setNotice(err.message || '创建失败');
@@ -711,6 +755,7 @@ export default function NewDevelopmentSystem({
       const label = field.split(':').slice(1).join(':') || dataLabels[cleanField] || cleanField;
       const formData = new FormData();
       fileList.forEach((file, index) => formData.append('files', file, file.name || `upload-${Date.now()}-${index + 1}`));
+      formData.append('newDevProject', String(selected.id));
       formData.append('path', uploadTargetPath(selected, field, label));
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), 300000);
@@ -774,7 +819,7 @@ export default function NewDevelopmentSystem({
       nextData = { ...nextData, [field]: asArray(nextData[field]).filter((_, i) => i !== index) };
     }
     const nextProject = { ...selected, data: nextData };
-    setProjects(prev => prev.map(item => item.id === selected.id ? nextProject : item));
+    if (autoSaveRef.current) window.clearTimeout(autoSaveRef.current);
     saveProject(nextProject).catch(err => setNotice(err.message || '删除文件失败'));
   }, [canEditSelected, readOnlyReason, saveProject, selected]);
 
@@ -791,9 +836,11 @@ export default function NewDevelopmentSystem({
       const projectData = selected.currentStepKey === 'opsSynthesis' && !selected.data.copywritingConfirm
         ? { ...(selected.data || {}), copywritingConfirm: buildPackagingConfirm(selected.data || {}) }
         : selected.data;
+      if (autoSaveRef.current) window.clearTimeout(autoSaveRef.current);
       const saved = await api(`/newdev/projects/${selected.id}/advance`, {
         method: 'POST',
         body: JSON.stringify({
+          updatedAt: selected.updatedAt,
           stepKey: nextStep,
           data: projectData,
           notifyOperations: selected.currentStepKey === 'purchase' && notifyOperationsOnPurchase,
@@ -818,9 +865,13 @@ export default function NewDevelopmentSystem({
     }
     setSaving(true);
     try {
+      if (autoSaveRef.current) window.clearTimeout(autoSaveRef.current);
+      const current = projectDraftKey(selected) === lastAutoSavedKeyRef.current[selected.id]
+        ? selected : await saveProject(selected);
+      if (!current) return;
       const saved = await api(`/newdev/projects/${selected.id}/reject`, {
         method: 'POST',
-        body: JSON.stringify({ targetStepKey: 'mainDetail', data: selected.data }),
+        body: JSON.stringify({ targetStepKey: 'mainDetail', updatedAt: current.updatedAt, data: current.data }),
       });
       lastAutoSavedKeyRef.current[saved.id] = projectDraftKey(saved);
       setProjects(prev => prev.map(item => item.id === saved.id ? saved : item));
@@ -929,9 +980,8 @@ export default function NewDevelopmentSystem({
         {projects.map(project => {
           const stepsForRow = steps.filter(step => step.stepKey !== 'done');
           return (
-            <button
+            <article
               key={project.id}
-              type="button"
               onClick={() => {
                 setSelectedId(project.id);
                 setDetailStepKey(null);
@@ -940,14 +990,14 @@ export default function NewDevelopmentSystem({
               className={`w-full rounded-lg border p-4 text-left transition ${selectedId === project.id && screen === 'detail' ? 'border-sky-500 bg-sky-500/10' : `${theme === 'dark' ? 'border-slate-800 bg-slate-900/70 hover:border-slate-600' : 'border-slate-200 bg-white hover:border-slate-300'}`}`}
             >
               <div className="mb-3 flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-bold">{project.title || '未命名新品'}</div>
-                  <div className="mt-1 text-xs text-slate-500">
-                    {stepMap.get(project.currentStepKey)?.label || project.currentStepKey} · {project.completedAt ? '完成' : formatRemaining(project.dueAt)}
+                <div className="min-w-0 flex-1">
+                  <button type="button" className="block max-w-full break-all text-left text-sm font-bold">{project.title || '未命名新品'}</button>
+                  <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">
+                    <span>{project.completedAt ? '已完成' : `${stepMap.get(project.currentStepKey)?.label || project.currentStepKey} · ${formatRemaining(project.dueAt)}`}</span>
+                    {!project.completedAt && <span className="min-w-0 truncate" title={project.assignees?.join('、')}>负责人：{project.assignees?.join('、') || '未分配'}</span>}
                   </div>
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <div className="text-xs text-slate-500">负责人：{project.assignees?.join('、') || '-'}</div>
+                <div className="shrink-0">
                   {canManage && (
                     <button
                       type="button"
@@ -968,7 +1018,7 @@ export default function NewDevelopmentSystem({
                   const active = step.stepKey === project.currentStepKey;
                   const done = stepOrder.indexOf(step.stepKey) < stepOrder.indexOf(project.currentStepKey) || !!project.completedAt;
                   return (
-                    <div key={step.stepKey} className="flex min-w-0 items-center gap-2">
+                    <div key={step.stepKey} className="flex shrink-0 items-center gap-2 whitespace-nowrap">
                       <button
                         type="button"
                         title={`跳到${step.label}`}
@@ -990,7 +1040,7 @@ export default function NewDevelopmentSystem({
                   );
                 })}
               </div>
-            </button>
+            </article>
           );
         })}
       </div>
@@ -1102,6 +1152,10 @@ export default function NewDevelopmentSystem({
         </div>
         <div className="mt-4 flex justify-end gap-2">
           <button type="button" className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-bold" onClick={() => setScreen('list')}>返回</button>
+          <button type="button" className="inline-flex items-center gap-2 rounded-lg border border-slate-700 px-4 py-2 text-sm font-bold hover:bg-slate-800" onClick={() => saveCreateDraft()}>
+            <Save className="h-4 w-4" />
+            保存草稿
+          </button>
           <button type="button" disabled={saving} onClick={createProject} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-bold text-white hover:bg-sky-500 disabled:opacity-60">
             <Plus className="h-4 w-4" />
             创建
@@ -1115,14 +1169,14 @@ export default function NewDevelopmentSystem({
     <div className="mx-auto max-w-6xl space-y-4">
               <div className={`rounded-lg border p-4 ${panel}`}>
                 <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
+                  <div className="min-w-0 max-w-full">
                     <div className="flex items-center gap-2 text-xs text-slate-500">
                       <Clock className="h-4 w-4" />
-                      {currentStep?.label || visibleStepKey || selected.currentStepKey} · 剩余 {formatRemaining(selected.dueAt)}
+                      {selected.completedAt ? '已完成' : `当前步骤：${currentStep?.label || selected.currentStepKey} · ${formatRemaining(selected.dueAt)}`}
                     </div>
-                    <h2 className="mt-1 text-2xl font-bold">{selected.title || '未命名新品'}</h2>
+                    <h2 className="mt-1 break-all text-2xl font-bold">{selected.title || '未命名新品'}</h2>
                     <div className="mt-1 text-sm text-slate-500">
-                      负责人：{selected.assignees?.join('、') || '-'} · 最后更新：{formatDate(selected.updatedAt)}
+                      {!selected.completedAt && `当前负责人：${selected.assignees?.join('、') || '未分配'} · `}最后更新：{formatDate(selected.updatedAt)}
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -1152,20 +1206,26 @@ export default function NewDevelopmentSystem({
                     const active = step.stepKey === selected.currentStepKey;
                     const viewing = step.stepKey === visibleStepKey;
                     const done = stepOrder.indexOf(step.stepKey) < stepOrder.indexOf(selected.currentStepKey) || !!selected.completedAt;
+                    const stepButtonClass = theme === 'dark'
+                      ? `${viewing ? 'ring-2 ring-white/50 ' : ''}${active ? 'border-sky-400 bg-sky-500 text-white' : done ? 'border-emerald-500 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30' : 'border-slate-600 bg-slate-800 text-slate-300 hover:border-slate-400'}`
+                      : `${viewing ? 'ring-2 ring-sky-300/70 ' : ''}${active ? 'border-sky-500 bg-sky-600 text-white shadow-sm shadow-sky-200' : done ? 'border-emerald-400 bg-emerald-50 text-emerald-700 hover:bg-emerald-100' : 'border-slate-300 bg-white text-slate-700 hover:border-slate-500 hover:bg-slate-50'}`;
+                    const stepLabelClass = theme === 'dark'
+                      ? `${viewing ? 'text-white' : active ? 'text-sky-300' : done ? 'text-emerald-300' : 'text-slate-500'}`
+                      : `${viewing ? 'text-slate-950 font-bold' : active ? 'text-sky-700 font-bold' : done ? 'text-emerald-700' : 'text-slate-600'}`;
                     return (
-                      <div key={step.stepKey} className="flex min-w-0 items-center gap-2">
+                      <div key={step.stepKey} className="flex shrink-0 items-center gap-2 whitespace-nowrap">
                         <button
                           type="button"
                           title={`跳到${step.label}`}
-                          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-xs font-bold transition ${viewing ? 'ring-2 ring-white/50 ' : ''}${active ? 'border-sky-400 bg-sky-500 text-white' : done ? 'border-emerald-500 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30' : 'border-slate-600 bg-slate-800 text-slate-300 hover:border-slate-400'}`}
+                          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-xs font-bold transition ${stepButtonClass}`}
                           onClick={() => setDetailStepKey(step.stepKey)}
                         >
                           {stepIcons[step.stepKey] || index + 1}
                         </button>
-                        <div className={`min-w-0 text-xs ${viewing ? 'text-white' : active ? 'text-sky-300' : done ? 'text-emerald-300' : 'text-slate-500'}`}>
+                        <div className={`min-w-0 text-xs ${stepLabelClass}`}>
                           {step.label}
                         </div>
-                        {index < steps.filter(item => item.stepKey !== 'done').length - 1 && <div className="h-px w-6 shrink-0 bg-slate-700" />}
+                        {index < steps.filter(item => item.stepKey !== 'done').length - 1 && <div className={`h-px w-6 shrink-0 ${theme === 'dark' ? 'bg-slate-700' : 'bg-slate-300'}`} />}
                       </div>
                     );
                   })}
@@ -1519,7 +1579,7 @@ function ProjectEditor({
   if (visibleStepKey === 'packaging') {
     return (
       <Section title="包装设计 / 白底图" className={panel}>
-        <DesignerTransfer designers={designers} disabled={!canEdit} inputClass={inputClass} onTransfer={onTransfer} current={data.transferredTo} />
+        <DesignerTransfer designers={designers} disabled={!canEdit} inputClass={inputClass} onTransfer={onTransfer} current={project.currentStepKey === visibleStepKey ? project.assignees?.join('、') : undefined} />
         <TextArea label="文案和检测项目确认" value={data.copywritingConfirm || buildPackagingConfirm(data)} onChange={value => onDataPatch({ copywritingConfirm: value })} {...fieldProps} />
         <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
         <div className="rounded-lg border border-slate-700 bg-slate-950/40 p-4">
@@ -1535,7 +1595,7 @@ function ProjectEditor({
   if (visibleStepKey === 'mainDetail') {
     return (
       <Section title="主图详情页设计" className={panel}>
-        <DesignerTransfer designers={designers} disabled={!canEdit} inputClass={inputClass} onTransfer={onTransfer} current={data.transferredTo} />
+        <DesignerTransfer designers={designers} disabled={!canEdit} inputClass={inputClass} onTransfer={onTransfer} current={project.currentStepKey === visibleStepKey ? project.assignees?.join('、') : undefined} />
         <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
         <div className="rounded-lg border border-slate-700 bg-slate-950/40 p-4">
           <MainDetailBrief data={data} token={token} onCopy={onCopy} />
@@ -1666,7 +1726,7 @@ function ProjectEditor({
           onChange={value => onDataPatch({ purchaseSellingPoints: value })}
         />
       </div>
-      <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} />
+      <ExistingTestReports files={asArray<FileRef>(data.existingTestReports)} token={token} canDelete={canEdit} onDelete={index => onDeleteUpload('existingTestReports', index)} />
     </Section>
   );
 }
@@ -2038,7 +2098,21 @@ function FileUploader({
 
 function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file: FileRef; token?: string; canDelete?: boolean; onDelete?: () => void }) {
   const name = file.name || file.path || '文件';
+  const extMatch = name.match(/\.([^.]+)$/i);
+  const ext = extMatch ? `.${extMatch[1].toLowerCase()}` : '';
   const isImage = /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
+  const isPreviewable = isImage || /\.(pdf|psd|ai|mp4|mov|avi|mkv|webm|m4v|flv|wmv|mpg|mpeg|3gp)$/i.test(name);
+  const isVideo = /\.(mp4|mov|avi|mkv|webm|m4v|flv|wmv|mpg|mpeg|3gp)$/i.test(name);
+  const isPdf = ext === '.pdf';
+  const isPsd = ext === '.psd';
+  const isAi = ext === '.ai';
+  const isSourceFile = isPdf || isPsd || isAi;
+  const barStyle = isSourceFile ? {
+    '.ai': { bg: '#f97316', label: 'AI' } as const,
+    '.psd': { bg: '#3b82f6', label: 'PSD' } as const,
+    '.pdf': { bg: '#ef4444', label: 'PDF' } as const,
+  }[ext] : null;
+  const thumbSrc = file.path ? `${API_BASE}/thumbnail?path=${encodeURIComponent(String(file.path).replace(/\\/g, '/'))}${token ? `&token=${encodeURIComponent(token)}` : ''}` : '';
   const href = downloadUrl(file.path, token);
   const openFile = async () => {
     if (!href) return;
@@ -2050,6 +2124,40 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
     }
     const opened = window.open(href, '_blank');
     if (!opened) window.location.href = href;
+  };
+  const renderPreview = (extraClass = '') => {
+    if (!isPreviewable) return null;
+    const fallbackIcon = isVideo
+      ? <Film className="h-8 w-8 text-indigo-400" />
+      : isImage
+        ? <ImageIcon className="h-8 w-8 text-sky-400" />
+        : <FileText className="h-8 w-8 text-slate-400" />;
+    return (
+      <div className={`relative flex aspect-video items-center justify-center bg-slate-900 overflow-hidden ${extraClass}`}>
+        {thumbSrc ? (
+          <>
+            <img
+              src={thumbSrc}
+              alt={name}
+              className="h-full w-full object-contain"
+              referrerPolicy="no-referrer"
+              draggable={false}
+              onError={(e) => {
+                (e.currentTarget as HTMLImageElement).style.display = 'none';
+                (e.currentTarget as HTMLImageElement).nextElementSibling?.classList.remove('hidden');
+              }}
+            />
+            <div className="hidden absolute inset-0 flex items-center justify-center bg-slate-800/50">
+              {fallbackIcon}
+            </div>
+          </>
+        ) : (
+          <div className="flex items-center justify-center">
+            {fallbackIcon}
+          </div>
+        )}
+      </div>
+    );
   };
   return (
     <div
@@ -2064,11 +2172,22 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
       title="双击打开"
     >
       <button type="button" onClick={event => event.preventDefault()} className="block w-full text-left">
-        <div className="flex aspect-video items-center justify-center bg-slate-900">
-          {isImage ? <Thumbnail path={file.path} token={token} name={name} className="h-full w-full object-contain" /> : <FileText className="h-8 w-8 text-slate-500" />}
-        </div>
+        {isSourceFile ? (
+          <div className="flex flex-col">
+            {renderPreview()}
+            <div className="flex h-5 items-center justify-center text-[10px] font-bold text-white" style={{ backgroundColor: barStyle!.bg }}>
+              {barStyle!.label}
+            </div>
+          </div>
+        ) : isPreviewable ? (
+          renderPreview()
+        ) : (
+          <div className="flex aspect-video items-center justify-center bg-slate-900">
+            <FileText className="h-8 w-8 text-slate-500" />
+          </div>
+        )}
         <div className="flex items-center gap-2 px-3 py-2 text-sm text-slate-300">
-          {isImage ? <ImageIcon className="h-4 w-4 shrink-0 text-sky-400" /> : <FileText className="h-4 w-4 shrink-0 text-slate-400" />}
+          {isVideo ? <Film className="h-4 w-4 shrink-0 text-indigo-400" /> : isImage ? <ImageIcon className="h-4 w-4 shrink-0 text-sky-400" /> : <FileText className="h-4 w-4 shrink-0 text-slate-400" />}
           <span className="min-w-0 truncate">{name}</span>
         </div>
       </button>
@@ -2081,14 +2200,32 @@ function FileCard({ file, token, canDelete, onDelete }: { key?: React.Key; file:
   );
 }
 
-function ExistingTestReports({ files, token }: { files: FileRef[]; token?: string }) {
+function ExistingTestReports({
+  files,
+  token,
+  canDelete,
+  onDelete,
+}: {
+  files: FileRef[];
+  token?: string;
+  canDelete?: boolean;
+  onDelete?: (index: number) => void;
+}) {
   return (
     <div className="rounded-lg border border-violet-500/30 bg-violet-500/10 p-4">
       <div className="mb-2 text-sm font-bold text-violet-100">已有检测报告</div>
       <div className="mb-3 text-xs text-slate-400">采购创建新品时提供的厂家检测报告，可作为卖点和设计参考。双击文件用电脑默认工具打开。</div>
       {files.length ? (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {files.map((file, index) => <FileCard key={`${file.path || file.name}-${index}`} file={file} token={token} />)}
+          {files.map((file, index) => (
+            <FileCard
+              key={`${file.path || file.name}-${index}`}
+              file={file}
+              token={token}
+              canDelete={canDelete}
+              onDelete={() => onDelete?.(index)}
+            />
+          ))}
         </div>
       ) : (
         <div className="text-xs text-slate-500">暂无检测报告</div>
@@ -2264,6 +2401,14 @@ function Thumbnail({ path, name, token, className }: { path?: string; name?: str
   const [failed, setFailed] = useState(false);
   const src = thumbnailUrl(path, token);
   useEffect(() => setFailed(false), [src]);
+
+  // 调试日志
+  useEffect(() => {
+    if (name?.toLowerCase().endsWith('.pdf')) {
+      console.log('[Thumbnail Debug]', { name, path, src, failed });
+    }
+  }, [name, path, src, failed]);
+
   if (!src || failed) {
     return (
       <div className="flex h-full w-full items-center justify-center bg-slate-900">

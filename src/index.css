@@ -74,6 +74,29 @@
   color: #64748b !important;
 }
 
+.newdev-light [class*="text-sky-100"],
+.newdev-light [class*="text-sky-200"] {
+  color: #075985 !important;
+}
+
+.newdev-light [class*="text-amber-100"],
+.newdev-light [class*="text-amber-200"] {
+  color: #92400e !important;
+}
+
+.newdev-light [class*="text-emerald-100"],
+.newdev-light [class*="text-emerald-200"] {
+  color: #047857 !important;
+}
+
+.newdev-light [class*="bg-slate-800"] {
+  background-color: #e2e8f0 !important;
+}
+
+.newdev-light [class*="hover:bg-slate-700"]:hover {
+  background-color: #cbd5e1 !important;
+}
+
 .newdev-light [class*="bg-sky-950"],
 .newdev-light [class*="bg-violet-950"],
 .newdev-light [class*="bg-amber-950"],

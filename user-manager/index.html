@@ -130,9 +130,15 @@
     </div>
   </div>
 
-  <script>
+  <script type="module">
+    import { chooseScope } from './scope-picker.mjs';
+    import { folderActions, scopeOf } from './asset-scopes.mjs';
     const PERM_LABELS = {
+      canApproveRegistrations: '审批新成员',
       canUpload: '上传',
+      canRename: '重命名',
+      canMove: '移动',
+      canCreateFolder: '新建文件夹',
       canDownload: '下载',
       canDelete: '删除',
       canManageProducts: '产品管理',
@@ -163,7 +169,7 @@
       tbody.innerHTML = users.map(u => `
         <tr>
           <td>${escapeHtml(u.username)}</td>
-          <td class="perms">${escapeHtml(u.password || '')}</td>
+          <td class="perms">${escapeHtml(u.protectedPassword ? '已设置' : u.password || '')}</td>
           <td>${escapeHtml(u.role)}</td>
           <td class="perms">${escapeHtml(renderPerms(u.permissions))}</td>
           <td class="act">
@@ -183,7 +189,7 @@
     function escapeHtml(s) {
       const d = document.createElement('div');
       d.textContent = s;
-      return d.innerHTML;
+      return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     let users = [];
@@ -203,6 +209,21 @@
         <label><input type="checkbox" data-key="${k}" ${perms[k] ? 'checked' : ''} /> ${PERM_LABELS[k]}</label>
       `).join('');
       el.querySelectorAll('input').forEach(inp => {
+        const key = inp.dataset.key;
+        if (folderActions.includes(key)) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          const refresh = () => {
+            const scope = scopeOf(perms, key);
+            btn.textContent = scope === 'all' ? '全部范围' : '指定文件夹（' + scope.length + '）';
+          };
+          refresh();
+          btn.onclick = async () => {
+            const result = await chooseScope(PERM_LABELS[key], scopeOf(perms,key), p => api('GET','/api/users/folders?path='+encodeURIComponent(p)));
+            if (result !== null) { perms.folderScopes = { ...perms.folderScopes, [key]: result }; refresh(); }
+          };
+          inp.parentElement.after(btn);
+        }
         inp.onchange = () => {
           perms[inp.dataset.key] = inp.checked;
           if (onChange) onChange();
@@ -211,11 +232,12 @@
     }
 
     document.getElementById('btnAdd').onclick = () => {
-      const perms = { canUpload: false, canDownload: true, canDelete: false, canManageProducts: false, canManageBrands: false, canTag: false };
+      const perms = { canApproveRegistrations: false, canRename: false, canMove: false, canCreateFolder: false, canUpload: false, canDownload: true, canDelete: false, canManageProducts: false, canManageBrands: false, canTag: false };
       document.getElementById('addUsername').value = '';
       document.getElementById('addPassword').value = '';
       document.getElementById('addRole').value = 'Viewer';
       document.getElementById('addRole').placeholder = '如 Admin、Editor、Viewer，可自定义';
+      window._addPerms = perms;
       makePermCheckboxes('addPerms', perms);
       document.getElementById('modalAdd').classList.remove('hide');
     };
@@ -227,8 +249,7 @@
       const password = document.getElementById('addPassword').value.trim();
       const role = document.getElementById('addRole').value.trim() || 'Viewer';
       if (!username || !password) { alert('请填写用户名和密码'); return; }
-      const perms = {};
-      document.querySelectorAll('#addPerms input').forEach(inp => { perms[inp.dataset.key] = inp.checked; });
+      const perms = window._addPerms;
       try {
         await api('POST', '/api/users', {
           username,
@@ -244,7 +265,7 @@
     function openEdit(u) {
       if (!u) return;
       document.getElementById('editUsername').value = u.username;
-      document.getElementById('editPasswordCurrent').value = u.password || '';
+      document.getElementById('editPasswordCurrent').value = u.protectedPassword ? '已设置' : u.password || '';
       document.getElementById('editPassword').value = '';
       document.getElementById('editRole').value = u.role || 'Viewer';
       const perms = { ...u.permissions };

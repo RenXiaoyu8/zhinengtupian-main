@@ -1,14 +1,14 @@
 {
   "name": "shangpin-cloud-assets",
   "private": true,
-  "version": "2.7.5",
+  "version": "3.0.8",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "tsx server.ts",
     "build:icons": "node ./scripts/generate_icons.mjs",
     "build": "vite build",
-    "build:server": "esbuild ././server.ts --bundle --platform=node --format=cjs --outfile=electron/server-bundle.cjs --external:better-sqlite3 --external:sharp --external:canvas --external:vite",
+    "build:server": "esbuild ././server.ts --bundle --platform=node --format=cjs --outfile=electron/server-bundle.cjs --external:better-sqlite3 --external:sharp --external:canvas --external:vite --external:ffmpeg-static",
     "build:updater": "python ./scripts/build_updater.py",
     "preview": "vite preview",
     "clean": "rm -rf dist",
@@ -30,10 +30,11 @@
     "ag-psd": "^30.1.0",
     "archiver": "^5.3.2",
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^12.6.2",
+    "better-sqlite3": "^12.11.1",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "ffmpeg-static": "^5.3.0",
     "form-data": "^4.0.0",
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.546.0",
@@ -47,7 +48,7 @@
     "xlsx": "^0.18.5"
   },
   "optionalDependencies": {
-    "canvas": "^3.0.3",
+    "canvas": "^3.2.3",
     "pdfjs-dist": "4.8.69"
   },
   "devDependencies": {
@@ -67,6 +68,9 @@
     "appId": "com.shangpin.cloud-assets",
     "productName": "尚品易站云资产",
     "npmRebuild": false,
+    "asarUnpack": [
+      "**/node_modules/ffmpeg-static/**"
+    ],
     "directories": {
       "output": "release"
     },

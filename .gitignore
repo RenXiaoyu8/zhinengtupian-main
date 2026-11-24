@@ -18,7 +18,6 @@ __pycache__/
 .server-port
 server_config.json
 update_config.json
-updater.spec
 %WRAP_CMD%
 *.db
 *.sqlite

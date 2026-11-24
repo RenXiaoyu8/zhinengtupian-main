@@ -195,27 +195,23 @@ function runUpdaterAndQuit(currentExePath, downloadUrl) {
     const tempUpdaterPath = path.join(tempDir, 'updater.exe');
     fs.copyFileSync(updaterPath, tempUpdaterPath);
 
-    // 通过 cmd /c start 让 updater.exe 在独立控制台窗口中运行。
-    // 直接 spawn + stdio:'ignore' 会把 stdout/stderr 重定向到 NUL 设备，
-    // 导致控制台窗口弹出后完全空白（进度/错误均不可见）。
-    // 用 start "" 启动时，updater.exe 获得新控制台的 CONOUT$ 句柄，print() 输出正常可见。
-    const q = (s) => '"' + String(s).replace(/"/g, '\\"') + '"';
-    const cmdArg = `/c start "" ${q(tempUpdaterPath)} --current-exe ${q(currentExePath)} --url ${q(downloadUrl)} --restart`;
-    spawn('cmd.exe', [cmdArg], {
-      detached: true,
-      stdio: 'ignore',
-      windowsVerbatimArguments: true,
-      cwd: tempDir,
+    const updater = spawn(tempUpdaterPath, [
+      '--current-exe', currentExePath, '--url', downloadUrl,
+      '--parent-pid', String(process.pid), '--restart',
+    ], { detached: true, stdio: 'ignore', cwd: tempDir });
+    updater.once('error', err => {
+      dialog.showErrorBox('启动更新程序失败', err.message);
     });
-    allowQuit = true;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      try { mainWindow.destroy(); } catch (_) {}
-    }
-    if (serverProcess) {
-      try { serverProcess.kill(); } catch (_) {}
-      serverProcess = null;
-    }
-    app.quit();
+    updater.once('spawn', () => {
+      updater.unref();
+      allowQuit = true;
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
+      if (serverProcess) {
+        try { serverProcess.kill(); } catch (_) {}
+        serverProcess = null;
+      }
+      app.quit();
+    });
   } catch (e) {
     dialog.showMessageBoxSync({ type: 'error', title: '更新失败', message: '启动更新程序失败', detail: String(e && e.message ? e.message : e) });
   }
@@ -297,6 +293,33 @@ let cachedHiddenTrayIcon = null;
 const APP_LOGO_FILES = ['尚品易站云资产logo-01.svg', 'app-icon.png', '尚品易站云资产logo.png'];
 
 const CLOSE_PREF_PATH = path.join(app.getPath('userData'), 'close-preference.json');
+const supportsLoginStart = process.platform === 'win32' && app.isPackaged && !isServerOnly;
+const loginItemName = '尚品易站云资产';
+
+function clientLoginItem(executable = process.execPath) {
+  return app.getLoginItemSettings({ path: executable }).launchItems.find(
+    item => item.name === loginItemName && item.scope === 'user'
+  );
+}
+
+function setClientLoginStart(enabled) {
+  app.setLoginItemSettings({ name: loginItemName, path: process.execPath, openAtLogin: true, enabled });
+  if (clientLoginItem()?.enabled !== enabled) throw new Error('Windows 未保存启动项设置');
+}
+
+function initializeLoginStart() {
+  if (!supportsLoginStart) return;
+  const marker = path.join(app.getPath('userData'), 'login-item-path.txt');
+  try {
+    const previous = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8') : '';
+    if (previous === process.execPath) return;
+    // Keep the Windows Startup Apps preference when a portable installation moves.
+    if (!clientLoginItem()) setClientLoginStart(previous ? !!clientLoginItem(previous)?.enabled : true);
+    fs.writeFileSync(marker, process.execPath, 'utf8');
+  } catch (err) {
+    startupLog('注册客户端开机启动失败：' + err.message);
+  }
+}
 
 function readClosePreference() {
   try {
@@ -415,11 +438,26 @@ function ensureTray() {
     return null;
   }
   tray.setToolTip('尚品易站云资产');
-  tray.setContextMenu(Menu.buildFromTemplate([
+  const buildTrayMenu = () => Menu.buildFromTemplate([
     { label: '打开主窗口', click: showMainWindow },
+    ...(supportsLoginStart ? [{
+      label: '开机自动启动',
+      type: 'checkbox',
+      checked: !!clientLoginItem()?.enabled,
+      click: item => {
+        try {
+          setClientLoginStart(item.checked);
+        } catch (err) {
+          startupLog('更新客户端开机启动失败：' + err.message);
+          dialog.showErrorBox('开机自动启动', err.message);
+        }
+      },
+    }] : []),
     { type: 'separator' },
     { label: '退出软件', click: () => { allowQuit = true; app.quit(); } },
-  ]));
+  ]);
+  if (supportsLoginStart) tray.on('right-click', () => tray.popUpContextMenu(buildTrayMenu()));
+  else tray.setContextMenu(buildTrayMenu());
   tray.on('click', showMainWindow);
   tray.on('double-click', showMainWindow);
   return tray;
@@ -452,6 +490,7 @@ const ASSETS_ROOT = process.env.ASSETS_ROOT || 'D:\\尚品易站图片';
  * @param {number|string} portOrBaseUrl - 本地端口（独立模式）或完整 baseUrl（远程模式，如 http://192.168.1.100:43123）
  * @param {boolean} isRemote - 是否远程模式（不启本地服务，直接加载公司主机地址）
  */
+let assetServerOrigin;
 function createWindow(portOrBaseUrl, isRemote = false) {
   Menu.setApplicationMenu(null);
   const win = new BrowserWindow({
@@ -469,6 +508,7 @@ function createWindow(portOrBaseUrl, isRemote = false) {
   ensureTray();
 
   const loadUrl = isRemote ? String(portOrBaseUrl) : `http://localhost:${portOrBaseUrl}`;
+  assetServerOrigin = new URL(loadUrl).origin;
   win.loadURL(loadUrl);
 
   // 禁止拖入文件时跳转；若为 file:// 则视为从系统拖入的文件，将路径发给渲染进程以打开智能上传
@@ -989,6 +1029,23 @@ async function listAllFilesInDir({ origin, token, dirRel }) {
   return files;
 }
 
+async function confirmAssetDownload(paths, urls) {
+  try {
+    if (!assetServerOrigin || paths.length !== urls.length) return false;
+    const parsed = urls.map(url => new URL(url));
+    if (parsed.some((url, i) => url.origin !== assetServerOrigin || url.pathname !== '/api/download' ||
+      url.searchParams.get('path') !== paths[i])) return false;
+    const token = parsed[0]?.searchParams.get('token');
+    if (!token) return false;
+    const response = await fetch(assetServerOrigin + '/api/files/download-access', {
+      method: 'POST', redirect: 'error',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ paths }),
+    });
+    return response.ok;
+  } catch { return false; }
+}
+
 ipcMain.on('ondragstart', async (event, paths, downloadUrls, isDirs) => {
   if (!paths || !Array.isArray(paths) || paths.length === 0) return;
   const fullPaths = [];
@@ -1017,6 +1074,10 @@ ipcMain.on('ondragstart', async (event, paths, downloadUrls, isDirs) => {
     dragReceivedBytes = baseReceived + receivedBytes;
     emitDragProgress('progress');
   };
+  if (!await confirmAssetDownload(paths, urls)) {
+    emitDragProgress('failed');
+    return;
+  }
   emitDragProgress('started');
   // 本批次共用一个临时目录，其下用原始文件名/文件夹名，拖到桌面时名称不变
   const sessionDir = path.join(DRAG_CACHE_ROOT, String(Date.now()) + '_' + Math.random().toString(16).slice(2));
@@ -1108,6 +1169,7 @@ ipcMain.on('ondragstart', async (event, paths, downloadUrls, isDirs) => {
 
 ipcMain.handle('open-file', async (_, relativePath, downloadUrl) => {
   if (!relativePath || typeof relativePath !== 'string') return { ok: false, err: '无效路径' };
+  if (!await confirmAssetDownload([relativePath], [downloadUrl])) return { ok: false, err: '没有此文件的下载权限' };
   const normalized = relativePath.replace(/^\//, '').replace(/\//g, path.sep);
   const fullPath = path.join(ASSETS_ROOT, normalized);
   const ext = path.extname(fullPath).toLowerCase();
@@ -1144,6 +1206,7 @@ ipcMain.handle('open-file', async (_, relativePath, downloadUrl) => {
 
 ipcMain.handle('show-item-in-folder', async (_, relativePath, downloadUrl) => {
   if (!relativePath || typeof relativePath !== 'string') return { ok: false, err: '无效路径' };
+  if (!await confirmAssetDownload([relativePath], [downloadUrl])) return { ok: false, err: '没有此文件的下载权限' };
   const normalized = relativePath.replace(/^\//, '').replace(/\//g, path.sep);
   const fullPath = path.join(ASSETS_ROOT, normalized);
   const ext = path.extname(fullPath).toLowerCase();
@@ -1208,6 +1271,7 @@ app.whenReady().then(async () => {
       return;
     }
 
+    initializeLoginStart();
     const serverConfig = loadServerConfig();
     startupLog('5. serverConfig: ' + (serverConfig ? '有' : '无'));
     let updateCheckBaseUrl = null;
@@ -1228,7 +1292,7 @@ app.whenReady().then(async () => {
               type: 'warning',
               title: '未连接公司服务器',
               message: '当前为本地模式，看不到公司已有目录。',
-              detail: '请确认：\n1) 公司主机已运行 启动服务端-公司主机.bat\n2) 本机与公司在同一局域网，或能访问公网地址\n3) 防火墙已放行 3798 端口\n\n启动日志中有各地址失败原因，路径见窗口标题栏说明。',
+              detail: '请确认：\n1) 公司主机已运行 启动服务端-公司主机.bat\n2) 本机与公司在同一局域网，或能访问公网地址\n3) 防火墙已放行 43123 端口\n\n启动日志中有各地址失败原因，路径见窗口标题栏说明。',
             });
           } catch (e) {}
         }

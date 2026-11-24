@@ -1,9 +1,14 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
+import { mountRegistrationRoutes } from './user-manager/registration';
+import registrationPasswords from './user-manager/registration-password.cjs';
+import { allowsFolder } from './user-manager/asset-scopes.mjs';
+import folderAccess from './user-manager/folder-access.cjs';
+const { safeAssetPath, childFolders, validScopes } = folderAccess;
 import path from 'path';
+import { createHash, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
 import os from 'os';
-import { execSync, spawnSync } from 'child_process';
+import { execFile, execSync, spawn, spawnSync } from 'child_process';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import cors from 'cors';
@@ -16,8 +21,6 @@ import archiver from 'archiver';
 
 const app = express();
 const PORT = 43123;
-const LEGACY_PORT = 3000;
-const SECRET_KEY = 'visualflow_hub_secret_key';
 const JSON_BODY_LIMIT = '50mb';
 const UPLOAD_FILE_LIMIT_BYTES = 3 * 1024 * 1024 * 1024;
 const ASSETS_ROOT = process.env.ASSETS_ROOT || 'D:\\尚品易站图片';
@@ -112,65 +115,177 @@ if (!fs.existsSync(THUMB_CACHE_DIR)) fs.mkdirSync(THUMB_CACHE_DIR, { recursive: 
 if (!fs.existsSync(PSD_THUMB_DIR)) fs.mkdirSync(PSD_THUMB_DIR, { recursive: true });
 
 function getThumbPath(relNorm: string): string {
-  return path.join(THUMB_CACHE_DIR, encodeURIComponent(relNorm) + '.webp');
+  const flat = encodeURIComponent(relNorm) + '.webp';
+  if (flat.length <= 250) return path.join(THUMB_CACHE_DIR, flat);
+  return longThumbPath(relNorm) + '.webp';
 }
-function readCachedThumbIfFresh(relNorm: string, fullPath: string): Buffer | null {
+
+function longThumbPath(relNorm: string) {
+  const segments = relNorm.split('/').map(s => createHash('sha256').update(s).digest('hex').slice(0, 24));
+  return path.join(THUMB_CACHE_DIR, 'nested', ...segments);
+}
+
+async function cacheThumbnail(relNorm: string, buffer: Buffer) {
+  const target = getThumbPath(relNorm);
+  const temp = path.join(path.dirname(target), randomUUID() + '.tmp');
+  try {
+    if (path.dirname(target) !== THUMB_CACHE_DIR) await fs.promises.mkdir(path.dirname(target), { recursive: true });
+    await fs.promises.writeFile(temp, buffer);
+    await fs.promises.rename(temp, target);
+  } catch (err) {
+    await fs.promises.unlink(temp).catch(() => {});
+    console.warn('缩略图缓存写入失败', relNorm, err);
+  }
+}
+async function readCachedThumbIfFresh(relNorm: string, sourceMtime: number): Promise<Buffer | null> {
   const thumbPath = getThumbPath(relNorm);
   try {
-    if (fs.existsSync(thumbPath)) {
-      const stat = fs.statSync(fullPath);
-      const thumbStat = fs.statSync(thumbPath);
-      if (thumbStat.mtimeMs >= stat.mtimeMs) {
-        return fs.readFileSync(thumbPath);
-      }
-    }
+    const cached = await fs.promises.stat(thumbPath);
+    if (cached.mtimeMs >= sourceMtime) return await fs.promises.readFile(thumbPath);
   } catch (_) {}
   return null;
 }
-function trySendCachedThumb(relNorm: string, fullPath: string, res: any): boolean {
-  const cached = readCachedThumbIfFresh(relNorm, fullPath);
-  if (cached) {
-    res.set('Content-Type', 'image/webp');
-    res.send(cached);
-    return true;
-  }
-  return false;
-}
-const HEAVY_THUMB_CONCURRENCY = 2;
+
 const NORMAL_IMAGE_THUMB_MAX_BYTES = 120 * 1024 * 1024;
-let heavyThumbActive = 0;
-const heavyThumbQueue: Array<() => void> = [];
-const heavyThumbInFlight = new Map<string, Promise<Buffer>>();
-
-function runWithHeavyThumbLimit<T>(task: () => Promise<T>): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const run = () => {
-      heavyThumbActive += 1;
-      task().then(resolve, reject).finally(() => {
-        heavyThumbActive -= 1;
-        const next = heavyThumbQueue.shift();
-        if (next) next();
-      });
-    };
-    if (heavyThumbActive < HEAVY_THUMB_CONCURRENCY) run();
-    else heavyThumbQueue.push(run);
-  });
+function thumbnailQueue(limit: number) {
+  const waiting: Array<() => void> = [];
+  let active = 0;
+  return async (produce: () => Promise<Buffer>) => {
+    if (active < limit) active++;
+    else await new Promise<void>(resume => waiting.push(resume));
+    try {
+      return await produce();
+    } finally {
+      const next = waiting.shift();
+      if (next) next();
+      else active--;
+    }
+  };
 }
 
-function getOrCreateHeavyThumb(relNorm: string, producer: () => Promise<Buffer>): Promise<Buffer> {
-  const existing = heavyThumbInFlight.get(relNorm);
+// Keep interactive photo previews responsive while documents and videos render.
+const imageQueue = thumbnailQueue(2);
+const documentQueue = thumbnailQueue(2);
+const thumbnailsInFlight = new Map<string, Promise<Buffer>>();
+function getOrCreateThumb(rel: string, produce: () => Promise<Buffer>, queue = documentQueue) {
+  const existing = thumbnailsInFlight.get(rel);
   if (existing) return existing;
-  const current = runWithHeavyThumbLimit(producer).finally(() => {
-    heavyThumbInFlight.delete(relNorm);
-  });
-  heavyThumbInFlight.set(relNorm, current);
+  const current = queue(produce).finally(() => thumbnailsInFlight.delete(rel));
+  thumbnailsInFlight.set(rel, current);
   return current;
 }
+
 function deleteThumbForPath(relNorm: string): void {
   try {
     const p = getThumbPath(relNorm);
     if (fs.existsSync(p)) safeUnlinkOrRmdir(p, false);
   } catch (_) {}
+}
+
+async function isLikelyAiPlaceholder(buffer: Buffer): Promise<boolean> {
+  try {
+    const stats = await sharp(buffer).stats();
+    const channels = stats.channels || [];
+    const r = channels[0]?.mean ?? 0;
+    const g = channels[1]?.mean ?? 0;
+    const b = channels[2]?.mean ?? 0;
+    const stdev = channels.reduce((sum, ch) => sum + (ch.stdev || 0), 0);
+    return r > 220 && g > 80 && g < 150 && b < 60 && stdev < 8;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function renderPdfLikeFirstPageToWebp(fullPath: string): Promise<Buffer> {
+  const canvasMod = await import('canvas');
+  const C = (canvasMod as any).default ?? canvasMod;
+  const createCanvas = C.createCanvas;
+  if (!createCanvas) throw new Error('canvas.createCanvas not available');
+
+  const prevImage = (global as any).Image;
+  const prevHTMLCanvasElement = (global as any).HTMLCanvasElement;
+  try {
+    if (C.Image) (global as any).Image = C.Image;
+    if (C.Canvas) (global as any).HTMLCanvasElement = C.Canvas;
+    const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    const data = new Uint8Array(fs.readFileSync(fullPath));
+    const doc = await pdfjs.getDocument({ data, disableWorker: true } as any).promise;
+    const page = await doc.getPage(1);
+    const scale = 300 / page.getViewport({ scale: 1 }).width;
+    const viewport = page.getViewport({ scale });
+    const canvas = createCanvas(Math.max(1, Math.round(viewport.width)), Math.max(1, Math.round(viewport.height)));
+    const ctx = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx as any, viewport }).promise;
+    const pngBuf = canvas.toBuffer('image/png');
+    return sharp(pngBuf)
+      .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
+      .webp({ quality: 80 })
+      .toBuffer();
+  } finally {
+    if (prevImage !== undefined) (global as any).Image = prevImage;
+    else delete (global as any).Image;
+    if (prevHTMLCanvasElement !== undefined) (global as any).HTMLCanvasElement = prevHTMLCanvasElement;
+    else delete (global as any).HTMLCanvasElement;
+  }
+}
+
+// 支持生成缩略图的视频扩展名
+const VIDEO_THUMB_EXTS = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.flv', '.wmv', '.mpg', '.mpeg', '.3gp'];
+
+// 解析 ffmpeg 二进制路径：开发与打包两种环境
+// 1) 环境变量 FFMPEG_PATH（最高优先级，便于自定义）
+// 2) ffmpeg-static 提供的二进制（打包后会落在 app.asar.unpacked）
+// 3) 系统 PATH 中的 ffmpeg（兜底）
+let ffmpegPathCache: string | null | undefined = undefined;
+function resolveFfmpegPath(): string | null {
+  if (ffmpegPathCache !== undefined) return ffmpegPathCache;
+  // 1) 环境变量
+  const fromEnv = process.env.FFMPEG_PATH;
+  if (fromEnv && fs.existsSync(fromEnv)) {
+    ffmpegPathCache = fromEnv;
+    return ffmpegPathCache;
+  }
+  // 2) ffmpeg-static
+  try {
+    const mod = require('ffmpeg-static');
+    let p: string | null = (mod && (mod.default || mod)) || null;
+    if (p && typeof p === 'string') {
+      // 打包(asar)环境下二进制会被解到 app.asar.unpacked，修正路径
+      if (!fs.existsSync(p) && p.includes('app.asar')) {
+        const unpacked = p.replace('app.asar', 'app.asar.unpacked');
+        if (fs.existsSync(unpacked)) p = unpacked;
+      }
+      if (p && fs.existsSync(p)) {
+        ffmpegPathCache = p;
+        return ffmpegPathCache;
+      }
+    }
+  } catch (_) {}
+  // 3) 系统 PATH 兜底
+  try {
+    const probe = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['ffmpeg'], { encoding: 'utf8' });
+    if (probe.status === 0 && probe.stdout) {
+      const first = probe.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
+      if (first && fs.existsSync(first)) {
+        ffmpegPathCache = first;
+        return ffmpegPathCache;
+      }
+    }
+  } catch (_) {}
+  ffmpegPathCache = null;
+  return ffmpegPathCache;
+}
+
+// 用 ffmpeg 抽取视频某一帧为 PNG（Buffer）。失败返回 null。
+async function extractVideoFrame(fullPath: string, seekSeconds: number): Promise<Buffer | null> {
+  const ffmpeg = resolveFfmpegPath();
+  if (!ffmpeg) return null;
+  const args = ['-v', 'error', '-ss', String(seekSeconds), '-i', fullPath, '-frames:v', '1',
+    '-vf', 'scale=300:-1:force_original_aspect_ratio=decrease', '-f', 'image2pipe', '-vcodec', 'png', 'pipe:1'];
+  return new Promise(resolve => {
+    execFile(ffmpeg, args, { encoding: 'buffer', timeout: 20000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 },
+      (err, frame) => resolve(!err && frame.length ? frame : null));
+  });
 }
 // 仅当网盘下尚无数据库、且旧数据在项目根时，迁移一次，避免用旧库覆盖新库
 const oldDb = path.join(process.cwd(), 'visualflow.db');
@@ -192,6 +307,9 @@ if (!fs.existsSync(dbDir)) {
 
 // 初始化数据库
 const db = new Database(DB_PATH);
+db.exec('CREATE TABLE IF NOT EXISTS session_signing_key (id INTEGER PRIMARY KEY CHECK (id = 1), secret TEXT NOT NULL)');
+db.prepare('INSERT OR IGNORE INTO session_signing_key VALUES (1, ?)').run(randomBytes(32).toString('hex'));
+const SECRET_KEY = (db.prepare('SELECT secret FROM session_signing_key WHERE id=1').get() as {secret: string}).secret;
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,6 +364,28 @@ db.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS newdev_uploads (
+    file_path TEXT PRIMARY KEY,
+    project_id INTEGER,
+    uploader TEXT,
+    file_stamp TEXT NOT NULL,
+    pending_delete INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS asset_folder_names (
+    parent TEXT NOT NULL,
+    template_name TEXT NOT NULL,
+    actual_name TEXT NOT NULL,
+    PRIMARY KEY(parent, template_name)
+  );
+
+  CREATE TABLE IF NOT EXISTS newdev_step_transfers (
+    project_id INTEGER NOT NULL REFERENCES newdev_projects(id) ON DELETE CASCADE,
+    step_key TEXT NOT NULL,
+    username TEXT NOT NULL,
+    PRIMARY KEY (project_id, step_key)
   );
 
   CREATE TABLE IF NOT EXISTS newdev_step_configs (
@@ -317,6 +457,10 @@ insertUser.run('viewer', bcrypt.hashSync('viewer123', 10), 'Viewer');
 
 // --- 基于本地 JSON 的用户与权限 ---
 type UserPermissions = {
+  canRename?: boolean;
+  canMove?: boolean;
+  folderScopes?: Partial<Record<'canUpload' | 'canDownload' | 'canDelete' | 'canMove' | 'canRename' | 'canCreateFolder' | 'canTag', 'all' | string[]>>;
+  canCreateFolder?: boolean;
   canUpload: boolean;
   canDownload: boolean;
   canDelete: boolean;
@@ -324,10 +468,14 @@ type UserPermissions = {
   canManageBrands: boolean;
   canTag: boolean;
   canManageUsers?: boolean;
+  canApproveRegistrations?: boolean;
   canManageNewDevelopment?: boolean;
+  canSendNotification?: boolean;
 };
 
 type JsonUser = {
+  passwordHash?: string;
+  registrationId?: string;
   username: string;
   password: string;
   role?: string;
@@ -346,10 +494,17 @@ type ProductFolderTemplateItem = {
   children?: ProductFolderTemplateItem[];
   subFolders?: string[];
 };
+type TemplateFolderOperation =
+  | { type: 'rename'; fromSegments: string[]; toName: string }
+  | { type: 'delete'; fromSegments: string[] }
+  | { type: 'move'; fromSegments: string[]; toSegments: string[] };
+type ProductFolderSyncOptions = {
+  deleteStrategy?: 'delete' | 'move' | 'keep';
+  moveTargetSegments?: string[];
+};
 
 const DEFAULT_PRODUCT_FOLDER_TEMPLATE: ProductFolderTemplateItem[] = [
-  { name: '产品图片', children: [{ name: '原图', children: [] }, { name: '主图', children: [] }, { name: '详情页', children: [] }, { name: '白底图', children: [] }, { name: 'PSD源文件', children: [] }] },
-  { name: 'sku', children: [] },
+  { name: '产品图片', children: [{ name: '原图', children: [] }, { name: '主图', children: [] }, { name: '详情页', children: [] }, { name: '白底图', children: [] }, { name: 'PSD源文件', children: [] }, { name: 'SKU', children: [] }] },
   { name: '包装', children: [{ name: '定稿源文件', children: [] }] },
   { name: '视频', children: [] },
   { name: '检测报告', children: [] },
@@ -459,6 +614,7 @@ function buildPermissions(user: JsonUser | null | undefined): UserPermissions {
           canTag: true,
           canManageUsers: true,
           canManageNewDevelopment: true,
+          canSendNotification: true,
         }
       : baseRole === 'editor'
       ? {
@@ -484,6 +640,10 @@ function buildPermissions(user: JsonUser | null | undefined): UserPermissions {
         };
   return {
     ...base,
+    canRename: user?.permissions?.canUpload ?? base.canUpload,
+    canMove: user?.permissions?.canUpload ?? base.canUpload,
+    canCreateFolder: baseRole === 'admin',
+    canApproveRegistrations: baseRole === 'admin',
     ...(isRenXiaoyu ? { canManageUsers: true, canManageNewDevelopment: true } : {}),
     ...(user?.permissions || {}),
   };
@@ -502,6 +662,10 @@ function getReqPermissions(req: any): UserPermissions {
   if (u && u.permissions) return u.permissions;
   const role = (u?.role || 'Viewer').toLowerCase();
   return buildPermissions({ username: username || '', password: '', role });
+}
+
+function allowedAsset(perms: UserPermissions, action: string, rel: string, contentsOnly = false, productImages = false) {
+  return allowsFolder(perms, action, rel, contentsOnly) && safeAssetPath(ASSETS_ROOT, rel, productImages);
 }
 
 ensureUsersJsonExists();
@@ -561,8 +725,9 @@ function opsUsernames(): string[] {
     .filter(Boolean);
 }
 
-function currentWeekKey() {
-  const now = new Date();
+function weekKeyForDate(value: Date | string | number = new Date()) {
+  const now = value instanceof Date ? new Date(value) : new Date(value);
+  if (Number.isNaN(now.getTime())) return '';
   const day = now.getDay() || 7;
   const monday = new Date(now);
   monday.setHours(0, 0, 0, 0);
@@ -570,27 +735,26 @@ function currentWeekKey() {
   return monday.toISOString().slice(0, 10);
 }
 
+function currentWeekKey() {
+  return weekKeyForDate();
+}
+
 function ensureOpsRotationRow() {
   const existing = db.prepare('SELECT * FROM newdev_ops_rotation WHERE id = 1').get() as any;
   if (existing) return existing;
   const usernames = opsUsernames();
   db.prepare('INSERT INTO newdev_ops_rotation (id, usernames, current_index, week_key) VALUES (1, ?, 0, ?)')
-    .run(JSON.stringify(usernames), currentWeekKey());
+    .run(JSON.stringify(usernames), '');
   return db.prepare('SELECT * FROM newdev_ops_rotation WHERE id = 1').get() as any;
 }
 
 function getOpsRotation() {
-  let row = ensureOpsRotationRow();
+  const row = ensureOpsRotationRow();
   let usernames = parseJsonArray(row.usernames).filter(name => opsUsernames().includes(name));
   if (!usernames.length) usernames = opsUsernames();
   let currentIndex = Math.max(0, Number(row.current_index || 0));
   const weekKey = currentWeekKey();
-  if (row.week_key !== weekKey && usernames.length) {
-    currentIndex = (currentIndex + 1) % usernames.length;
-    db.prepare('UPDATE newdev_ops_rotation SET usernames = ?, current_index = ?, week_key = ? WHERE id = 1')
-      .run(JSON.stringify(usernames), currentIndex, weekKey);
-    row = db.prepare('SELECT * FROM newdev_ops_rotation WHERE id = 1').get() as any;
-  } else if (JSON.stringify(usernames) !== JSON.stringify(parseJsonArray(row.usernames))) {
+  if (JSON.stringify(usernames) !== JSON.stringify(parseJsonArray(row.usernames))) {
     db.prepare('UPDATE newdev_ops_rotation SET usernames = ?, current_index = ? WHERE id = 1')
       .run(JSON.stringify(usernames), usernames.length ? currentIndex % usernames.length : 0);
   }
@@ -599,7 +763,50 @@ function getOpsRotation() {
     currentIndex: usernames.length ? currentIndex % usernames.length : 0,
     currentUsername: usernames.length ? usernames[currentIndex % usernames.length] : '',
     weekKey,
+    lastNewProjectWeekKey: String(row.week_key || ''),
   };
+}
+
+function latestNewDevProjectWeekKey(): string {
+  const row = db.prepare(`
+    SELECT created_at FROM newdev_projects
+    WHERE created_at IS NOT NULL AND TRIM(created_at) <> ''
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get() as any;
+  return row?.created_at ? weekKeyForDate(String(row.created_at)) : '';
+}
+
+function lastOpsRotationProjectWeekKey(): string {
+  const configured = String(getNewDevSetting('opsRotationLastProjectWeekKey', '') || '').trim();
+  if (configured) return configured;
+  const row = ensureOpsRotationRow();
+  const stored = String(row.week_key || '').trim();
+  if (stored) return stored;
+  return latestNewDevProjectWeekKey();
+}
+
+function resolveOpsOwnerForNewProject(): string {
+  let row = ensureOpsRotationRow();
+  let usernames = parseJsonArray(row.usernames).filter(name => opsUsernames().includes(name));
+  if (!usernames.length) usernames = opsUsernames();
+  if (!usernames.length) return '';
+
+  let currentIndex = Math.max(0, Number(row.current_index || 0)) % usernames.length;
+  const weekKey = currentWeekKey();
+  const lastProjectWeekKey = lastOpsRotationProjectWeekKey();
+
+  if (lastProjectWeekKey && lastProjectWeekKey !== weekKey) {
+    currentIndex = (currentIndex + 1) % usernames.length;
+  }
+
+  db.prepare('UPDATE newdev_ops_rotation SET usernames = ?, current_index = ?, week_key = ? WHERE id = 1')
+    .run(JSON.stringify(usernames), currentIndex, weekKey);
+  setNewDevSetting('opsRotationLastProjectWeekKey', weekKey);
+
+  row = db.prepare('SELECT * FROM newdev_ops_rotation WHERE id = 1').get() as any;
+  usernames = parseJsonArray(row.usernames).filter(name => opsUsernames().includes(name));
+  return usernames.length ? usernames[Math.max(0, Number(row.current_index || 0)) % usernames.length] : '';
 }
 
 function getNewDevSetting<T = any>(key: string, fallback: T): T {
@@ -674,8 +881,49 @@ function getStepConfig(stepKey: string) {
   return getStepConfigs().find(s => s.stepKey === stepKey) || getStepConfigs()[0];
 }
 
-function resolveStepAssignees(stepKey: string): string[] {
+function projectOpsOwnerFromData(data: any): string {
+  const ops = new Set(opsUsernames());
+  const direct = String(data?.opsOwnerUsername || data?.assignedOpsUsername || '').trim();
+  if (direct && ops.has(direct)) return direct;
+  const candidateFields = [
+    data?.sellingPointAuthors,
+    data?.sellingPointEditors,
+    data?.testItemAuthors,
+    data?.testItemEditors,
+  ];
+  for (const field of candidateFields) {
+    if (!field || typeof field !== 'object' || Array.isArray(field)) continue;
+    for (const value of Object.values(field)) {
+      const username = String(value || '').trim();
+      if (username && ops.has(username)) return username;
+    }
+  }
+  const transferredTo = String(data?.transferredTo || '').trim();
+  return transferredTo && ops.has(transferredTo) ? transferredTo : '';
+}
+
+function projectOpsOwner(rowOrData: any): string {
+  const data = rowOrData?.data_json !== undefined ? parseProjectData(rowOrData) : rowOrData;
+  return projectOpsOwnerFromData(data);
+}
+
+function withProjectOpsOwner(data: any, username?: string): any {
+  const current = projectOpsOwnerFromData(data);
+  if (current) return { ...data, opsOwnerUsername: current };
+  const fallback = String(username || getOpsRotation().currentUsername || '').trim();
+  return fallback && opsUsernames().includes(fallback) ? { ...data, opsOwnerUsername: fallback } : data;
+}
+
+function resolveStepAssignees(stepKey: string, rowOrData?: any): string[] {
+  if (stepKey === 'done') return [];
+  if (rowOrData?.id) {
+    const transfer = db.prepare('SELECT username FROM newdev_step_transfers WHERE project_id = ? AND step_key = ?')
+      .get(rowOrData.id, stepKey) as { username: string } | undefined;
+    if (transfer) return [transfer.username];
+  }
   if (stepKey === 'selling' || stepKey === 'opsSynthesis' || stepKey === 'opsReview') {
+    const owner = rowOrData ? projectOpsOwner(rowOrData) : '';
+    if (owner) return [owner];
     const current = getOpsRotation().currentUsername;
     return current ? [current] : opsUsernames();
   }
@@ -684,18 +932,18 @@ function resolveStepAssignees(stepKey: string): string[] {
   return [...new Set([...cfg.assigneeUsernames, ...usernamesByPositions(cfg.assigneePositions)])];
 }
 
-function canOperateNewDevStep(req: any, stepKey: string): boolean {
+function canOperateNewDevStep(req: any, stepKey: string, rowOrData?: any): boolean {
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   const perms = getReqPermissions(req);
   if (perms.canManageNewDevelopment || canManageUsers(req)) return true;
-  return !!username && resolveStepAssignees(stepKey).includes(username);
+  return !!username && resolveStepAssignees(stepKey, rowOrData).includes(username);
 }
 
-function canSupplementNewDevStep(req: any, stepKey: string): boolean {
-  if (canOperateNewDevStep(req, stepKey)) return true;
+function canSupplementNewDevStep(req: any, stepKey: string, rowOrData?: any): boolean {
+  if (canOperateNewDevStep(req, stepKey, rowOrData)) return true;
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   if (!username) return false;
-  if ((stepKey === 'selling' || stepKey === 'opsSynthesis' || stepKey === 'opsReview') && opsUsernames().includes(username)) return true;
+  if ((stepKey === 'selling' || stepKey === 'opsSynthesis') && opsUsernames().includes(username)) return true;
   if (stepKey === 'leaderReview') {
     const currentUser = loadJsonUsers().find(u => String(u.username || '').trim() === username);
     return isLeaderReviewUser({ username, role: currentUser?.role || (req.user as JwtUser | undefined)?.role || '' });
@@ -703,7 +951,7 @@ function canSupplementNewDevStep(req: any, stepKey: string): boolean {
   return false;
 }
 
-function canReviewPurchaseSellingPoint(req: any): boolean {
+function canReviewPurchaseSellingPoint(req: any, rowOrData?: any): boolean {
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   const perms = getReqPermissions(req);
   return !!perms.canManageNewDevelopment || canManageUsers(req) || (!!username && opsUsernames().includes(username));
@@ -742,6 +990,7 @@ function calculateDueAt(stepKey: string) {
 }
 
 function projectRowToJson(row: any) {
+  const data = row.data_json ? JSON.parse(row.data_json) : {};
   return {
     id: Number(row.id),
     title: row.title,
@@ -751,12 +1000,12 @@ function projectRowToJson(row: any) {
     spec: row.spec || '',
     currentStepKey: row.current_step_key,
     dueAt: row.due_at,
-    data: row.data_json ? JSON.parse(row.data_json) : {},
+    data,
     createdBy: row.created_by || '',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     completedAt: row.completed_at,
-    assignees: resolveStepAssignees(row.current_step_key),
+    assignees: row.completed_at ? [] : resolveStepAssignees(row.current_step_key, row),
   };
 }
 
@@ -856,6 +1105,105 @@ function compactStoredNewDevProjects() {
 }
 
 compactStoredNewDevProjects();
+
+const uploadFieldsByStep: Record<string, string[]> = {
+  initiation: ['existingTestReports'],
+  selling: ['testItemImages'],
+  opsSynthesis: ['sellingPointImages'],
+  packaging: ['packagingSourceFiles', 'packagingPreviewImages', 'whiteBackgroundImages'],
+  mainDetail: ['mainDetailSourceFiles', 'skuImages', 'mainImages', 'detailImages'],
+  leaderReview: ['leaderRejectImages', 'leaderRejectIssueImages'],
+  opsReview: ['opsRejectImages', 'opsRejectIssueImages'],
+};
+function projectUploadPaths(data: any, fields = Object.values(uploadFieldsByStep).flat()): Set<string> {
+  const lists = fields.flatMap(key => {
+    const value = data?.[key];
+    return Array.isArray(value) ? [value] : Object.values(value || {});
+  });
+  return new Set(lists.flatMap(list => Array.isArray(list)
+    ? list.map(file => file?.path).filter(p => typeof p === 'string').map(p => p.replace(/\\/g, '/'))
+    : []));
+}
+
+function uploadStamp(relative: string) {
+  if (!relative.split('/').every(validAssetSegment)) return null;
+  const full = path.join(ASSETS_ROOT, relative);
+  try {
+    if (!visibleAssetPath(full)) return null;
+    const stat = fs.lstatSync(full, { bigint: true });
+    return stat.isFile() ? [stat.dev, stat.ino, stat.size, stat.mtimeNs].join(':') : null;
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+// Import only active attachments once. Subsequent project edits cannot grant ownership of library files.
+if (!getNewDevSetting('uploadOwnershipImported', false)) {
+  db.transaction(() => {
+    const insert = db.prepare('INSERT OR IGNORE INTO newdev_uploads(file_path, project_id, file_stamp) VALUES (?, ?, ?)');
+    for (const row of db.prepare('SELECT id, title, data_json FROM newdev_projects').all() as any[]) {
+      const data = parseProjectData(row);
+      const prefix = String(data.productFolderPath || `新品开发/${safeTemplateName(row.title)}`) + '/';
+      for (const rel of projectUploadPaths(data)) {
+        if (!rel.startsWith(prefix)) continue;
+        const stamp = uploadStamp(rel);
+        if (stamp) insert.run(rel, row.id, stamp);
+      }
+    }
+    setNewDevSetting('uploadOwnershipImported', true);
+  })();
+}
+
+function cleanPendingProjectUploads() {
+  const pending = db.prepare('SELECT file_path, file_stamp FROM newdev_uploads WHERE pending_delete = 1').all() as any[];
+  if (!pending.length) return;
+  const active = new Set<string>();
+  for (const row of db.prepare('SELECT data_json FROM newdev_projects').all()) {
+    for (const rel of projectUploadPaths(parseProjectData(row))) active.add(rel.toLowerCase());
+  }
+  for (const entry of pending) {
+    const rel = entry.file_path;
+    if (active.has(rel.toLowerCase())) continue;
+    try {
+      if (uploadStamp(rel) === entry.file_stamp) {
+        safeUnlinkSync(path.join(ASSETS_ROOT, rel));
+        db.prepare('DELETE FROM file_tags WHERE file_path = ?').run(rel);
+        deleteThumbForPath(rel);
+        const legacyThumb = path.join(PSD_THUMB_DIR, encodeURIComponent(rel) + '.webp');
+        if (fs.existsSync(legacyThumb)) safeUnlinkSync(legacyThumb);
+      }
+      db.prepare('DELETE FROM newdev_uploads WHERE file_path = ?').run(rel);
+    } catch (err) {
+      console.warn('流程附件清理失败，将重试', rel, err);
+    }
+  }
+}
+setInterval(cleanPendingProjectUploads, 30000).unref();
+
+function conflictingAttachmentEdit(req: any, row: any, nextData: any) {
+  const oldData = parseProjectData(row);
+  const before = projectUploadPaths(oldData);
+  const after = projectUploadPaths(nextData);
+  const removed = [...before].filter(rel => !after.has(rel));
+  if (removed.length) {
+    const editable = projectUploadPaths(oldData, uploadFieldsByStep[row.current_step_key] || []);
+    if (removed.some(rel => !editable.has(rel))) return true;
+  }
+  const stale = req.body.updatedAt && req.body.updatedAt !== row.updated_at;
+  return stale && (removed.length || before.size !== after.size);
+}
+
+function saveProjectWithUploads(row: any, nextData: any, save: () => void) {
+  const retained = projectUploadPaths(nextData);
+  const removed = [...projectUploadPaths(parseProjectData(row))].filter(rel => !retained.has(rel));
+  db.transaction(() => {
+    save();
+    const queue = db.prepare('UPDATE newdev_uploads SET pending_delete = 1 WHERE file_path = ? AND project_id = ?');
+    for (const rel of removed) queue.run(rel, row.id);
+  })();
+  if (removed.length) cleanPendingProjectUploads();
+}
 
 function attachSellingPointAuthors(oldData: any, nextData: any, username: string) {
   const oldAuthors = oldData?.sellingPointAuthors && typeof oldData.sellingPointAuthors === 'object' ? oldData.sellingPointAuthors : {};
@@ -1067,26 +1415,38 @@ function ensureProductFromNewDev(body: any) {
   const sku = spec || barcode || `NEWDEV-${Date.now()}`;
   const brand = brandId ? db.prepare('SELECT id, name FROM brands WHERE id = ?').get(brandId) as any : null;
   if (!brand) throw new Error('请选择有效品牌');
-  const existing = db.prepare('SELECT * FROM products WHERE sku = ?').get(sku) as any;
+  const existing = db.prepare('SELECT p.*, b.name AS brand_name FROM products p LEFT JOIN brands b ON b.id = p.brand_id WHERE p.sku = ?').get(sku) as any;
   let productId = existing?.id ? Number(existing.id) : 0;
-  if (existing) {
-    db.prepare('UPDATE products SET official_name = ?, names = ?, brand_id = ? WHERE id = ?')
-      .run(title, alias, brandId, productId);
-  } else {
-    const result = db.prepare('INSERT INTO products (sku, official_name, names, brand_id, image_path) VALUES (?, ?, ?, ?, ?)')
-      .run(sku, title, alias, brandId, '');
-    productId = Number(result.lastInsertRowid);
+  const productRoot = productRootForRow({ brand_name: brand.name, official_name: title, sku });
+  const undo: Array<() => void> = [];
+  try {
+    db.transaction(() => {
+      if (existing) {
+        const previousFolder = relAssetPath(productRootForRow(existing));
+        relocateProductFolder(existing, { brand_name: brand.name, official_name: title, sku }, undo);
+        if (Array.isArray(body.data?.existingTestReports)) {
+          body.data.existingTestReports = body.data.existingTestReports.map((file: any) =>
+            typeof file?.path === 'string' ? { ...file, path: replaceAssetPrefix(file.path, previousFolder, relAssetPath(productRoot)) } : file);
+        }
+        db.prepare('UPDATE products SET official_name = ?, names = ?, brand_id = ? WHERE id = ?').run(title, alias, brandId, productId);
+      } else {
+        const result = db.prepare('INSERT INTO products (sku, official_name, names, brand_id, image_path) VALUES (?, ?, ?, ?, ?)')
+          .run(sku, title, alias, brandId, '');
+        productId = Number(result.lastInsertRowid);
+      }
+      createProductFolders(productRoot, loadProductFolderTemplate());
+    })();
+  } catch (err) {
+    for (const rollback of undo.reverse()) rollback();
+    throw err;
   }
-  createProductFolders(brand.name, sku, title, [], loadProductFolderTemplate());
-  const brandFolder = brand.name.replace(/[/\\:*?"<>|]/g, '_');
-  const productFolder = (title || sku).replace(/[/\\:*?"<>|]/g, '_');
   return {
     productId,
     sku,
     alias,
     brandId,
     brandName: brand?.name || '',
-    productFolderPath: `${brandFolder}/${productFolder}`,
+    productFolderPath: relAssetPath(productRoot),
   };
 }
 
@@ -1177,7 +1537,8 @@ function normalizeNotificationRow(row: any) {
 }
 
 function createStepNotification(projectId: number, title: string, stepKey: string) {
-  const recipients = resolveStepAssignees(stepKey);
+  const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(projectId) as any;
+  const recipients = resolveStepAssignees(stepKey, row);
   if (!recipients.length) return;
   const label = getStepConfig(stepKey)?.label || stepKey;
   addNotification(recipients, `新品流程到你处理：${title}`, `项目进入「${label}」步骤，请及时处理。`, projectId, `step:${stepKey}`);
@@ -1233,13 +1594,40 @@ function normalizeFolderTemplate(items: any[]): ProductFolderTemplateItem[] {
   }));
 }
 
+function validateFolderTemplateNames(items: ProductFolderTemplateItem[], parents: string[] = []): string | null {
+  const siblings = new Set<string>();
+  for (const item of items) {
+    const name = String(item?.name || '').trim();
+    const currentPath = [...parents, name || '未命名'].join('/');
+    if (!name) {
+      return `文件夹名称不能为空：${parents.join('/') || '根目录'}`;
+    }
+    if (siblings.has(name.toLowerCase())) return `同级目录名称重复：${currentPath}`;
+    siblings.add(name.toLowerCase());
+    if (!validAssetSegment(name)) {
+      return `文件夹名称包含非法字符：${currentPath}`;
+    }
+    if (Array.isArray(item.children)) {
+      const childError = validateFolderTemplateNames(item.children, [...parents, name]);
+      if (childError) return childError;
+    }
+  }
+  return null;
+}
+
 function loadProductFolderTemplate(): ProductFolderTemplateItem[] {
   try {
     if (fs.existsSync(PRODUCT_FOLDERS_PATH) && fs.statSync(PRODUCT_FOLDERS_PATH).isFile()) {
       const raw = fs.readFileSync(PRODUCT_FOLDERS_PATH, 'utf-8');
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        return normalizeFolderTemplate(parsed);
+        const normalized = normalizeFolderTemplate(parsed);
+        const validationError = validateFolderTemplateNames(normalized);
+        if (validationError) {
+          console.warn(`product_folders.json 无效，已使用默认模板：${validationError}`);
+          return DEFAULT_PRODUCT_FOLDER_TEMPLATE;
+        }
+        return normalized;
       }
     }
   } catch (e) {
@@ -1253,46 +1641,302 @@ function saveProductFolderTemplate(folders: ProductFolderTemplateItem[]) {
     fs.writeFileSync(PRODUCT_FOLDERS_PATH, JSON.stringify(folders, null, 2), 'utf-8');
   } catch (e) {
     console.error('写入 product_folders.json 失败:', e);
+    throw e;
   }
 }
 
-function syncAllExistingProductFolders(folderTemplate: ProductFolderTemplateItem[]) {
-  try {
-    const products = db.prepare(`
-      SELECT p.*, b.name as brand_name
-      FROM products p
-      LEFT JOIN brands b ON p.brand_id = b.id
-    `).all() as any[];
-    const variants = db.prepare('SELECT * FROM product_variants').all() as any[];
+function safeTemplateName(value: string) { return String(value || '').replace(/[/\\:*?"<>|]/g, '_').trim() || '未命名'; }
+const safeTemplateSegments = (segments: any): string[] =>
+  Array.isArray(segments) ? segments.map(segment => safeTemplateName(String(segment || ''))).filter(Boolean) : [];
+const relAssetPath = (fullPath: string) => path.relative(ASSETS_ROOT, fullPath).replace(/\\/g, '/');
 
-    const variantMap = new Map<number, any[]>();
-    for (const v of variants) {
-      const pid = Number(v.product_id);
-      const arr = variantMap.get(pid);
-      if (arr) arr.push(v);
-      else variantMap.set(pid, [v]);
-    }
+function productRootForRow(product: any) {
+  const brandDir = product.brand_name ? safeTemplateName(product.brand_name) : '未分类品牌';
+  const productFolderName = safeTemplateName(((product.official_name || '').trim() || product.sku || '').trim());
+  return path.join(ASSETS_ROOT, generatedFolderPath([brandDir, productFolderName]));
+}
 
-    for (const p of products) {
-      const pid = Number(p.id);
-      const vlist = variantMap.get(pid) || [];
-      // 复用 createProductFolders：内部只会 mkdir 不会删；遇到同名已存在则跳过
-      createProductFolders(
-        p.brand_name,
-        p.sku,
-        p.official_name || '',
-        vlist,
-        Array.isArray(folderTemplate) && folderTemplate.length ? folderTemplate : loadProductFolderTemplate()
-      );
-    }
-  } catch (e) {
-    console.error('同步产品目录结构失败:', e);
+function relocateProductFolder(previous: any, next: any, undo: Array<() => void>) {
+  const source = productRootForRow(previous);
+  const destination = productRootForRow(next);
+  if (source === destination) return;
+  const other = getAllProductsWithVariants().some(p => p.id !== previous.id &&
+    [source.toLowerCase(), destination.toLowerCase()].includes(productRootForRow(p).toLowerCase()));
+  if (other) throw new Error('目录已关联其他产品，请使用独立的产品目录名称');
+  if (!fs.existsSync(source)) {
+    if (fs.existsSync(destination)) throw new Error('目标产品目录已存在');
+    return;
   }
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  renameAsset(source, destination, false);
+  undo.push(() => fs.renameSync(destination, source));
+}
+
+function getAllProductsWithVariants() {
+  const products = db.prepare(`
+    SELECT p.*, b.name as brand_name
+    FROM products p
+    LEFT JOIN brands b ON p.brand_id = b.id
+  `).all() as any[];
+  const variants = db.prepare('SELECT * FROM product_variants').all() as any[];
+  const variantMap = new Map<number, any[]>();
+  for (const v of variants) {
+    const pid = Number(v.product_id);
+    const arr = variantMap.get(pid);
+    if (arr) arr.push(v);
+    else variantMap.set(pid, [v]);
+  }
+  return products.map(product => ({ ...product, variants: variantMap.get(Number(product.id)) || [] }));
+}
+
+// Generated folders follow manual renames. Paths chosen directly in the library stay literal.
+function generatedFolderPath(segments: string[], parent = '') {
+  const lookup = db.prepare('SELECT actual_name FROM asset_folder_names WHERE parent = ? AND template_name = ?');
+  for (const segment of segments) {
+    if (!validAssetSegment(segment)) throw new Error('目录名称无效');
+    const binding = lookup.get(parent, segment) as { actual_name: string } | undefined;
+    parent = path.posix.join(parent, binding?.actual_name || segment);
+  }
+  return parent;
+}
+
+function replaceAssetPrefix(value: string, from: string, to: string) {
+  return value === from || value.startsWith(from + '/') ? to + value.slice(from.length) : value;
+}
+
+function updateTagPathPrefix(from: string, to: string) {
+  // substr compares a literal prefix, including underscores and percent signs in real filenames.
+  for (const [table, column] of [['file_tags', 'file_path'], ['newdev_uploads', 'file_path'],
+    ['products', 'image_path'], ['asset_folder_names', 'parent']]) {
+    db.prepare(`UPDATE ${table} SET ${column} = ? || substr(${column}, length(?) + 1)
+      WHERE ${column} = ? OR substr(${column}, 1, length(?) + 1) = ? || '/'`).run(to, from, from, from, from);
+  }
+  const rewrite = (obj: any) => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const [key, value] of Object.entries(obj)) {
+      if ((key === 'path' || key === 'productFolderPath') && typeof value === 'string') {
+        const next = replaceAssetPrefix(value.replace(/\\/g, '/'), from, to);
+        if (next !== value.replace(/\\/g, '/')) {
+          obj[key] = next;
+          if (key === 'path' && obj.name) obj.name = path.posix.basename(next);
+        }
+      } else if (key !== 'history') rewrite(value);
+    }
+  };
+  for (const row of db.prepare('SELECT id, title, data_json FROM newdev_projects').all() as any[]) {
+    const data = parseProjectData(row);
+    const before = JSON.stringify(data);
+    if (!data.productFolderPath) {
+      const legacy = `新品开发/${safeTemplateName(row.title)}`;
+      const moved = replaceAssetPrefix(legacy, from, to);
+      if (moved !== legacy) data.productFolderPath = moved;
+    }
+    rewrite(data);
+    const after = JSON.stringify(data);
+    if (before !== after) db.prepare('UPDATE newdev_projects SET data_json = ?, updated_at = ? WHERE id = ?').run(after, nowIso(), row.id);
+  }
+  const prefix = 'manual-product-update:';
+  for (const row of db.prepare("SELECT id, kind FROM notifications WHERE kind LIKE 'manual-product-update:%'").all() as any[]) {
+    const [encoded, ...suffix] = row.kind.slice(prefix.length).split(':');
+    let original: string;
+    try { original = decodeURIComponent(encoded); } catch { continue; }
+    const next = replaceAssetPrefix(original, from, to);
+    if (next !== original) db.prepare('UPDATE notifications SET kind = ? WHERE id = ?')
+      .run([prefix + encodeURIComponent(next), ...suffix].join(':'), row.id);
+  }
+  try { deleteThumbsUnderPrefix(from); } catch (_) {}
+}
+
+function renameAsset(src: string, dest: string, rememberName: boolean) {
+  if (src === dest) return;
+  const caseOnly = process.platform === 'win32' && src.toLowerCase() === dest.toLowerCase();
+  if (fs.existsSync(dest) && !caseOnly) throw new Error('目标目录已存在同名项目');
+  if (!visibleAssetPath(src) || !visibleAssetPath(dest) || fs.lstatSync(src).isSymbolicLink()) throw new Error('目录不可用');
+  const isDir = fs.statSync(src).isDirectory();
+  fs.renameSync(src, dest);
+  try {
+    db.transaction(() => {
+      const from = relAssetPath(src);
+      const to = relAssetPath(dest);
+      updateTagPathPrefix(from, to);
+      if (isDir && rememberName) {
+        const parent = relAssetPath(path.dirname(src));
+        const oldName = path.basename(src);
+        const newName = path.basename(dest);
+        db.prepare('UPDATE asset_folder_names SET actual_name = ? WHERE parent = ? AND actual_name = ?').run(newName, parent, oldName);
+        db.prepare('INSERT OR IGNORE INTO asset_folder_names VALUES (?, ?, ?)').run(parent, oldName, newName);
+        db.prepare('DELETE FROM asset_folder_names WHERE template_name = actual_name AND parent = ?').run(parent);
+      }
+    })();
+  } catch (err) {
+    fs.renameSync(dest, src);
+    throw err;
+  }
+}
+
+function deleteTagPathPrefix(rel: string) {
+  db.prepare("DELETE FROM file_tags WHERE file_path = ? OR substr(file_path, 1, length(?) + 1) = ? || '/'").run(rel, rel, rel);
+  try { deleteThumbsUnderPrefix(rel); } catch (_) {}
+}
+
+function uniqueFolderDest(destFull: string) {
+  if (!fs.existsSync(destFull)) return destFull;
+  const parent = path.dirname(destFull);
+  const base = path.basename(destFull);
+  let index = 1;
+  let candidate = path.join(parent, `${base}(${index})`);
+  while (fs.existsSync(candidate)) {
+    index++;
+    candidate = path.join(parent, `${base}(${index})`);
+  }
+  return candidate;
+}
+
+function applyTemplateOperation(productRoot: string, op: TemplateFolderOperation, options: ProductFolderSyncOptions, undo?: Array<() => void>) {
+  const fromSegments = safeTemplateSegments(op.fromSegments);
+  if (!fromSegments.length) return;
+  const srcFull = path.join(ASSETS_ROOT, generatedFolderPath(fromSegments, relAssetPath(productRoot)));
+  if (!fs.existsSync(srcFull) || !fs.statSync(srcFull).isDirectory()) return;
+
+  if (op.type === 'rename') {
+    const destFull = path.join(path.dirname(srcFull), safeTemplateName(op.toName));
+    if (srcFull === destFull) return;
+    renameAsset(srcFull, destFull, true);
+    undo?.push(() => fs.renameSync(destFull, srcFull));
+    return;
+  }
+
+  if (op.type === 'move') {
+    const toSegments = safeTemplateSegments(op.toSegments);
+    const targetParent = path.join(productRoot, ...toSegments);
+    if (targetParent === srcFull || targetParent.startsWith(srcFull + path.sep)) return;
+    fs.mkdirSync(targetParent, { recursive: true });
+    const destFull = uniqueFolderDest(path.join(targetParent, path.basename(srcFull)));
+    fs.renameSync(srcFull, destFull);
+    updateTagPathPrefix(relAssetPath(srcFull), relAssetPath(destFull));
+    return;
+  }
+
+  if (op.type === 'delete') {
+    const entries = fs.readdirSync(srcFull);
+    if (!entries.length) {
+      safeUnlinkOrRmdir(srcFull, true);
+      return;
+    }
+    const strategy = options.deleteStrategy || 'keep';
+    if (strategy === 'delete') {
+      deleteTagPathPrefix(relAssetPath(srcFull));
+      safeRmSyncRecursive(srcFull);
+      return;
+    }
+    if (strategy === 'move') {
+      const target = path.join(productRoot, ...safeTemplateSegments(options.moveTargetSegments));
+      if (target === srcFull || target.startsWith(srcFull + path.sep)) return;
+      fs.mkdirSync(target, { recursive: true });
+      for (const name of entries) {
+        const childFull = path.join(srcFull, name);
+        const destFull = uniqueFolderDest(path.join(target, name));
+        fs.renameSync(childFull, destFull);
+        updateTagPathPrefix(relAssetPath(childFull), relAssetPath(destFull));
+      }
+      safeUnlinkOrRmdir(srcFull, true);
+    }
+  }
+}
+
+function previewProductFolderSync(operations: TemplateFolderOperation[]) {
+  const products = getAllProductsWithVariants();
+  const deleteOps = operations.filter(op => op.type === 'delete');
+  const nonEmptyDeletes: { productId: number; productName: string; path: string; itemCount: number }[] = [];
+  for (const product of products) {
+    const productRoot = productRootForRow(product);
+    for (const op of deleteOps) {
+      const srcFull = path.join(productRoot, ...safeTemplateSegments(op.fromSegments));
+      if (!fs.existsSync(srcFull) || !fs.statSync(srcFull).isDirectory()) continue;
+      const entries = fs.readdirSync(srcFull);
+      if (entries.length) {
+        nonEmptyDeletes.push({
+          productId: Number(product.id),
+          productName: product.official_name || product.sku || '',
+          path: relAssetPath(srcFull),
+          itemCount: entries.length,
+        });
+      }
+    }
+  }
+  return { nonEmptyDeletes, nonEmptyDeleteCount: nonEmptyDeletes.length };
+}
+
+function syncAllExistingProductFolders(folderTemplate: ProductFolderTemplateItem[], operations: TemplateFolderOperation[] = [], options: ProductFolderSyncOptions = {}) {
+  const validationError = validateFolderTemplateNames(folderTemplate);
+  if (validationError) throw new Error(validationError);
+  const failures: string[] = [];
+  for (const product of getAllProductsWithVariants()) {
+    try {
+      const root = productRootForRow(product);
+      for (const op of operations) applyTemplateOperation(root, op, options);
+      createProductFolders(root, folderTemplate);
+    } catch (err: any) {
+      failures.push(`${product.official_name || product.sku}：${err.message || err}`);
+    }
+  }
+  if (failures.length) throw new Error(failures.join('；'));
+}
+
+function runProductFolderSyncJob(jobPath: string) {
+  const logPath = path.join(APP_DATA_DIR, 'product-folder-sync.log');
+  const log = (message: string) => {
+    try {
+      fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${message}\n`, 'utf-8');
+    } catch (_) {}
+  };
+  try {
+    const job = JSON.parse(fs.readFileSync(jobPath, 'utf-8')) as {
+      folders?: ProductFolderTemplateItem[];
+      operations?: TemplateFolderOperation[];
+      syncOptions?: ProductFolderSyncOptions;
+    };
+    log(`start ${jobPath}`);
+    syncAllExistingProductFolders(
+      Array.isArray(job.folders) ? job.folders : loadProductFolderTemplate(),
+      Array.isArray(job.operations) ? job.operations : [],
+      job.syncOptions && typeof job.syncOptions === 'object' ? job.syncOptions : {}
+    );
+    log(`done ${jobPath}`);
+    try { fs.unlinkSync(jobPath); } catch (_) {}
+  } catch (err: any) {
+    log(`failed ${jobPath}: ${err?.stack || err?.message || err}`);
+  }
+}
+
+function queueProductFolderSyncJob(folders: ProductFolderTemplateItem[], operations: TemplateFolderOperation[], syncOptions: ProductFolderSyncOptions) {
+  const jobDir = path.join(APP_DATA_DIR, 'sync_jobs');
+  fs.mkdirSync(jobDir, { recursive: true });
+  const jobPath = path.join(jobDir, `product-folders-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+  fs.writeFileSync(jobPath, JSON.stringify({ folders, operations, syncOptions }, null, 2), 'utf-8');
+
+  const entry = process.argv[1];
+  if (!entry || !fs.existsSync(entry)) {
+    setTimeout(() => runProductFolderSyncJob(jobPath), 5000);
+    return;
+  }
+
+  const child = spawn(process.execPath, [entry], {
+    cwd: process.cwd(),
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env: {
+      ...process.env,
+      PRODUCT_FOLDER_SYNC_JOB: jobPath,
+      NODE_ENV: process.env.NODE_ENV || 'production',
+    },
+  });
+  child.unref();
 }
 
 app.use(cors());
-app.use(express.json({ limit: JSON_BODY_LIMIT }));
-app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
+
 
 // 静态资源：新版本 zip 下载目录（公司主机部署时使用）
 if (!fs.existsSync(RELEASES_DIR)) fs.mkdirSync(RELEASES_DIR, { recursive: true });
@@ -1315,11 +1959,21 @@ const authenticate = (req: any, res: any, next: any) => {
   
   try {
     req.user = jwt.verify(token, SECRET_KEY);
+    const account = loadJsonUsers().find(user => user.username.trim() === req.user.username?.trim());
+    if (!account || account.registrationId !== req.user.registrationId) return res.status(401).json({ error: '账号已失效' });
     next();
   } catch (err) {
     res.status(401).json({ error: '无效的 Token' });
   }
 };
+
+mountRegistrationRoutes(app, {
+  db, authenticate, canManage: canManageUsers,
+  canApprove: (req: any) => !!getReqPermissions(req).canApproveRegistrations,
+  loadUsers: loadJsonUsers, saveUsers: saveJsonUsers, validScopes, permissionBodyLimit: JSON_BODY_LIMIT,
+});
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
 
 // --- API 路由 ---
 
@@ -1349,13 +2003,30 @@ app.get('/api/config', (req, res) => {
 });
 
 // 登录（基于本地 users.json）
-app.post('/api/login', (req, res) => {
+let passwordChecks = 0;
+app.post('/api/login', async (req, res, next) => {
   const { username, password } = req.body as { username: string; password: string };
   const users = loadJsonUsers();
   const inUser = String(username ?? '').replace(/^\uFEFF/, '').trim();
   const inPass = String(password ?? '').replace(/^\uFEFF/, '').trim();
-  const candidates = users.filter(u => String(u?.username ?? '').replace(/^\uFEFF/, '').trim() === inUser);
-  const user = candidates.find(u => String(u?.password ?? '').replace(/^\uFEFF/, '').trim() === inPass);
+  const candidates = users.filter(u => {
+    const name = String(u?.username ?? '').trim();
+    return u.registrationId ? name.normalize('NFKC').toLowerCase() === inUser.normalize('NFKC').toLowerCase() : name === inUser;
+  });
+  let user = candidates.find(u => !u.passwordHash && !!inPass && String(u.password || '').trim() === inPass);
+  if (!user && inPass && inPass.length <= 128 && candidates.some(u => u.passwordHash)) {
+    if (passwordChecks >= 6) return res.status(429).json({ error: '登录请求较多，请稍后再试' });
+    passwordChecks++;
+    try {
+      for (const candidate of candidates) {
+        if (candidate.passwordHash && await registrationPasswords.verifyPassword(inPass, candidate.passwordHash)) {
+          user = candidate;
+          break;
+        }
+      }
+    } catch (err) { return next(err); }
+    finally { passwordChecks--; }
+  }
 
   if (!user) {
     return res.status(401).json({ error: '用户名或密码错误' });
@@ -1368,12 +2039,24 @@ app.post('/api/login', (req, res) => {
     permissions,
   };
 
-  const token = jwt.sign(jwtUser, SECRET_KEY, { expiresIn: '24h' });
+  const token = jwt.sign({ username: jwtUser.username, role: jwtUser.role, registrationId: user.registrationId }, SECRET_KEY, { expiresIn: '24h' });
   res.json({
     token,
     username: jwtUser.username,
     role: jwtUser.role,
     permissions: jwtUser.permissions,
+  });
+});
+
+// 获取当前用户最新权限（前端每次启动时调用，确保权限与 users.json 同步，避免本地缓存滞后）
+app.get('/api/me', authenticate, (req: any, res) => {
+  const u = req.user as JwtUser | undefined;
+  if (!u?.username) return res.status(401).json({ error: '未授权' });
+  const permissions = getReqPermissions(req);
+  res.json({
+    username: u.username,
+    role: u.role,
+    permissions,
   });
 });
 
@@ -1386,15 +2069,28 @@ function canManageUsers(req: any) {
 }
 
 function saveJsonUsers(users: JsonUser[]) {
-  fs.writeFileSync(USERS_JSON_PATH, JSON.stringify(users, null, 2), 'utf-8');
+  const temp = USERS_JSON_PATH + '.' + randomUUID() + '.tmp';
+  try {
+    fs.writeFileSync(temp, JSON.stringify(users, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(temp, USERS_JSON_PATH);
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
   usersJsonCache = null;
 }
+
+app.get('/api/users/folders', authenticate, async (req: any, res) => {
+  if (!canManageUsers(req)) return res.status(403).json({ error: '无权设置权限范围' });
+  try { res.json(await childFolders(ASSETS_ROOT, req.query.path ?? '')); }
+  catch { res.status(400).json({ error: '无法读取目录' }); }
+});
 
 app.get('/api/users', authenticate, (req: any, res) => {
   if (!canManageUsers(req)) return res.status(403).json({ error: '无权操作' });
   res.json(loadJsonUsers().map(u => ({
     username: u.username,
     password: u.password || '',
+    protectedPassword: !!u.passwordHash,
     role: u.role || 'User',
     permissions: buildPermissions(u),
   })));
@@ -1403,16 +2099,22 @@ app.get('/api/users', authenticate, (req: any, res) => {
 app.post('/api/users', authenticate, (req: any, res) => {
   if (!canManageUsers(req)) return res.status(403).json({ error: '无权操作' });
   const body = req.body || {};
+  if (!validScopes(body.permissions?.folderScopes)) return res.status(400).json({ error: '权限范围无效' });
   const username = String(body.username || '').trim();
   if (!username) return res.status(400).json({ error: '用户名不能为空' });
   const users = loadJsonUsers();
   const existingIdx = users.findIndex(u => String(u.username).trim() === username);
   const nextUser: JsonUser = {
+    ...users[existingIdx],
     username,
     password: String(body.password || users[existingIdx]?.password || '123456'),
     role: String(body.role || users[existingIdx]?.role || 'User'),
-    permissions: body.permissions && typeof body.permissions === 'object' ? body.permissions : users[existingIdx]?.permissions,
+    permissions: { ...users[existingIdx]?.permissions, ...body.permissions },
   };
+  if (nextUser.passwordHash) {
+    if (body.password) nextUser.passwordHash = registrationPasswords.resetPassword(String(body.password).trim());
+    nextUser.password = '';
+  }
   if (existingIdx >= 0) users[existingIdx] = nextUser;
   else users.push(nextUser);
   saveJsonUsers(users);
@@ -1431,6 +2133,7 @@ app.delete('/api/users/:username', authenticate, (req: any, res) => {
 app.put('/api/users', authenticate, (req: any, res) => {
   if (!canManageUsers(req)) return res.status(403).json({ error: '无权操作' });
   const body = req.body || {};
+  if (!validScopes(body.permissions?.folderScopes)) return res.status(400).json({ error: '权限范围无效' });
   const username = String(body.username || '').trim();
   if (!username) return res.status(400).json({ error: '用户名不能为空' });
   const users = loadJsonUsers();
@@ -1438,9 +2141,11 @@ app.put('/api/users', authenticate, (req: any, res) => {
   if (existingIdx < 0) return res.status(404).json({ error: '用户不存在' });
   users[existingIdx] = {
     ...users[existingIdx],
-    password: body.password ? String(body.password) : users[existingIdx].password,
+    ...(users[existingIdx].passwordHash
+      ? (body.password ? { password: '', passwordHash: registrationPasswords.resetPassword(String(body.password).trim()) } : {})
+      : { password: body.password ? String(body.password) : users[existingIdx].password }),
     role: String(body.role || users[existingIdx].role || 'User'),
-    permissions: body.permissions && typeof body.permissions === 'object' ? body.permissions : users[existingIdx].permissions,
+    permissions: { ...users[existingIdx].permissions, ...body.permissions },
   };
   saveJsonUsers(users);
   res.json({ success: true });
@@ -1552,7 +2257,8 @@ app.post('/api/newdev/projects', authenticate, (req: any, res) => {
   } catch (err: any) {
     return res.status(400).json({ error: err?.message || '创建产品资料失败' });
   }
-  const initialData = compactProjectData({ ...(body.data || {}), ...linkedProduct });
+  const opsOwnerUsername = resolveOpsOwnerForNewProject();
+  const initialData = compactProjectData(withProjectOpsOwner({ ...(body.data || {}), ...linkedProduct }, opsOwnerUsername));
   const data = appendProjectHistory(initialData, {
     user: createdBy,
     stepKey: creationStepKey,
@@ -1582,6 +2288,10 @@ app.post('/api/newdev/projects', authenticate, (req: any, res) => {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(title, barcode, String(body.standard || ''), String(linkedProduct.brandName || body.brand || ''), String(body.spec || ''), stepKey, calculateDueAt(stepKey), JSON.stringify(data), createdBy, createdAt, createdAt);
   const id = Number(result.lastInsertRowid);
+  for (const rel of projectUploadPaths(data)) {
+    db.prepare('UPDATE newdev_uploads SET project_id = ? WHERE file_path = ? AND project_id IS NULL AND uploader = ?')
+      .run(id, rel, createdBy);
+  }
   addNotification(allUsernames(), `新建新品项目：${title}`, `新品「${title}」已创建，所有人可查看进度。`, id, 'new-project');
   createStepNotification(id, title, stepKey);
   res.json(projectRowToJson(db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id)));
@@ -1590,7 +2300,7 @@ app.post('/api/newdev/projects', authenticate, (req: any, res) => {
 app.delete('/api/newdev/projects/:id', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
-  const canDeleteNewDev = username === '任小雨' || !!perms.canManageNewDevelopment || !!perms.canManageUsers || !!perms.canDelete || canManageUsers(req);
+  const canDeleteNewDev = username === '任小雨' || !!perms.canManageNewDevelopment || !!perms.canManageUsers || allowsFolder(perms, 'canDelete', '') || canManageUsers(req);
   if (!canDeleteNewDev) return res.status(403).json({ error: '无权删除新品记录' });
   const id = Number(req.params.id);
   const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
@@ -1612,10 +2322,14 @@ app.put('/api/newdev/projects/:id', authenticate, (req: any, res) => {
   const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
   if (!row) return res.status(404).json({ error: '项目不存在' });
   if (row.completed_at) return res.status(400).json({ error: '项目已完成，不能再修改' });
-  if (!canSupplementNewDevStep(req, row.current_step_key)) return res.status(403).json({ error: '只能修改当前由你负责的步骤' });
+  if (!canSupplementNewDevStep(req, row.current_step_key, row)) return res.status(403).json({ error: '只能修改当前由你负责的步骤' });
   const body = req.body || {};
   const oldData = parseProjectData(row);
-  let nextData = body.data && typeof body.data === 'object' ? compactProjectData(body.data) : oldData;
+  if (oldData.productFolderPath && req.body?.data?.productFolderPath &&
+      req.body.data.productFolderPath !== oldData.productFolderPath) {
+    return res.status(409).json({ error: '产品目录已变更，请刷新后重试' });
+  }
+  let nextData = body.data && typeof body.data === 'object' ? { ...oldData, ...compactProjectData(body.data) } : oldData;
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   if (row.current_step_key === 'selling' || row.current_step_key === 'opsSynthesis') {
     nextData = mergeCollaborativeNewDevData(oldData, nextData, username);
@@ -1623,6 +2337,9 @@ app.put('/api/newdev/projects/:id', authenticate, (req: any, res) => {
     nextData = mergeReviewIssueData(oldData, nextData, username, 'leader');
   } else if (row.current_step_key === 'opsReview') {
     nextData = mergeReviewIssueData(oldData, nextData, username, 'ops');
+  }
+  if (row.current_step_key === 'selling' || row.current_step_key === 'opsSynthesis' || row.current_step_key === 'opsReview') {
+    nextData = withProjectOpsOwner(nextData, username);
   }
   nextData = attachSellingPointAuthors(oldData, nextData, username);
   const changes = buildProjectChanges(row, body, oldData, { ...nextData, __changeUser: username });
@@ -1636,8 +2353,11 @@ app.put('/api/newdev/projects/:id', authenticate, (req: any, res) => {
       changes,
     });
   }
-  db.prepare('UPDATE newdev_projects SET title = ?, barcode = ?, standard = ?, brand = ?, spec = ?, data_json = ?, updated_at = ? WHERE id = ?')
-    .run(String(body.title ?? row.title), String(body.barcode ?? row.barcode ?? ''), String(body.standard ?? row.standard ?? ''), String(body.brand ?? row.brand ?? ''), String(body.spec ?? row.spec ?? ''), JSON.stringify(compactProjectData(nextData)), nowIso(), id);
+  if (conflictingAttachmentEdit(req, row, nextData)) return res.status(409).json({ error: '流程附件已更新，请刷新后重试' });
+  saveProjectWithUploads(row, nextData, () => {
+    db.prepare('UPDATE newdev_projects SET title = ?, barcode = ?, standard = ?, brand = ?, spec = ?, data_json = ?, updated_at = ? WHERE id = ?')
+      .run(String(body.title ?? row.title), String(body.barcode ?? row.barcode ?? ''), String(body.standard ?? row.standard ?? ''), String(body.brand ?? row.brand ?? ''), String(body.spec ?? row.spec ?? ''), JSON.stringify(compactProjectData(nextData)), nowIso(), id);
+  });
   res.json(projectRowToJson(db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id)));
 });
 
@@ -1646,7 +2366,7 @@ app.post('/api/newdev/projects/:id/purchase-selling-point', authenticate, (req: 
   const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
   if (!row) return res.status(404).json({ error: '项目不存在' });
   if (row.completed_at) return res.status(400).json({ error: '项目已完成，不能再修改' });
-  if (!canReviewPurchaseSellingPoint(req)) return res.status(403).json({ error: '只有运营或管理员可以处理采购卖点' });
+  if (!canReviewPurchaseSellingPoint(req, row)) return res.status(403).json({ error: '只有运营或管理员可以处理采购卖点' });
   const point = String(req.body?.point || '').trim();
   const decision = String(req.body?.decision || '').trim();
   if (!point) return res.status(400).json({ error: '卖点不能为空' });
@@ -1661,7 +2381,7 @@ app.post('/api/newdev/projects/:id/purchase-selling-point', authenticate, (req: 
     nextStatus = { ...status };
     delete nextStatus[point];
   }
-  let nextData: any = { ...oldData, purchaseSellingPointStatus: nextStatus };
+  let nextData: any = withProjectOpsOwner({ ...oldData, purchaseSellingPointStatus: nextStatus }, username);
   if (decision === 'accepted') {
     const currentPoints = Array.isArray(nextData.sellingPoints) ? nextData.sellingPoints.map((item: any) => String(item || '')) : [];
     if (!currentPoints.map((item: string) => item.trim()).includes(point)) nextData.sellingPoints = [...currentPoints.filter((item: string) => item.trim()), point];
@@ -1684,7 +2404,9 @@ app.post('/api/newdev/projects/:id/purchase-selling-point', authenticate, (req: 
     summary: `${decision === 'accepted' ? '采纳' : decision === 'reset' ? '取消采纳' : '不采纳'}采购卖点：${point}`,
     changes: [{ field: 'purchaseSellingPoints', label: '采购添加卖点', from: point, to: decision === 'accepted' ? '已采纳并复制到运营卖点' : decision === 'reset' ? '已取消采纳并从运营卖点删除' : '不采纳' }],
   });
-  db.prepare('UPDATE newdev_projects SET data_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(compactProjectData(nextData)), nowIso(), id);
+  saveProjectWithUploads(row, nextData, () => {
+    db.prepare('UPDATE newdev_projects SET data_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(compactProjectData(nextData)), nowIso(), id);
+  });
   res.json(projectRowToJson(db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id)));
 });
 
@@ -1693,18 +2415,24 @@ app.post('/api/newdev/projects/:id/advance', authenticate, (req: any, res) => {
   const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
   if (!row) return res.status(404).json({ error: '项目不存在' });
   if (row.completed_at) return res.status(400).json({ error: '项目已完成' });
-  if (!canOperateNewDevStep(req, row.current_step_key)) return res.status(403).json({ error: '只能提交当前由你负责的步骤' });
-  const next = String(req.body?.stepKey || getNextStepKey(row.current_step_key) || '');
+  if (!canOperateNewDevStep(req, row.current_step_key, row)) return res.status(403).json({ error: '只能提交当前由你负责的步骤' });
+  const next = getNextStepKey(row.current_step_key);
+  if (req.body?.stepKey && req.body.stepKey !== next) return res.status(409).json({ error: '流程步骤已变化，请刷新后重新提交' });
   if (!next) return res.status(400).json({ error: '已经没有下一步' });
   const done = next === 'done';
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   const oldData = parseProjectData(row);
-  const requestData = req.body?.data && typeof req.body.data === 'object' ? compactProjectData(req.body.data) : oldData;
+  if (oldData.productFolderPath && req.body?.data?.productFolderPath &&
+      req.body.data.productFolderPath !== oldData.productFolderPath) {
+    return res.status(409).json({ error: '产品目录已变更，请刷新后重试' });
+  }
+  const requestData = req.body?.data && typeof req.body.data === 'object' ? { ...oldData, ...compactProjectData(req.body.data) } : oldData;
   const dataForNextStep = next === 'packaging' && !requestData.copywritingConfirm
     ? { ...requestData, copywritingConfirm: buildPackagingConfirmText(requestData) }
     : requestData;
-  const changes = buildProjectChanges(row, {}, oldData, { ...dataForNextStep, __changeUser: username });
-  const nextData = appendProjectHistory(dataForNextStep, {
+  const ownedDataForNextStep = withProjectOpsOwner(dataForNextStep, username);
+  const changes = buildProjectChanges(row, {}, oldData, { ...ownedDataForNextStep, __changeUser: username });
+  const nextData = appendProjectHistory(ownedDataForNextStep, {
     user: username,
     stepKey: row.current_step_key,
     stepLabel: stepLabel(row.current_step_key),
@@ -1712,8 +2440,11 @@ app.post('/api/newdev/projects/:id/advance', authenticate, (req: any, res) => {
     summary: done ? '完成新品开发' : `提交到下一步：${stepLabel(row.current_step_key)} → ${stepLabel(next)}`,
     changes,
   });
-  db.prepare('UPDATE newdev_projects SET current_step_key = ?, due_at = ?, data_json = ?, updated_at = ?, completed_at = ? WHERE id = ?')
-    .run(next, done ? null : calculateDueAt(next), JSON.stringify(compactProjectData(nextData)), nowIso(), done ? nowIso() : null, id);
+  if (conflictingAttachmentEdit(req, row, nextData)) return res.status(409).json({ error: '流程附件已更新，请刷新后重试' });
+  saveProjectWithUploads(row, nextData, () => {
+    db.prepare('UPDATE newdev_projects SET current_step_key = ?, due_at = ?, data_json = ?, updated_at = ?, completed_at = ? WHERE id = ?')
+      .run(next, done ? null : calculateDueAt(next), JSON.stringify(compactProjectData(nextData)), nowIso(), done ? nowIso() : null, id);
+  });
   if (!done) createStepNotification(id, row.title, next);
   if (row.current_step_key === 'purchase' && req.body?.notifyOperations) {
     const summary = String(req.body?.purchaseSummary || '').trim();
@@ -1734,15 +2465,20 @@ app.post('/api/newdev/projects/:id/reject', authenticate, (req: any, res) => {
   const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
   if (!row) return res.status(404).json({ error: '项目不存在' });
   if (row.completed_at) return res.status(400).json({ error: '项目已完成' });
-  if (!canOperateNewDevStep(req, row.current_step_key)) return res.status(403).json({ error: '只能退回当前由你负责的步骤' });
+  if (!canOperateNewDevStep(req, row.current_step_key, row)) return res.status(403).json({ error: '只能退回当前由你负责的步骤' });
   if (!['leaderReview', 'opsReview'].includes(String(row.current_step_key))) return res.status(400).json({ error: '当前步骤不能退回' });
   const targetStepKey = String(req.body?.targetStepKey || 'mainDetail');
   if (targetStepKey !== 'mainDetail') return res.status(400).json({ error: '只能退回到主图详情页设计' });
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   const oldData = parseProjectData(row);
-  const requestData = req.body?.data && typeof req.body.data === 'object' ? compactProjectData(req.body.data) : oldData;
-  const changes = buildProjectChanges(row, {}, oldData, requestData);
-  const nextData = appendProjectHistory(requestData, {
+  if (oldData.productFolderPath && req.body?.data?.productFolderPath &&
+      req.body.data.productFolderPath !== oldData.productFolderPath) {
+    return res.status(409).json({ error: '产品目录已变更，请刷新后重试' });
+  }
+  const requestData = req.body?.data && typeof req.body.data === 'object' ? { ...oldData, ...compactProjectData(req.body.data) } : oldData;
+  const ownedRequestData = withProjectOpsOwner(requestData, username);
+  const changes = buildProjectChanges(row, {}, oldData, ownedRequestData);
+  const nextData = appendProjectHistory(ownedRequestData, {
     user: username,
     stepKey: row.current_step_key,
     stepLabel: stepLabel(row.current_step_key),
@@ -1750,6 +2486,10 @@ app.post('/api/newdev/projects/:id/reject', authenticate, (req: any, res) => {
     summary: `${stepLabel(row.current_step_key)}退回到${stepLabel(targetStepKey)}修改`,
     changes,
   });
+  const retained = projectUploadPaths(nextData);
+  if (conflictingAttachmentEdit(req, row, nextData) || [...projectUploadPaths(oldData)].some(rel => !retained.has(rel))) {
+    return res.status(409).json({ error: '附件有未同步的修改，请先保存或刷新后再退回' });
+  }
   db.prepare('UPDATE newdev_projects SET current_step_key = ?, due_at = ?, data_json = ?, updated_at = ? WHERE id = ?')
     .run(targetStepKey, calculateDueAt(targetStepKey), JSON.stringify(compactProjectData(nextData)), nowIso(), id);
   createStepNotification(id, row.title, targetStepKey);
@@ -1789,7 +2529,7 @@ app.post('/api/newdev/projects/:id/broadcast', authenticate, (req: any, res) => 
   const id = Number(req.params.id);
   const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
   if (!row) return res.status(404).json({ error: '项目不存在' });
-  if (!canOperateNewDevStep(req, row.current_step_key)) return res.status(403).json({ error: '无权操作' });
+  if (!canOperateNewDevStep(req, row.current_step_key, row)) return res.status(403).json({ error: '无权操作' });
   const title = String(req.body?.title || `新品流程通知：${row.title}`).trim();
   const message = String(req.body?.message || '').trim();
   addNotification(allUsernames(), title, message || title, id, `newdev-broadcast:${id}:${Date.now()}`);
@@ -1800,23 +2540,31 @@ app.post('/api/newdev/projects/:id/transfer', authenticate, (req: any, res) => {
   const id = Number(req.params.id);
   const row = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id) as any;
   if (!row) return res.status(404).json({ error: '项目不存在' });
-  if (!canOperateNewDevStep(req, row.current_step_key)) return res.status(403).json({ error: '无权操作' });
+  if (row.completed_at) return res.status(400).json({ error: '已完成的项目不能转交' });
+  if (!canOperateNewDevStep(req, row.current_step_key, row)) return res.status(403).json({ error: '无权操作' });
   const assignee = String(req.body?.assignee || '').trim();
   if (!assignee) return res.status(400).json({ error: '请选择转交人员' });
-  const cfg = getStepConfig(row.current_step_key);
-  db.prepare('UPDATE newdev_step_configs SET assignee_usernames = ?, assignee_positions = ? WHERE step_key = ?')
-    .run(JSON.stringify([assignee]), JSON.stringify([]), row.current_step_key);
   const username = String((req.user as JwtUser | undefined)?.username || '').trim();
   const oldData = parseProjectData(row);
-  const nextData = appendProjectHistory(compactProjectData({ ...oldData, transferredTo: assignee }), {
+  const cfg = getStepConfig(row.current_step_key);
+  const isOpsStep = row.current_step_key === 'selling' || row.current_step_key === 'opsSynthesis' || row.current_step_key === 'opsReview';
+  if (!allUsernames().includes(assignee)) return res.status(400).json({ error: '转交人员不存在' });
+  const transferredData = compactProjectData({ ...oldData, transferredTo: assignee, ...(isOpsStep ? { opsOwnerUsername: assignee } : {}) });
+  const nextData = appendProjectHistory(transferredData, {
     user: username,
     stepKey: row.current_step_key,
     stepLabel: cfg?.label || row.current_step_key,
     action: 'transfer',
     summary: `转交给 ${assignee}`,
-    changes: [{ field: 'assignee', label: '负责人', from: resolveStepAssignees(row.current_step_key).join('、'), to: assignee }],
+    changes: [{ field: 'assignee', label: '负责人', from: resolveStepAssignees(row.current_step_key, row).join('、'), to: assignee }],
   });
-  db.prepare('UPDATE newdev_projects SET data_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(compactProjectData(nextData)), nowIso(), id);
+  db.transaction(() => {
+    if (!isOpsStep) {
+      db.prepare('INSERT OR REPLACE INTO newdev_step_transfers (project_id, step_key, username) VALUES (?, ?, ?)')
+        .run(id, row.current_step_key, assignee);
+    }
+    db.prepare('UPDATE newdev_projects SET data_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(compactProjectData(nextData)), nowIso(), id);
+  })();
   createStepNotification(id, row.title, row.current_step_key);
   res.json(projectRowToJson(db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(id)));
 });
@@ -1852,7 +2600,7 @@ app.get('/api/notification-recipients', authenticate, (req, res) => {
 
 app.post('/api/manual-notification', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
-  if (!perms.canManageNewDevelopment && !perms.canManageProducts && !perms.canUpload && !canManageUsers(req)) {
+  if (!perms.canSendNotification && !canManageUsers(req)) {
     return res.status(403).json({ error: '无权操作' });
   }
   const body = req.body || {};
@@ -1940,7 +2688,7 @@ app.post('/api/brands', authenticate, (req: any, res) => {
 
 app.delete('/api/brands/:id', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
-  if (!perms.canDelete || !perms.canManageBrands) return res.status(403).json({ error: '无权操作' });
+  if (!allowsFolder(perms, 'canDelete', '') || !perms.canManageBrands) return res.status(403).json({ error: '无权操作' });
   const { id } = req.params;
   try {
     db.prepare('DELETE FROM brands WHERE id = ?').run(id);
@@ -1954,24 +2702,9 @@ app.delete('/api/brands/:id', authenticate, (req: any, res) => {
 
 // 获取所有产品及其变体
 app.get('/api/products', authenticate, (req, res) => {
-  const products = db.prepare(`
-    SELECT p.*, b.name as brand_name 
-    FROM products p 
-    LEFT JOIN brands b ON p.brand_id = b.id
-  `).all() as any[];
-  const variants = db.prepare('SELECT * FROM product_variants').all() as any[];
-  const variantMap = new Map<number, any[]>();
-  for (const v of variants) {
-    const pid = Number(v.product_id);
-    const arr = variantMap.get(pid);
-    if (arr) arr.push(v);
-    else variantMap.set(pid, [v]);
-  }
-  const productsWithVariants = products.map(p => ({
-    ...p,
-    variants: variantMap.get(Number(p.id)) || []
+  const productsWithVariants = getAllProductsWithVariants().map(p => ({
+    ...p, productFolderPath: relAssetPath(productRootForRow(p))
   }));
-  
   res.json(productsWithVariants);
 });
 
@@ -1985,42 +2718,51 @@ app.get('/api/product-folders/template', authenticate, (req: any, res) => {
   res.json(tmpl);
 });
 
+app.post('/api/product-folders/sync-preview', authenticate, (req: any, res) => {
+  const perms = getReqPermissions(req);
+  if (!perms.canManageProducts) return res.status(403).json({ error: '无权操作' });
+  const operations = Array.isArray(req.body?.operations) ? req.body.operations as TemplateFolderOperation[] : [];
+  try {
+    res.json(previewProductFolderSync(operations));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || '同步预览失败' });
+  }
+});
+
 app.post('/api/product-folders/template', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
   if (!perms.canManageProducts) return res.status(403).json({ error: '无权操作' });
-  const { folders } = req.body as { folders: ProductFolderTemplateItem[] };
-  if (!Array.isArray(folders)) {
-    return res.status(400).json({ error: 'folders 格式错误，必须为数组' });
+  try {
+    const { folders, operations, syncOptions } = req.body as { folders: ProductFolderTemplateItem[]; operations?: TemplateFolderOperation[]; syncOptions?: ProductFolderSyncOptions };
+    if (!Array.isArray(folders)) {
+      return res.status(400).json({ error: 'folders 格式错误，必须为数组' });
+    }
+    const normalizedFolders = normalizeFolderTemplate(folders);
+    const validationError = validateFolderTemplateNames(normalizedFolders);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+    saveProductFolderTemplate(normalizedFolders);
+    const normalizedOps = Array.isArray(operations) ? operations : [];
+    const normalizedOptions = syncOptions && typeof syncOptions === 'object' ? syncOptions : {};
+    queueProductFolderSyncJob(normalizedFolders, normalizedOps, normalizedOptions);
+    res.json({ success: true, syncingExistingFolders: true });
+  } catch (err: any) {
+    console.error('保存默认文件夹模板失败:', err);
+    res.status(500).json({ error: `保存默认文件夹模板失败：${err?.message || '服务器内部错误'}` });
   }
-  saveProductFolderTemplate(folders);
-  // 保存模板后，自动补齐所有已存在产品的目录结构（只补缺失，不覆盖同名）
-  setTimeout(() => syncAllExistingProductFolders(folders), 0);
-  res.json({ success: true });
 });
 
 // 辅助函数：创建产品目录结构（以产品正式名称命名，非编码）
-const createProductFolders = (
-  brandName: string | undefined,
-  productSku: string,
-  officialName: string,
-  variants: any[],
-  folderConfig: any[]
-) => {
-  const brandDir = brandName ? brandName : '未分类品牌';
-  let productFolderName = (officialName || '').trim() || productSku;
-  productFolderName = productFolderName.replace(/[/\\:*?"<>|]/g, '_'); // Windows 路径非法字符替换
-  const productDir = path.join(ASSETS_ROOT, brandDir, productFolderName);
-
-  const sanitizeName = (n: string) => (n || '').replace(/[/\\:*?"<>|]/g, '_').trim() || '未命名';
-
+function createProductFolders(productDir: string, folderConfig: any[]) {
   const createDirsRecursive = (basePath: string, items: any[]) => {
     if (!Array.isArray(items)) return;
     for (const cat of items) {
       if (!cat) continue;
       const catName = typeof cat === 'string' ? cat : (cat.name || '');
-      const name = sanitizeName(catName);
+      const name = safeTemplateName(catName);
       if (!name) continue;
-      const catPath = path.join(basePath, name);
+      const catPath = path.join(ASSETS_ROOT, generatedFolderPath([name], relAssetPath(basePath)));
       if (!fs.existsSync(catPath)) {
         fs.mkdirSync(catPath, { recursive: true });
       }
@@ -2041,23 +2783,40 @@ app.post('/api/products', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
   if (!perms.canManageProducts) return res.status(403).json({ error: '无权操作' });
   const { id, sku, official_name, names, brand_id, image_path, variants, folders } = req.body;
+  const undo: Array<() => void> = [];
+  const renames = Array.isArray(req.body.folderRenames) ? req.body.folderRenames : [];
+  if (renames.some((op: any) => op?.type !== 'rename' || !Array.isArray(op.fromSegments) ||
+      !op.fromSegments.length || !op.fromSegments.every((s: any) => typeof s === 'string' && validAssetSegment(s)) ||
+      typeof op.toName !== 'string' || !validAssetSegment(op.toName))) {
+    return res.status(400).json({ error: '目录名称无效' });
+  }
+  if (Array.isArray(folders)) {
+    const error = validateFolderTemplateNames(folders);
+    if (error) return res.status(400).json({ error });
+  }
   
   const brand = brand_id ? db.prepare('SELECT name FROM brands WHERE id = ?').get(brand_id) as any : null;
   const brandName = brand ? brand.name : undefined;
 
   const transaction = db.transaction(() => {
     let productId = id;
+    const desiredVariants = Array.isArray(variants) ? variants.filter(v => v.sku).map(v => ({ sku: v.sku, color: v.color || '' })) : null;
+    const existingVariants = id ? db.prepare("SELECT sku, COALESCE(color, '') AS color FROM product_variants WHERE product_id = ? ORDER BY id").all(id) : [];
+    const variantsChanged = desiredVariants !== null && JSON.stringify(desiredVariants) !== JSON.stringify(existingVariants);
+    const next = { brand_name: brandName, official_name, sku };
+    const previous = id ? db.prepare('SELECT p.*, b.name AS brand_name FROM products p LEFT JOIN brands b ON b.id = p.brand_id WHERE p.id = ?').get(id) : null;
+    if (id && !previous) throw new Error('产品不存在');
     if (id) {
       db.prepare('UPDATE products SET sku = ?, official_name = ?, names = ?, brand_id = ?, image_path = ? WHERE id = ?')
         .run(sku, official_name, names, brand_id, image_path, id);
-      db.prepare('DELETE FROM product_variants WHERE product_id = ?').run(id);
+      if (variantsChanged) db.prepare('DELETE FROM product_variants WHERE product_id = ?').run(id);
     } else {
       const result = db.prepare('INSERT INTO products (sku, official_name, names, brand_id, image_path) VALUES (?, ?, ?, ?, ?)')
         .run(sku, official_name, names, brand_id, image_path);
       productId = result.lastInsertRowid;
     }
 
-    if (variants && Array.isArray(variants)) {
+    if (variantsChanged) {
       const insertVariant = db.prepare('INSERT INTO product_variants (product_id, sku, color) VALUES (?, ?, ?)');
       for (const v of variants) {
         if (v.sku) {
@@ -2067,21 +2826,28 @@ app.post('/api/products', authenticate, (req: any, res) => {
     }
     
     // 自动创建文件夹结构（以产品正式名称命名）
+    if (previous) {
+      relocateProductFolder(previous, next, undo);
+      for (const op of renames) applyTemplateOperation(productRootForRow(next), op, {}, undo);
+    }
     const folderList = Array.isArray(folders) && folders.length ? folders : loadProductFolderTemplate();
-    createProductFolders(brandName, sku, official_name || '', variants || [], folderList);
+    if (!previous || !fs.existsSync(productRootForRow(next)) || Array.isArray(folders)) {
+      createProductFolders(productRootForRow(next), folderList);
+    }
   });
 
   try {
     transaction();
     res.json({ success: true });
   } catch (err: any) {
+    for (const rollback of undo.reverse()) rollback();
     res.status(400).json({ error: err.message || '操作失败' });
   }
 });
 
 app.delete('/api/products/:id', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
-  if (!perms.canDelete || !perms.canManageProducts) return res.status(403).json({ error: '无权操作' });
+  if (!allowsFolder(perms, 'canDelete', '') || !perms.canManageProducts) return res.status(403).json({ error: '无权操作' });
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: '无效的产品 ID' });
   try {
@@ -2101,6 +2867,9 @@ app.post('/api/files/tag', authenticate, (req: any, res) => {
   if (!perms.canTag) return res.status(403).json({ error: '无权操作' });
   const { file_paths, product_ids, variant_ids } = req.body; 
   
+  if (!Array.isArray(file_paths) || !file_paths.every(rel => allowedAsset(perms, 'canTag', rel, true))) {
+    return res.status(403).json({ error: '包含无标签权限的项目' });
+  }
   const insertTag = db.prepare('INSERT INTO file_tags (file_path, product_id, variant_id) VALUES (?, ?, ?)');
   const deleteTags = db.prepare('DELETE FROM file_tags WHERE file_path = ?');
   
@@ -2204,188 +2973,144 @@ app.get('/api/files', authenticate, (req: any, res) => {
 });
 
 // 递归搜索资产：支持「产品 + 文件夹」如「刮皮刀 主图」，返回匹配的文件和文件夹（文件夹排在图片后面）
-app.get('/api/files/search', authenticate, (req: any, res) => {
-  const q = ((req.query.q as string) || '').trim();
-  if (!q) return res.json([]);
-
-  const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
-  const pathLower = (s: string) => (s || '').toLowerCase().replace(/\\/g, '/');
-  const safeFolderName = (s: string) => (s || '').replace(/[/\\:*?"<>|]/g, '_');
-  const aliasesOf = (s: string) => (s || '').split(/[,，]/).map(a => a.trim().toLowerCase()).filter(Boolean);
-  const filesList: any[] = [];
-  const dirsList: any[] = [];
-  const productRootDirs: any[] = [];
-  const MAX_SEARCH_RESULTS = 240;
-  const MAX_DIR_RESULTS = 80;
-  const hasEnoughResults = () => productRootDirs.length + filesList.length + dirsList.length >= MAX_SEARCH_RESULTS;
-
+app.get('/api/files/search', authenticate, async (req: any, res) => {
+  const terms = String(req.query.q || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return res.json([]);
+  const streaming = req.query.stream === '1';
+  const results: any[] = [];
+  const directories: any[] = [];
+  const seen = new Set<string>();
+  const maxResults = 240;
+  const maxDirectories = 80;
+  const concurrency = 8;
+  let directoryCount = 0;
+  const normalize = (value: string) => (value || '').replace(/\\/g, '/').toLowerCase();
+  const folderPreviews = async (rel: string) => {
+    const entries = await fs.promises.readdir(path.join(ASSETS_ROOT, rel), { withFileTypes: true }).catch(() => []);
+    return entries.filter(e => e.isFile() && /\.(jpe?g|png|webp)$/i.test(e.name)).slice(0, 4).map(e => rel + '/' + e.name);
+  };
+  const publish = (items: any[]) => {
+    if (!items.length || res.destroyed) return;
+    results.push(...items);
+    if (streaming) res.write(JSON.stringify(items) + '\n');
+  };
   try {
-    const matchedProducts = db.prepare(`
-      SELECT p.id, p.sku, p.official_name, p.names, b.name AS brand_name
-      FROM products p
-      LEFT JOIN brands b ON p.brand_id = b.id
+    const tags = db.prepare(`
+      SELECT ft.file_path, p.id, p.sku, p.official_name, p.names, pv.sku AS variantSku, pv.color
+      FROM file_tags ft JOIN products p ON ft.product_id = p.id
+      LEFT JOIN product_variants pv ON ft.variant_id = pv.id
     `).all() as any[];
-
-    for (const p of matchedProducts) {
-      const fields = [
-        pathLower(p.sku || ''),
-        pathLower(p.official_name || ''),
-        pathLower(p.brand_name || ''),
-        ...aliasesOf(p.names || '')
-      ];
-      if (!terms.some((term: string) => fields.some(field => field.includes(term)))) continue;
-
-      const brandName = p.brand_name || '未分类品牌';
-      const productFolderName = safeFolderName(((p.official_name || '').trim() || p.sku || '').trim());
-      if (!productFolderName) continue;
-
-      const relPath = [brandName, productFolderName].filter(Boolean).join('/');
-      const fullPath = path.join(ASSETS_ROOT, brandName, productFolderName);
-      if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isDirectory()) continue;
-
-      const stat = fs.statSync(fullPath);
-      productRootDirs.push({
-        name: productFolderName,
-        path: relPath,
-        isDir: true,
-        size: 0,
-        mtime: stat.mtime,
-        ext: '',
-        previews: getFolderPreviews(fullPath, relPath),
-        products: [{
-          id: p.id,
-          sku: p.sku,
-          official_name: p.official_name,
-          names: p.names
-        }]
-      });
+    const byPath = new Map<string, any[]>();
+    for (const tag of tags) {
+      const key = normalize(tag.file_path);
+      const existing = byPath.get(key) || [];
+      existing.push(tag);
+      byPath.set(key, existing);
     }
-  } catch (e) {
-    // ignore product root boost errors in search
-  }
-
-  function walkDir(dirPath: string, relPath: string) {
-    if (hasEnoughResults()) return;
-    try {
-      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-      for (const ent of entries) {
-        if (hasEnoughResults()) break;
-        if (ent.name === APP_DATA_FOLDER_NAME) continue;
-        const childRel = relPath ? `${relPath}/${ent.name}` : ent.name;
-        const childFull = path.join(dirPath, ent.name);
-        const pathForApi = childRel.replace(/\\/g, '/');
-        const pathLowerStr = pathLower(childRel);
-        const nameLower = pathLower(ent.name);
-
-        const matchTerm = (term: string, tags: any[]) => {
-          if (nameLower.includes(term) || pathLowerStr.includes(term)) return true;
-          return tags.some((t: any) => {
-            const sku = pathLower(t.product_sku);
-            const officialName = pathLower(t.product_official_name || '');
-            const aliases = (t.product_names || '').split(/[,，]/).map((a: string) => a.trim().toLowerCase());
-            const variantSku = pathLower(t.variant_sku || '');
-            const variantColor = pathLower(t.variant_color || '');
-            return sku.includes(term) || officialName.includes(term) || aliases.some((a: string) => a.includes(term))
-              || variantSku.includes(term) || variantColor.includes(term);
-          });
-        };
-
-        if (ent.isDirectory()) {
-          // 文件夹：既要匹配名称/路径，也要考虑其子文件的产品标签（SKU / 正式名 / 别名）
-          let tags: any[] = [];
-          if (terms.every((term: string) => matchTerm(term, tags))) {
-            const stat = fs.statSync(childFull);
-            if (dirsList.length < MAX_DIR_RESULTS) dirsList.push({
-              name: ent.name,
-              path: pathForApi,
-              isDir: true,
-              size: 0,
-              mtime: stat.mtime,
-              ext: '',
-              previews: getFolderPreviews(childFull, childRel),
-              products: tags.map((t: any) => ({
-                id: t.product_id,
-                sku: t.product_sku,
-                official_name: t.product_official_name,
-                names: t.product_names
-              }))
-            });
-          }
-          walkDir(childFull, childRel);
-        } else {
-          const tags = db.prepare(`
-            SELECT ft.product_id, p.sku as product_sku, p.official_name as product_official_name, p.names as product_names,
-                   pv.sku as variant_sku, pv.color as variant_color
-            FROM file_tags ft
-            JOIN products p ON ft.product_id = p.id
-            LEFT JOIN product_variants pv ON ft.variant_id = pv.id
-            WHERE ft.file_path = ?
-          `).all(pathForApi) as any[];
-
-          if (terms.every((term: string) => matchTerm(term, tags))) {
-            const stat = fs.statSync(childFull);
-            filesList.push({
-              name: ent.name,
-              path: pathForApi,
-              isDir: false,
-              size: stat.size,
-              mtime: stat.mtime,
-              ext: path.extname(ent.name).toLowerCase(),
-              products: tags.map((t: any) => ({
-                id: t.product_id,
-                sku: t.product_sku,
-                official_name: t.product_official_name,
-                names: t.product_names
-              }))
-            });
-          }
-        }
+    const products = db.prepare(`
+      SELECT p.id, p.sku, p.official_name, p.names, b.name AS brand_name
+      FROM products p LEFT JOIN brands b ON p.brand_id = b.id
+    `).all() as any[];
+    const matches = (term: string, values: string[]) => values.some(value => normalize(value).includes(term));
+    const productFields = (p: any) => [p.sku, p.official_name, ...(p.names || '').split(/[,，]/)];
+    const productInfo = (p: any) => ({ id: p.id, sku: p.sku, official_name: p.official_name, names: p.names });
+    const itemFor = async (rel: string, isDir: boolean, associated: any[]) => {
+      const stat = await fs.promises.stat(path.join(ASSETS_ROOT, rel)).catch(() => null);
+      if (!stat || stat.isDirectory() !== isDir || res.destroyed) return null;
+      return { name: path.posix.basename(rel), path: rel, isDir, size: isDir ? 0 : stat.size,
+        mtime: stat.mtime, ext: isDir ? '' : path.extname(rel).toLowerCase(),
+        ...(isDir ? { previews: await folderPreviews(rel) } : {}), products: associated.map(productInfo) };
+    };
+    if (streaming) res.type('application/x-ndjson').set('Cache-Control', 'no-store');
+    const boosted = products.filter(p => terms.some(term => matches(term, [...productFields(p), p.brand_name])));
+    const queue: string[] = [];
+    const scheduled = new Set<string>();
+    const enqueue = (rel: string) => {
+      const key = normalize(rel);
+      if (!scheduled.has(key)) { scheduled.add(key); queue.push(rel); }
+    };
+    for (let i = 0; i < boosted.length && directoryCount < maxDirectories; i += concurrency) {
+      if (res.destroyed) return;
+      const rows = await Promise.all(boosted.slice(i, i + concurrency).map(p => {
+        const rel = relAssetPath(productRootForRow(p));
+        return rel.split('/').every(validAssetSegment) && !rel.startsWith(APP_DATA_FOLDER_NAME + '/') ? itemFor(rel, true, [p]) : null;
+      }));
+      const batch = [];
+      for (const item of rows) {
+        if (!item || directoryCount >= maxDirectories || seen.has(normalize(item.path))) continue;
+        seen.add(normalize(item.path));
+        batch.push(item);
+        directoryCount++;
       }
-    } catch (e) {
-      /* ignore */
+      publish(batch);
     }
-  }
-
-  function getFolderPreviews(folderPath: string, relPath: string): string[] {
-    try {
-      const subItems = fs.readdirSync(folderPath);
-      const relNorm = relPath.replace(/\\/g, '/');
-      return subItems
-        .filter(si => ['.jpg', '.jpeg', '.png', '.webp'].includes(path.extname(si).toLowerCase()))
-        .slice(0, 4)
-        .map(si => (relNorm ? `${relNorm}/` : '') + si);
-    } catch (e) {
-      return [];
+    enqueue('');
+    for (let head = 0; head < queue.length && results.length + directories.length < maxResults;) {
+      if (res.destroyed) return;
+      const parents = queue.slice(head, head + concurrency);
+      head += parents.length;
+      const listings = await Promise.all(parents.map(rel =>
+        fs.promises.readdir(path.join(ASSETS_ROOT, rel), { withFileTypes: true }).catch(() => [] as fs.Dirent[])
+      ));
+      const candidates = [];
+      for (const [i, entries] of listings.entries()) {
+        for (const entry of entries) {
+          if (entry.name === APP_DATA_FOLDER_NAME || (!entry.isDirectory() && !entry.isFile())) continue;
+          const rel = parents[i] ? parents[i] + '/' + entry.name : entry.name;
+          const key = normalize(rel);
+          const isDir = entry.isDirectory();
+          if (isDir) enqueue(rel);
+          if (seen.has(key) || (isDir && directoryCount >= maxDirectories)) continue;
+          const associated = byPath.get(key) || [];
+          if (!terms.every(term => key.includes(term) || associated.some(p => matches(term, [...productFields(p), p.variantSku, p.color])))) continue;
+          seen.add(key);
+          if (isDir) directoryCount++;
+          candidates.push({ rel, isDir, associated });
+          if (results.length + directories.length + candidates.length >= maxResults) break;
+        }
+        if (results.length + directories.length + candidates.length >= maxResults) break;
+      }
+      for (let i = 0; i < candidates.length; i += concurrency) {
+        if (res.destroyed) return;
+        const rows = await Promise.all(candidates.slice(i, i + concurrency).map(c => itemFor(c.rel, c.isDir, c.associated)));
+        const batch = [];
+        for (const row of rows) {
+          if (!row) continue;
+          if (row.isDir) directories.push(row);
+          else batch.push(row);
+        }
+        publish(batch);
+      }
     }
-  }
-
-  try {
-    walkDir(ASSETS_ROOT, '');
-    const seen = new Set<string>();
-    const merged = [...productRootDirs, ...filesList, ...dirsList].filter(item => {
-      const key = `${item.isDir ? 'dir' : 'file'}:${pathLower(item.path)}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    res.json(merged);
+    if (res.destroyed) return;
+    publish(directories);
+    if (streaming) res.end();
+    else res.json(results);
   } catch (err) {
-    res.status(500).json({ error: '搜索失败' });
+    if (res.destroyed) return;
+    if (res.headersSent) res.destroy();
+    else res.status(500).json({ error: '搜索失败' });
   }
 });
 
-// 智能缩略图生成（支持 jpg/png/webp/gif、PSD、PDF）
+// 智能缩略图生成（支持 jpg/png/webp/gif、PSD、PDF、视频）
 app.get('/api/thumbnail', async (req: any, res) => {
   let filePath = (req.query.path as string) || '';
   if (!filePath.trim()) return res.status(400).send('Path required');
   // 统一为相对路径：去掉首部斜杠/反斜杠，避免 path.join 在 Windows 上产生错误路径
   filePath = filePath.replace(/^[/\\]+/, '').replace(/\\/g, '/');
-  
+
   const fullPath = path.join(ASSETS_ROOT, filePath);
   const assetsResolved = path.resolve(ASSETS_ROOT);
   const fullResolved = path.resolve(fullPath);
 
-  if (!fs.existsSync(fullPath) || !fullResolved.startsWith(assetsResolved)) {
+  const relative = path.relative(assetsResolved, fullResolved);
+  if (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+    return res.status(404).send('Not Found');
+  }
+  const sourceStat = await fs.promises.stat(fullPath).catch(() => null);
+  if (!sourceStat?.isFile()) {
+    console.warn(`[Thumbnail] File not found or invalid path: ${filePath} -> ${fullPath}`);
     return res.status(404).send('Not Found');
   }
 
@@ -2395,34 +3120,33 @@ app.get('/api/thumbnail', async (req: any, res) => {
     // 普通图片：sharp，按最长边缩放（不裁剪），保持原始比例
     if (['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext)) {
       const relNorm = filePath.replace(/\\/g, '/');
-      const fresh = readCachedThumbIfFresh(relNorm, fullPath);
+      const fresh = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
       if (fresh) {
         res.set('Content-Type', 'image/webp');
         res.set('Cache-Control', 'private, max-age=86400');
         return res.send(fresh);
       }
 
-      const sourceStat = fs.statSync(fullPath);
       if (sourceStat.size > NORMAL_IMAGE_THUMB_MAX_BYTES) {
         return res.status(413).send('Image too large for thumbnail');
       }
 
       const startedAt = Date.now();
-      const buffer = await getOrCreateHeavyThumb(relNorm, async () => {
-        const cached = readCachedThumbIfFresh(relNorm, fullPath);
+      const buffer = await getOrCreateThumb(relNorm, async () => {
+        const cached = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
         if (cached) return cached;
         const generated = await sharp(fullPath, { failOn: 'none' })
           .rotate()
           .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
           .webp({ quality: 80 })
           .toBuffer();
-        try { fs.writeFileSync(getThumbPath(relNorm), generated); } catch (_) {}
+        await cacheThumbnail(relNorm, generated);
         const elapsed = Date.now() - startedAt;
         if (elapsed > 2000) {
           console.warn(`Slow thumbnail generated in ${elapsed}ms: ${relNorm} (${sourceStat.size} bytes)`);
         }
         return generated;
-      });
+      }, imageQueue);
       res.set('Content-Type', 'image/webp');
       res.set('Cache-Control', 'private, max-age=86400');
       return res.send(buffer);
@@ -2432,13 +3156,13 @@ app.get('/api/thumbnail', async (req: any, res) => {
     if (ext === '.psd') {
       try {
         const relNorm = filePath.replace(/\\/g, '/');
-        const fresh = readCachedThumbIfFresh(relNorm, fullPath);
+        const fresh = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
         if (fresh) {
           res.set('Content-Type', 'image/webp');
           return res.send(fresh);
         }
-        const buffer = await getOrCreateHeavyThumb(relNorm, async () => {
-          const cached = readCachedThumbIfFresh(relNorm, fullPath);
+        const buffer = await getOrCreateThumb(relNorm, async () => {
+          const cached = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
           if (cached) return cached;
         // 兼容旧目录
         const oldThumbPath = path.join(PSD_THUMB_DIR, encodeURIComponent(relNorm) + '.webp');
@@ -2464,7 +3188,7 @@ app.get('/api/thumbnail', async (req: any, res) => {
           .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
           .webp({ quality: 80 })
           .toBuffer();
-        try { fs.writeFileSync(getThumbPath(relNorm), buffer); } catch (_) {}
+        await cacheThumbnail(relNorm, buffer);
           return buffer;
         });
         res.set('Content-Type', 'image/webp');
@@ -2479,52 +3203,24 @@ app.get('/api/thumbnail', async (req: any, res) => {
     if (ext === '.pdf') {
       try {
         const relNorm = filePath.replace(/\\/g, '/');
-        const fresh = readCachedThumbIfFresh(relNorm, fullPath);
+        const fresh = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
         if (fresh) {
           res.set('Content-Type', 'image/webp');
           return res.send(fresh);
         }
-        const buffer = await getOrCreateHeavyThumb(relNorm, async () => {
-          const cached = readCachedThumbIfFresh(relNorm, fullPath);
+        console.log(`[PDF Thumbnail] Generating for: ${relNorm}`);
+        const buffer = await getOrCreateThumb(relNorm, async () => {
+          const cached = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
           if (cached) return cached;
-          const canvasMod = await import('canvas');
-          const C = (canvasMod as any).default ?? canvasMod;
-          const createCanvas = C.createCanvas;
-          const prevImage = (global as any).Image;
-          const prevHTMLCanvasElement = (global as any).HTMLCanvasElement;
-          try {
-            if (C.Image) (global as any).Image = C.Image;
-            if (C.Canvas) (global as any).HTMLCanvasElement = C.Canvas;
-            const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-            const pdfData = new Uint8Array(fs.readFileSync(fullPath));
-            const doc = await pdfjs.getDocument({ data: pdfData }).promise;
-            const page = await doc.getPage(1);
-            const scale = 300 / page.getViewport({ scale: 1 }).width;
-            const viewport = page.getViewport({ scale });
-            const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
-            const ctx = canvas.getContext('2d');
-            await page.render({
-              canvasContext: ctx as any,
-              viewport,
-            }).promise;
-            const pngBuf = canvas.toBuffer('image/png');
-            const buffer = await sharp(pngBuf)
-              .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
-              .webp({ quality: 80 })
-              .toBuffer();
-            try { fs.writeFileSync(getThumbPath(relNorm), buffer); } catch (_) {}
-            return buffer;
-          } finally {
-            if (prevImage !== undefined) (global as any).Image = prevImage;
-            else delete (global as any).Image;
-            if (prevHTMLCanvasElement !== undefined) (global as any).HTMLCanvasElement = prevHTMLCanvasElement;
-            else delete (global as any).HTMLCanvasElement;
-          }
+          const buffer = await renderPdfLikeFirstPageToWebp(fullPath);
+          await cacheThumbnail(relNorm, buffer);
+          console.log(`[PDF Thumbnail] Success: ${relNorm}`);
+          return buffer;
         });
         res.set('Content-Type', 'image/webp');
         return res.send(buffer);
       } catch (e) {
-        console.warn('PDF thumbnail failed:', e);
+        console.error('[PDF Thumbnail] Error:', e);
         return res.status(400).send('PDF thumbnail not available');
       }
     }
@@ -2532,65 +3228,61 @@ app.get('/api/thumbnail', async (req: any, res) => {
     // AI：优先按 PDF 渲染生成缩略图（很多 AI 实际是 PDF 兼容），失败则回退占位图；结果缓存到勿动/thumbs
     if (ext === '.ai') {
       const relNorm = filePath.replace(/\\/g, '/');
-      const fresh = readCachedThumbIfFresh(relNorm, fullPath);
+      const fresh = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
       if (fresh) {
-        res.set('Content-Type', 'image/webp');
-        return res.send(fresh);
+        if (!(await isLikelyAiPlaceholder(fresh))) {
+          res.set('Content-Type', 'image/webp');
+          return res.send(fresh);
+        }
+        try { fs.unlinkSync(getThumbPath(relNorm)); } catch (_) {}
       }
       try {
-        const buffer = await getOrCreateHeavyThumb(relNorm, async () => {
-          const cached = readCachedThumbIfFresh(relNorm, fullPath);
-          if (cached) return cached;
-          const canvasMod = await import('canvas');
-          const C = (canvasMod as any).default ?? canvasMod;
-          const createCanvas = C.createCanvas;
-          const prevImage = (global as any).Image;
-          const prevHTMLCanvasElement = (global as any).HTMLCanvasElement;
-          try {
-            if (C.Image) (global as any).Image = C.Image;
-            if (C.Canvas) (global as any).HTMLCanvasElement = C.Canvas;
-            const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-            const aiData = new Uint8Array(fs.readFileSync(fullPath));
-            const doc = await pdfjs.getDocument({ data: aiData }).promise;
-            const page = await doc.getPage(1);
-            const scale = 300 / page.getViewport({ scale: 1 }).width;
-            const viewport = page.getViewport({ scale });
-            const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
-            const ctx = canvas.getContext('2d');
-            await page.render({
-              canvasContext: ctx as any,
-              viewport,
-            }).promise;
-            const pngBuf = canvas.toBuffer('image/png');
-            const buffer = await sharp(pngBuf)
-              .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
-              .webp({ quality: 80 })
-              .toBuffer();
-            try { fs.writeFileSync(getThumbPath(relNorm), buffer); } catch (_) {}
-            return buffer;
-          } finally {
-            if (prevImage !== undefined) (global as any).Image = prevImage;
-            else delete (global as any).Image;
-            if (prevHTMLCanvasElement !== undefined) (global as any).HTMLCanvasElement = prevHTMLCanvasElement;
-            else delete (global as any).HTMLCanvasElement;
-          }
+        const buffer = await getOrCreateThumb(relNorm, async () => {
+          const cached = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
+          if (cached && !(await isLikelyAiPlaceholder(cached))) return cached;
+          const buffer = await renderPdfLikeFirstPageToWebp(fullPath);
+          await cacheThumbnail(relNorm, buffer);
+          return buffer;
         });
         res.set('Content-Type', 'image/webp');
         return res.send(buffer);
       } catch (e) {
         // 回退：占位图（依然缓存，避免每次都重试解析）
-        const placeholder = await getOrCreateHeavyThumb(relNorm, async () => {
-          const cached = readCachedThumbIfFresh(relNorm, fullPath);
+        console.warn('AI thumbnail failed:', e);
+        return res.status(400).send('AI thumbnail not available');
+      }
+    }
+
+    // 视频：用 ffmpeg 抽取首帧（约 1 秒处，避免黑屏首帧）生成缩略图，缓存到勿动/thumbs
+    if (VIDEO_THUMB_EXTS.includes(ext)) {
+      const relNorm = filePath.replace(/\\/g, '/');
+      const fresh = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
+      if (fresh) {
+        res.set('Content-Type', 'image/webp');
+        res.set('Cache-Control', 'private, max-age=86400');
+        return res.send(fresh);
+      }
+      try {
+        const buffer = await getOrCreateThumb(relNorm, async () => {
+          const cached = await readCachedThumbIfFresh(relNorm, sourceStat.mtimeMs);
           if (cached) return cached;
-          return sharp({
-            create: { width: 300, height: 300, channels: 3, background: { r: 249, g: 115, b: 22 } },
-          })
+          // 先尝试 1 秒处抽帧，失败再退回到第 0 帧（短视频可能不足 1 秒）
+          let frame = await extractVideoFrame(fullPath, 1);
+          if (!frame) frame = await extractVideoFrame(fullPath, 0);
+          if (!frame) throw new Error('ffmpeg frame extraction failed');
+          const generated = await sharp(frame)
+            .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
             .webp({ quality: 80 })
             .toBuffer();
+          await cacheThumbnail(relNorm, generated);
+          return generated;
         });
-        try { fs.writeFileSync(getThumbPath(relNorm), placeholder); } catch (_) {}
         res.set('Content-Type', 'image/webp');
-        return res.send(placeholder);
+        res.set('Cache-Control', 'private, max-age=86400');
+        return res.send(buffer);
+      } catch (e) {
+        console.warn('Video thumbnail failed:', e);
+        return res.status(400).send('Video thumbnail not available');
       }
     }
 
@@ -2602,9 +3294,19 @@ app.get('/api/thumbnail', async (req: any, res) => {
 });
 
 // 大文件流式下载（inline=1 时用于预览，不强制下载）；路径规范与 thumbnail 一致
+app.post('/api/files/download-access', authenticate, (req: any, res) => {
+  const paths = req.body?.paths;
+  const perms = getReqPermissions(req);
+  if (!Array.isArray(paths) || !paths.length || !paths.every(p => p && allowedAsset(perms, 'canDownload', p, false, true))) {
+    return res.status(403).json({ error: '没有所选项目的下载权限' });
+  }
+  res.sendStatus(204);
+});
+
 app.get('/api/download', authenticate, (req: any, res: any) => {
   let filePath = (req.query.path as string) || '';
   filePath = filePath.replace(/^[/\\]+/, '').replace(/\\/g, '/');
+  if (!allowedAsset(getReqPermissions(req), 'canDownload', filePath, false, true)) return res.status(403).json({ error: '没有此目录的下载权限' });
   const inline = req.query.inline === '1' || req.query.inline === 'true';
   const fullPath = path.join(ASSETS_ROOT, filePath);
   const assetsResolved = path.resolve(ASSETS_ROOT);
@@ -2660,6 +3362,9 @@ app.get('/api/download-zip', authenticate, (req: any, res: any) => {
   }
 
   const assetsResolved = path.resolve(ASSETS_ROOT);
+  if (paths.length !== list.length || !paths.every(rel => allowedAsset(perms, 'canDownload', rel))) {
+    return res.status(403).json({ error: '包含无下载权限的项目' });
+  }
   const stamp = new Date();
   const ts = [
     stamp.getFullYear(),
@@ -2753,8 +3458,11 @@ app.post('/api/upload', authenticate, (req: any, res: any, next: any) => {
   });
 }, (req: any, res) => {
   const perms = getReqPermissions(req);
+  const stagedFiles = (req.files || []) as Express.Multer.File[];
+  res.once('finish', () => {
+    for (const file of stagedFiles) fs.promises.unlink(file.path).catch(() => {});
+  });
   if (!perms.canUpload) return res.status(403).json({ error: '无权操作' });
-  
   try {
     let targetDir = (req.body.path || '').replace(/\\/g, '/');
     const conflictStrategyRaw = String(req.body.conflictStrategy || '').trim().toLowerCase();
@@ -2765,7 +3473,33 @@ app.post('/api/upload', authenticate, (req: any, res: any, next: any) => {
     const files = (req.files as Express.Multer.File[]) || [];
     if (!files.length) return res.status(400).json({ error: '未收到文件' });
     
+    const workflow = req.body.newDevProject;
+    const workflowId = workflow === 'draft' ? null : Number(workflow);
+    if (workflow && workflow !== 'draft') {
+      const project = db.prepare('SELECT * FROM newdev_projects WHERE id = ?').get(workflowId) as any;
+      if (!project || project.completed_at || !canSupplementNewDevStep(req, project.current_step_key, project)) {
+        return res.status(403).json({ error: '当前无法上传流程附件' });
+      }
+      const root = parseProjectData(project).productFolderPath || `新品开发/${safeTemplateName(project.title)}`;
+      if (!targetDir.startsWith(root + '/')) return res.status(409).json({ error: '产品目录已变更，请刷新后重试' });
+      targetDir = generatedFolderPath(targetDir.slice(root.length + 1).split('/'), root);
+    }
+    if (workflow === 'draft') {
+      const existing = req.body.draftSku && db.prepare('SELECT p.*, b.name AS brand_name FROM products p LEFT JOIN brands b ON b.id = p.brand_id WHERE p.sku = ?').get(req.body.draftSku);
+      targetDir = existing
+        ? generatedFolderPath(['检测报告'], relAssetPath(productRootForRow(existing)))
+        : generatedFolderPath(targetDir.split('/'));
+    }
+    if (!workflow && targetDir && !fs.existsSync(path.join(ASSETS_ROOT, targetDir))) {
+      const parts = targetDir.split('/');
+      if (parts.every(validAssetSegment)) {
+        const relocated = generatedFolderPath(parts);
+        if (relocated !== targetDir && fs.existsSync(path.join(ASSETS_ROOT, relocated))) targetDir = relocated;
+      }
+    }
+    if (workflow && conflictStrategy === 'overwrite') return res.status(400).json({ error: '流程附件必须单独保存' });
     const assetsResolved = path.resolve(ASSETS_ROOT);
+    if (!allowedAsset(perms, 'canUpload', targetDir, false, true)) return res.status(403).json({ error: '没有此目录的上传权限' });
     const uploadedFiles: { name: string; path: string }[] = [];
     const conflictedFiles: { name: string; path: string }[] = [];
 
@@ -2782,6 +3516,7 @@ app.post('/api/upload', authenticate, (req: any, res: any, next: any) => {
       }
     };
 
+    const destinations = [];
     for (const file of files) {
       // 统一处理中文文件名编码：部分环境下 originalname 会按 latin1 解码，这里转回 UTF-8
       let originalName = (file.originalname || '').replace(/\\/g, '/');
@@ -2795,10 +3530,15 @@ app.post('/api/upload', authenticate, (req: any, res: any, next: any) => {
       if (relParts.some((p: string) => p === '..')) return res.status(400).json({ error: '路径非法' });
       const safeRel = relParts.join(path.sep);
       const desiredPath = path.join(ASSETS_ROOT, targetDir, safeRel);
-      if (!path.resolve(desiredPath).startsWith(assetsResolved)) {
+      if (!relParts.length || !relParts.every(validAssetSegment) ||
+          !safeAssetPath(ASSETS_ROOT, path.relative(ASSETS_ROOT, desiredPath), true) ||
+          !path.resolve(desiredPath).startsWith(assetsResolved)) {
         return res.status(400).json({ error: '路径非法' });
       }
 
+      destinations.push({ file, desiredPath, safeRel });
+    }
+    for (const { file, desiredPath, safeRel } of destinations) {
       if (conflictStrategyRaw === 'ask' && fs.existsSync(desiredPath)) {
         conflictedFiles.push({
           name: path.basename(desiredPath),
@@ -2822,6 +3562,13 @@ app.post('/api/upload', authenticate, (req: any, res: any, next: any) => {
         } else {
           throw e;
         }
+      }
+      if (workflow) {
+        const rel = path.relative(ASSETS_ROOT, finalPath).split(path.sep).join('/');
+        const stamp = uploadStamp(rel);
+        if (!stamp) throw new Error('流程附件路径无效');
+        db.prepare('INSERT OR REPLACE INTO newdev_uploads(file_path, project_id, uploader, file_stamp) VALUES (?, ?, ?, ?)')
+          .run(rel, workflowId, req.user.username, stamp);
       }
       uploadedFiles.push({
         name: path.basename(finalPath),
@@ -2875,20 +3622,7 @@ function sleepMs(ms: number): void {
   while (Date.now() < deadline) { /* spin */ }
 }
 
-function winDelete(targetPath: string, isDir: boolean): boolean {
-  if (os.platform() !== 'win32') return false;
-  try {
-    spawnSync('cmd.exe', ['/c', 'attrib', '-r', '-h', '-s', targetPath], { windowsHide: true, timeout: 5000 });
-    const args = isDir ? ['/c', 'rmdir', '/s', '/q', targetPath] : ['/c', 'del', '/f', '/q', targetPath];
-    const r = spawnSync('cmd.exe', args, { windowsHide: true, timeout: isDir ? 30000 : 10000, encoding: 'utf8' });
-    return r.status === 0;
-  } catch (_) {
-    return false;
-  }
-}
-
 function safeUnlinkOrRmdir(targetPath: string, isDir: boolean, retries = 8): void {
-  if (os.platform() === 'win32' && winDelete(targetPath, isDir)) return;
   let lastErr: NodeJS.ErrnoException | null = null;
   for (let i = 0; i < retries; i++) {
     try {
@@ -2905,32 +3639,89 @@ function safeUnlinkOrRmdir(targetPath: string, isDir: boolean, retries = 8): voi
       }
     }
   }
-  if (os.platform() === 'win32' && winDelete(targetPath, isDir)) return;
   if (lastErr) throw lastErr;
 }
 
 function safeRmSyncRecursive(targetPath: string): void {
-  const stat = fs.statSync(targetPath);
-  if (!stat.isDirectory()) {
-    safeUnlinkOrRmdir(targetPath, false);
-    return;
-  }
-  let names: string[] = [];
-  try {
-    names = fs.readdirSync(targetPath);
-  } catch (e: any) {
-    try { fs.rmSync(targetPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }); } catch (e2: any) {
-      if (e2?.code === 'EPERM') throw Object.assign(new Error('删除失败：文件或文件夹可能被占用，请关闭可能使用该文件的程序（如预览、杀毒）后重试'), { code: 'EPERM' });
-      throw e2;
-    }
-    return;
-  }
-  for (const name of names) {
-    const childPath = path.join(targetPath, name);
-    safeRmSyncRecursive(childPath);
-  }
-  safeUnlinkOrRmdir(targetPath, true);
+  fs.rmSync(targetPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
 }
+
+function deleteThumbsUnderPrefix(relPath: string): void {
+  const normalized = relPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  const relPrefix = normalized + '/';
+  const nested = longThumbPath(normalized);
+  if (fs.existsSync(nested)) safeRmSyncRecursive(nested);
+  deleteThumbForPath(normalized);
+  for (const dir of [THUMB_CACHE_DIR, PSD_THUMB_DIR]) {
+    if (!fs.existsSync(dir)) continue;
+    const files = fs.readdirSync(dir);
+    files.forEach((name) => {
+      try {
+        const decoded = decodeURIComponent(name.replace(/\.webp$/i, ''));
+        if (decoded === normalized || decoded.startsWith(relPrefix)) {
+          safeUnlinkOrRmdir(path.join(dir, name), false);
+        }
+      } catch (_) {}
+    });
+  }
+}
+
+app.get('/api/files/folder-info', authenticate, (req: any, res) => {
+  const folderPath = (req.query.path as string)?.replace(/\\/g, '/').replace(/^[/\\]+/, '') || '';
+  if (!folderPath || folderPath.includes('..')) return res.status(400).json({ error: '路径非法' });
+
+  const assetsResolved = path.resolve(ASSETS_ROOT);
+  const fullPath = path.resolve(ASSETS_ROOT, folderPath);
+  if (!fullPath.startsWith(assetsResolved) || fullPath === assetsResolved) return res.status(400).json({ error: '路径非法' });
+  if (!fs.existsSync(fullPath)) return res.status(404).json({ error: '文件夹不存在' });
+  if (!fs.statSync(fullPath).isDirectory()) return res.status(400).json({ error: '不是文件夹' });
+
+  try {
+    const entries = fs.readdirSync(fullPath);
+    res.json({
+      path: folderPath,
+      isEmpty: entries.length === 0,
+      itemCount: entries.length,
+      childPaths: entries.map(name => path.join(folderPath, name).replace(/\\/g, '/')),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || '读取文件夹失败' });
+  }
+});
+
+app.post('/api/files/rename', authenticate, (req: any, res) => {
+  const perms = getReqPermissions(req);
+  if (!perms.canRename) return res.status(403).json({ error: '无权操作' });
+
+  const filePath = String(req.body?.path || '').replace(/\\/g, '/').replace(/^[/\\]+/, '').trim();
+  const newName = String(req.body?.newName || '').trim();
+  if (!filePath || filePath.includes('..')) return res.status(400).json({ error: '路径非法' });
+  if (!validAssetSegment(newName)) return res.status(400).json({ error: '名称无效' });
+  if (/[<>:"/\\|?*\x00-\x1f]/.test(newName) || newName === '.' || newName === '..') {
+    return res.status(400).json({ error: '名称包含非法字符' });
+  }
+
+  if (!allowedAsset(perms, 'canRename', filePath, true)) return res.status(403).json({ error: '没有此目录的重命名权限' });
+  const assetsResolved = path.resolve(ASSETS_ROOT);
+  const srcFull = path.resolve(ASSETS_ROOT, filePath);
+  if (!srcFull.startsWith(assetsResolved) || srcFull === assetsResolved) return res.status(400).json({ error: '路径非法' });
+  if (!fs.existsSync(srcFull)) return res.status(404).json({ error: '文件或文件夹不存在' });
+
+  const parentRel = path.dirname(filePath).replace(/\\/g, '/');
+  const normalizedParent = parentRel === '.' ? '' : parentRel;
+  const destRel = path.join(normalizedParent, newName).replace(/\\/g, '/');
+  const destFull = path.resolve(ASSETS_ROOT, destRel);
+  if (!destFull.startsWith(assetsResolved)) return res.status(400).json({ error: '新路径非法' });
+  if (destFull === srcFull) return res.json({ success: true, path: destRel, name: newName });
+  if (fs.existsSync(destFull) && !(process.platform === 'win32' && srcFull.toLowerCase() === destFull.toLowerCase())) return res.status(409).json({ error: '同级目录已存在同名项目' });
+
+  try {
+    renameAsset(srcFull, destFull, true);
+    res.json({ success: true, path: destRel, name: newName });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || '重命名失败' });
+  }
+});
 
 app.delete('/api/files', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
@@ -2940,6 +3731,7 @@ app.delete('/api/files', authenticate, (req: any, res) => {
   if (!filePath || filePath.includes('..')) {
     return res.status(400).json({ error: '路径非法' });
   }
+  if (!allowedAsset(perms, 'canDelete', filePath, true)) return res.status(403).json({ error: '没有此目录的删除权限' });
   const fullPath = path.resolve(ASSETS_ROOT, filePath);
   const assetsResolved = path.resolve(ASSETS_ROOT);
   if (!fullPath.startsWith(assetsResolved) || fullPath === assetsResolved) {
@@ -2951,36 +3743,21 @@ app.delete('/api/files', authenticate, (req: any, res) => {
       return res.status(404).json({ error: '文件不存在' });
     }
     if (fs.statSync(fullPath).isDirectory()) {
-      db.prepare("DELETE FROM file_tags WHERE file_path LIKE ?").run(`${filePath.replace(/%/g, '\\%')}/%`);
+      if (req.query.emptyOnly === '1' && fs.readdirSync(fullPath).length > 0) {
+        return res.status(409).json({ error: '文件夹仍有内容，不能删除空文件夹' });
+      }
       safeRmSyncRecursive(fullPath);
-      // 删除该目录下所有 PSD/PDF/AI 缩略图缓存（勿动/thumbs + 兼容旧 psd_thumbs）
-      try {
-        const relPrefix = filePath.replace(/\\/g, '/').replace(/\/+$/, '') + '/';
-        for (const dir of [THUMB_CACHE_DIR, PSD_THUMB_DIR]) {
-          if (!fs.existsSync(dir)) continue;
-          const files = fs.readdirSync(dir);
-          files.forEach((name) => {
-            try {
-              const decoded = decodeURIComponent(name.replace(/\.webp$/i, ''));
-              if (decoded.startsWith(relPrefix)) {
-                safeUnlinkOrRmdir(path.join(dir, name), false);
-              }
-            } catch (_) {}
-          });
-        }
-      } catch (_) {}
+      deleteTagPathPrefix(filePath);
     } else {
       db.prepare("DELETE FROM file_tags WHERE file_path = ?").run(filePath);
       safeUnlinkOrRmdir(fullPath, false);
       const ext = path.extname(fullPath).toLowerCase();
-      if (ext === '.psd' || ext === '.pdf' || ext === '.ai') {
-        deleteThumbForPath(filePath.replace(/\\/g, '/'));
-        if (ext === '.psd') {
-          try {
-            const thumbPath = path.join(PSD_THUMB_DIR, encodeURIComponent(filePath.replace(/\\/g, '/')) + '.webp');
-            if (fs.existsSync(thumbPath)) safeUnlinkOrRmdir(thumbPath, false);
-          } catch (_) {}
-        }
+      deleteThumbForPath(filePath);
+      if (ext === '.psd') {
+        try {
+          const oldThumb = path.join(PSD_THUMB_DIR, encodeURIComponent(filePath) + '.webp');
+          if (fs.existsSync(oldThumb)) safeUnlinkOrRmdir(oldThumb, false);
+        } catch (_) {}
       }
     }
     res.json({ success: true });
@@ -2996,7 +3773,7 @@ app.delete('/api/files', authenticate, (req: any, res) => {
 // 批量移动文件/文件夹到指定目录
 app.post('/api/files/move', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
-  if (!perms.canUpload) return res.status(403).json({ error: '无权操作' });
+  if (!perms.canMove) return res.status(403).json({ error: '无权操作' });
 
   const { paths, destination } = req.body as { paths: string[]; destination: string };
   if (!Array.isArray(paths) || !paths.length) {
@@ -3005,6 +3782,9 @@ app.post('/api/files/move', authenticate, (req: any, res) => {
   const dest = (destination ?? '').replace(/\\/g, '/').replace(/^[/\\]+/, '');
   if (dest.includes('..')) return res.status(400).json({ error: '目标路径非法' });
 
+  if (!allowedAsset(perms, 'canMove', dest) || !paths.every(rel => allowedAsset(perms, 'canMove', rel, true))) {
+    return res.status(403).json({ error: '来源和目标必须都在移动权限范围内' });
+  }
   const assetsResolved = path.resolve(ASSETS_ROOT);
   const destFull = path.resolve(ASSETS_ROOT, dest);
   if (!destFull.startsWith(assetsResolved)) {
@@ -3086,27 +3866,37 @@ app.post('/api/files/move', authenticate, (req: any, res) => {
   res.json({ success: true, results });
 });
 
+function validAssetSegment(value: string) {
+  return !!value && !/[<>:"/\\|?*\x00-\x1f]|[. ]$/.test(value) &&
+    !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(value);
+}
+
+// Resolve the existing parent too, so directory junctions cannot reach private or external files.
+function visibleAssetPath(fullPath: string) {
+  const root = fs.realpathSync(ASSETS_ROOT);
+  const relative = path.relative(root, path.join(fs.realpathSync(path.dirname(fullPath)), path.basename(fullPath)));
+  return relative.split(path.sep).every(validAssetSegment) && !path.isAbsolute(relative) &&
+    relative.split(path.sep)[0].toLowerCase() !== APP_DATA_FOLDER_NAME.toLowerCase();
+}
+
 // 创建文件夹（是否允许由 users.json 控制）
 app.post('/api/mkdir', authenticate, (req: any, res) => {
   const perms = getReqPermissions(req);
-  if (!perms.canUpload) return res.status(403).json({ error: '无权操作' });
-  
-  const { path: targetPath, name } = req.body;
-  if (!name) return res.status(400).json({ error: '文件夹名称不能为空' });
-  
-  const fullPath = path.join(ASSETS_ROOT, targetPath, name);
-  
-  if (!fullPath.startsWith(ASSETS_ROOT)) {
-    return res.status(403).json({ error: '越权访问' });
+  if (perms.canCreateFolder !== true) return res.status(403).json({ error: '无权新建文件夹' });
+  const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
+  const parent = req.body.path ?? '';
+  if (!validAssetSegment(name) || typeof parent !== 'string' ||
+      (parent && !parent.split(/[\\/]/).every(validAssetSegment))) {
+    return res.status(400).json({ error: '文件夹名称或路径无效' });
   }
-
+  if (!allowedAsset(perms, 'canCreateFolder', parent)) return res.status(403).json({ error: '没有此目录的新建文件夹权限' });
   try {
-    if (fs.existsSync(fullPath)) {
-      return res.status(400).json({ error: '文件夹已存在' });
-    }
-    fs.mkdirSync(fullPath, { recursive: true });
+    const fullPath = path.join(ASSETS_ROOT, parent, name);
+    if (!visibleAssetPath(fullPath)) return res.status(403).json({ error: '目录不可用' });
+    fs.mkdirSync(fullPath);
     res.json({ success: true });
-  } catch (err) {
+  } catch (err: any) {
+    if (err.code === 'EEXIST') return res.status(409).json({ error: '同名文件或文件夹已存在' });
     res.status(500).json({ error: '创建文件夹失败' });
   }
 });
@@ -3114,6 +3904,7 @@ app.post('/api/mkdir', authenticate, (req: any, res) => {
 // --- Vite 整合 ---
 export async function startServer(): Promise<number> {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
@@ -3159,7 +3950,6 @@ export async function startServer(): Promise<number> {
   }
 
   const listenPorts = [basePort];
-  if (basePort !== LEGACY_PORT) listenPorts.push(LEGACY_PORT);
   const startedPorts = await Promise.allSettled(listenPorts.map((port, index) => tryListen(port, index === 0)));
   const okPorts = startedPorts.filter((r): r is PromiseFulfilledResult<number> => r.status === 'fulfilled');
   if (!okPorts.length) {
@@ -3169,6 +3959,11 @@ export async function startServer(): Promise<number> {
 }
 
 // 仅在被直接运行（如 tsx server.ts）时自动启动，被 Electron 引用时不自动启动
+if (process.env.PRODUCT_FOLDER_SYNC_JOB) {
+  runProductFolderSyncJob(process.env.PRODUCT_FOLDER_SYNC_JOB);
+  process.exit(0);
+}
+
 const isRunDirectly = process.argv.some(
   (arg) => typeof arg === 'string' && (arg.includes('server') || arg.includes('run-server'))
 );

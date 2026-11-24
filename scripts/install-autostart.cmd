@@ -32,7 +32,7 @@ echo.
 
 echo [1/2] Allowing Windows Firewall port 43123...
 netsh advfirewall firewall add rule name="ShangpinCloudAssets-43123" dir=in action=allow protocol=TCP localport=43123 >nul 2>&1
-netsh advfirewall firewall add rule name="ShangpinCloudAssets-3000" dir=in action=allow protocol=TCP localport=3000 >nul 2>&1
+netsh advfirewall firewall delete rule name="ShangpinCloudAssets-3000" >nul 2>&1
 if errorlevel 1 (
   echo.
   echo ERROR: Firewall setup failed.
@@ -40,7 +40,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-echo Done. Ports 43123 and 3000 are now allowed for LAN access.
+echo Done. Port 43123 is now allowed for LAN access. Legacy port 3000 is not opened.
 
 echo.
 echo [2/2] Installing startup task...

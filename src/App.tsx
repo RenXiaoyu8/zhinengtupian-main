@@ -37,12 +37,19 @@ import {
   EyeOff,
   Move,
   FolderOpen,
-  Megaphone
+  Megaphone,
+  Film,
+  Pencil
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { FileItem, User, Product, Brand, UserPermissions } from './types';
-import UserManagementModal from './UserManagementModal';
+import CreateFolderField from './CreateFolderField';
+const UserManagementModal = lazy(() => import('./UserManagementModal'));
+import RegistrationForm from './login/RegistrationForm';
+import { LoginCloud } from './login/LoginCloud';
 const appLogo = new URL('../尚品易站云资产logo-01.svg', import.meta.url).href;
+
+import { allowsFolder } from '../user-manager/asset-scopes.mjs';
 
 const API_BASE = '/api';
 const NewDevelopmentSystem = lazy(() => import('./NewDevelopmentSystem'));
@@ -54,6 +61,26 @@ const pathJoin = (...parts: string[]) => {
 type FolderNode = { name: string; children: FolderNode[] };
 type AppNotification = { id: number; title: string; message: string; project_id?: number; kind: string; created_at: string; productFolderPath?: string };
 type NotifyUser = { username: string; role: string };
+type TemplateFolderOperation =
+  | { type: 'rename'; fromSegments: string[]; toName: string }
+  | { type: 'delete'; fromSegments: string[] }
+  | { type: 'move'; fromSegments: string[]; toSegments: string[] };
+
+type ProductFolderSyncOptions = {
+  deleteStrategy?: 'delete' | 'move' | 'keep';
+  moveTargetSegments?: string[];
+};
+
+type ProductFolderDeletePreview = {
+  nonEmptyDeletes: Array<{
+    productId: number;
+    productName: string;
+    path: string;
+    itemCount: number;
+  }>;
+  nonEmptyDeleteCount: number;
+};
+
 type DownloadToast = {
   id: number;
   filename: string;
@@ -76,7 +103,7 @@ const cloneFolderTree = (nodes: FolderNode[] | undefined | null): FolderNode[] =
 // 产品文件夹树：支持任意层级
 type ProductFolderNode = { name: string; children: ProductFolderNode[] };
 const INITIAL_PRODUCT_FOLDERS: ProductFolderNode[] = [
-  { name: '产品图片', children: [{ name: '原图', children: [] }, { name: '主图', children: [] }, { name: '详情页', children: [] }] },
+  { name: '产品图片', children: [{ name: '原图', children: [] }, { name: '主图', children: [] }, { name: '详情页', children: [] }, { name: 'SKU', children: [] }] },
   { name: '视频', children: [] },
   { name: '检测报告', children: [] },
 ];
@@ -108,6 +135,64 @@ function addProductChildAtPath(roots: ProductFolderNode[], path: number[], child
   const [i, ...rest] = path;
   return roots.map((n, idx) => idx === i ? { ...n, children: addProductChildAtPath(n.children || [], rest, child) } : n);
 }
+const productFolderPathKey = (path: number[]) => path.join('/');
+const productFolderPathFromKey = (key: string) => key === '' ? [] : key.split('/').map(Number).filter(n => Number.isFinite(n));
+const isSameProductPath = (a: number[], b: number[]) => a.length === b.length && a.every((v, i) => v === b[i]);
+const isProductPathInside = (path: number[], parent: number[]) => path.length > parent.length && parent.every((v, i) => path[i] === v);
+const compactProductFolderPaths = (paths: number[][]) =>
+  paths.filter(path => !paths.some(other => isProductPathInside(path, other)));
+function flattenProductFolderPaths(nodes: ProductFolderNode[], base: number[] = [], labels: string[] = []): { path: number[]; key: string; name: string; label: string; segments: string[] }[] {
+  return nodes.flatMap((node, index) => {
+    const path = [...base, index];
+    const nextLabels = [...labels, node.name];
+    return [
+      { path, key: productFolderPathKey(path), name: node.name, label: nextLabels.join(' / '), segments: nextLabels },
+      ...flattenProductFolderPaths(node.children || [], path, nextLabels),
+    ];
+  });
+}
+function collectProductNodesAtPaths(nodes: ProductFolderNode[], keys: Set<string>, base: number[] = []): ProductFolderNode[] {
+  return nodes.flatMap((node, index) => {
+    const path = [...base, index];
+    const own = keys.has(productFolderPathKey(path)) ? [cloneProductFolderTree([node])[0]] : [];
+    return [...own, ...collectProductNodesAtPaths(node.children || [], keys, path)];
+  });
+}
+function removeProductNodesByKeys(nodes: ProductFolderNode[], keys: Set<string>, base: number[] = []): ProductFolderNode[] {
+  return nodes.flatMap((node, index) => {
+    const path = [...base, index];
+    if (keys.has(productFolderPathKey(path))) return [];
+    return [{ ...node, children: removeProductNodesByKeys(node.children || [], keys, path) }];
+  });
+}
+function renameProductNodesByKey(nodes: ProductFolderNode[], names: Map<string, string>, base: number[] = []): ProductFolderNode[] {
+  return nodes.map((node, index) => {
+    const path = [...base, index];
+    const key = productFolderPathKey(path);
+    return {
+      ...node,
+      name: names.get(key) || node.name,
+      children: renameProductNodesByKey(node.children || [], names, path),
+    };
+  });
+}
+function moveProductNodesToPath(nodes: ProductFolderNode[], selectedPaths: number[][], targetPath: number[]): ProductFolderNode[] {
+  const selectedKeys = new Set(selectedPaths.map(productFolderPathKey));
+  const moving = collectProductNodesAtPaths(nodes, selectedKeys);
+  if (!moving.length) return nodes;
+  const walk = (items: ProductFolderNode[], base: number[] = []): ProductFolderNode[] => {
+    const next: ProductFolderNode[] = [];
+    items.forEach((node, index) => {
+      const path = [...base, index];
+      if (selectedKeys.has(productFolderPathKey(path))) return;
+      const children = walk(node.children || [], path);
+      next.push({ ...node, children: isSameProductPath(path, targetPath) ? [...children, ...moving] : children });
+    });
+    return next;
+  };
+  const withoutSelected = walk(nodes);
+  return targetPath.length === 0 ? [...withoutSelected, ...moving] : withoutSelected;
+}
 function normalizeProductFoldersFromApi(data: any[]): ProductFolderNode[] {
   if (!Array.isArray(data)) return cloneProductFolderTree(INITIAL_PRODUCT_FOLDERS);
   return data.map((f: any) => ({
@@ -124,6 +209,7 @@ const INITIAL_SMART_UPLOAD_FOLDERS: FolderNode[] = [
 
 function getProductFolderPath(product: Product | null | undefined) {
   if (!product) return '';
+  if (product.productFolderPath) return product.productFolderPath;
   const brandName = (product.brand_name || '未分类品牌').replace(/[/\\:*?"<>|]/g, '_');
   const productFolderName = ((product.official_name || '').trim() || product.sku || '').replace(/[/\\:*?"<>|]/g, '_');
   return pathJoin(brandName, productFolderName);
@@ -282,12 +368,14 @@ export default function App() {
   const [sellingPoints, setSellingPoints] = useState<Record<string, any>>({});
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [rememberPassword, setRememberPassword] = useState(true);
+  const [registering, setRegistering] = useState(false);
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [error, setError] = useState('');
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, path?: string, isDir?: boolean } | null>(null);
   const [showNewFolderModal, setShowNewFolderModal] = useState(false);
-  const [newFolderName, setNewFolderName] = useState('');
+  const [renameModal, setRenameModal] = useState<{ file: FileItem; name: string } | null>(null);
+  const [folderDeleteModal, setFolderDeleteModal] = useState<{ folder: FileItem; itemCount: number; childPaths: string[] } | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [showProductManager, setShowProductManager] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
@@ -325,6 +413,15 @@ export default function App() {
   const [isEditingProduct, setIsEditingProduct] = useState(false);
   const [selectedFolderPath, setSelectedFolderPath] = useState<number[]>([]);
   const [newChildFolderName, setNewChildFolderName] = useState('');
+  const [selectedProductFolderKeys, setSelectedProductFolderKeys] = useState<Set<string>>(new Set());
+  const [batchRenameFoldersOpen, setBatchRenameFoldersOpen] = useState(false);
+  const [batchRenameFolderText, setBatchRenameFolderText] = useState('');
+  const [folderMoveTargetKey, setFolderMoveTargetKey] = useState('');
+  const [pendingProductFolderOps, setPendingProductFolderOps] = useState<TemplateFolderOperation[]>([]);
+  const [folderTemplateSaving, setFolderTemplateSaving] = useState(false);
+  const [folderTemplateDeletePreview, setFolderTemplateDeletePreview] = useState<ProductFolderDeletePreview | null>(null);
+  const [folderTemplateDeleteStrategy, setFolderTemplateDeleteStrategy] = useState<'delete' | 'move' | 'keep'>('move');
+  const [folderTemplateDeleteTargetKey, setFolderTemplateDeleteTargetKey] = useState('__root__');
   const [brands, setBrands] = useState<Brand[]>([]);
   const [productFolderTemplate, setProductFolderTemplate] = useState<ProductFolderNode[]>(cloneProductFolderTree(INITIAL_PRODUCT_FOLDERS));
   const [showBrandManager, setShowBrandManager] = useState(false);
@@ -338,8 +435,7 @@ export default function App() {
     productIds: [] as number[],
     variantId: null as number | null,
     folders: cloneFolderTree(INITIAL_SMART_UPLOAD_FOLDERS) as FolderNode[],
-    selectedFolderPath: [] as string[],
-    newFolderName: ''
+    selectedFolderPath: [] as string[]
   });
   const [smartUploadDirs, setSmartUploadDirs] = useState<string[]>([]);
   const [smartUploadDirsLoading, setSmartUploadDirsLoading] = useState(false);
@@ -412,6 +508,8 @@ export default function App() {
   const [taggingSearchQuery, setTaggingSearchQuery] = useState('');
   const [productSearchQuery, setProductSearchQuery] = useState('');
   const [smartUploadSearch, setSmartUploadSearch] = useState('');
+  const smartSearchRef = useRef<HTMLDivElement>(null);
+  const [smartUploadError, setSmartUploadError] = useState('');
   const [showSmartSearchResults, setShowSmartSearchResults] = useState(false);
   const [showAddProductModal, setShowAddProductModal] = useState(false);
   const [showAddBrandModal, setShowAddBrandModal] = useState(false);
@@ -452,12 +550,14 @@ export default function App() {
   const [moveBrowseItems, setMoveBrowseItems] = useState<FileItem[]>([]); // 弹窗内当前目录的子项
   const [moveBrowseLoading, setMoveBrowseLoading] = useState(false);
   const [moveExecuting, setMoveExecuting] = useState(false);
+  const [moveAfterDeleteFolder, setMoveAfterDeleteFolder] = useState<string | null>(null);
 
   const buildPermissions = (u: any): UserPermissions => {
     if (u && u.permissions) return u.permissions as UserPermissions;
     const role = (u?.role || 'Viewer').toLowerCase();
     if (role === 'admin' || role === 'editor') {
       return {
+        canCreateFolder: role === 'admin',
         canUpload: true,
         canDownload: true,
         canDelete: true,
@@ -466,6 +566,7 @@ export default function App() {
         canTag: true,
         canManageUsers: role === 'admin',
         canManageNewDevelopment: true,
+        canSendNotification: false,
       };
     }
     // Viewer 或未知角色：默认只允许下载查看
@@ -478,11 +579,66 @@ export default function App() {
       canTag: false,
       canManageUsers: false,
       canManageNewDevelopment: false,
+      canSendNotification: false,
     };
   };
 
+  const handleAuthExpired = useCallback(() => {
+    setFiles([]);
+    setSearchResults(null);
+    setProducts([]);
+    setBrands([]);
+    setUser(null);
+    localStorage.removeItem('vf_user');
+    setError('登录已失效，请重新登录');
+  }, []);
+
+  // --- 全局 401 拦截 ---
+  useEffect(() => {
+    const originalFetch = window.fetch;
+    window.fetch = async (...args) => {
+      const response = await originalFetch(...args);
+      if (response.status === 401 && user) {
+        // 登录超时，自动退出
+        handleAuthExpired();
+      }
+      return response;
+    };
+    return () => {
+      window.fetch = originalFetch;
+    };
+  }, [user, handleAuthExpired]);
+
   // --- 鉴权逻辑 ---
   useEffect(() => {
+    const refreshPermissionsFromServer = async (parsedUser: any) => {
+      try {
+        const res = await fetch('/api/me', {
+          headers: { 'Authorization': `Bearer ${parsedUser.token}` }
+        });
+        if (res.status === 401) {
+          setFiles([]);
+          setSearchResults(null);
+          setProducts([]);
+          setBrands([]);
+          setUser(null);
+          localStorage.removeItem('vf_user');
+          setError('登录已失效，请重新登录');
+          return;
+        }
+        if (res.ok) {
+          const data = await res.json();
+          if (data.permissions) {
+            const updated = { ...parsedUser, permissions: data.permissions };
+            setUser(updated);
+            localStorage.setItem('vf_user', JSON.stringify(updated));
+          }
+        }
+      } catch {
+        // 服务器不可达时保留本地缓存，不打扰用户
+      }
+    };
+
     try {
       const saved = localStorage.getItem('vf_user');
       if (saved) {
@@ -490,11 +646,12 @@ export default function App() {
         if (parsed && parsed.token) {
           const permissions = buildPermissions(parsed);
           setUser({ ...parsed, permissions });
+          refreshPermissionsFromServer(parsed);
         } else {
           localStorage.removeItem('vf_user');
         }
       }
-    } catch {
+    } catch (err: any) {
       localStorage.removeItem('vf_user');
     }
     try {
@@ -533,21 +690,25 @@ export default function App() {
     }
     try {
       const res = await fetch(`${API_BASE}/notifications`, {
-        headers: { Authorization: `Bearer ${user.token}` },
+        headers: { 'Authorization': `Bearer ${user.token}` }
       });
-      if (!res.ok) return;
-      const list = await res.json();
-      const notifications = Array.isArray(list) ? list : [];
-      setAppNotifications(prev => {
-        const oldKey = prev.map(n => n.id).join(',');
-        const newKey = notifications.map(n => n.id).join(',');
-        return oldKey === newKey ? prev : notifications;
-      });
-      notifyShell(notifications.length);
-    } catch {
-      // 通知轮询失败不打断主流程。
+      if (res.status === 401) {
+        handleAuthExpired();
+        return;
+      }
+      const data = await res.json();
+      if (res.ok) {
+        const sorted = (Array.isArray(data) ? data : []).sort((a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+        );
+        setAppNotifications(sorted);
+        const unreadCount = sorted.filter((n: any) => !n.read_at).length;
+        notifyShell(unreadCount);
+      }
+    } catch (err) {
+      console.error('Fetch notifications failed', err);
     }
-  }, [user?.token, notifyShell]);
+  }, [user, notifyShell, handleAuthExpired]);
 
   useEffect(() => {
     fetchAppNotifications();
@@ -705,8 +866,12 @@ export default function App() {
       });
       const data = await res.json();
       if (res.ok) {
+        console.log('[Login Debug] Server response:', data);
+        console.log('[Login Debug] Server permissions:', data.permissions);
         const permissions = buildPermissions(data);
+        console.log('[Login Debug] After buildPermissions:', permissions);
         const normalized: User = { ...data, permissions };
+        console.log('[Login Debug] Normalized user:', normalized);
         setUser(normalized);
         localStorage.setItem('vf_user', JSON.stringify(normalized));
         if (rememberPassword) {
@@ -726,6 +891,9 @@ export default function App() {
     setIsEditingProduct(true);
     setProductImageFile(null);
     setSelectedFolderPath([]);
+    clearProductFolderSelection();
+    setFolderMoveTargetKey('');
+    setPendingProductFolderOps([]);
     setNewProductForm({
       id: product.id,
       sku: product.sku || '',
@@ -852,16 +1020,6 @@ export default function App() {
     localStorage.removeItem('vf_user');
   };
 
-  const handleAuthExpired = useCallback(() => {
-    setFiles([]);
-    setSearchResults(null);
-    setProducts([]);
-    setBrands([]);
-    setUser(null);
-    localStorage.removeItem('vf_user');
-    setError('登录已失效，请重新登录');
-  }, []);
-
   // --- 文件操作 ---
   const fetchFiles = useCallback(async (path: string) => {
     if (!user) return;
@@ -890,8 +1048,35 @@ export default function App() {
     }
   }, [user, handleAuthExpired]);
 
+  useEffect(() => {
+    if (!user?.token) return;
+    const token = user.token;
+    let active = true;
+    const refresh = async () => {
+      if (document.visibilityState === 'hidden') return;
+      try {
+        const res = await fetch('/api/me', { headers: { Authorization: 'Bearer ' + token } });
+        if (!res.ok) return;
+        const { permissions } = await res.json();
+        if (active && permissions) setUser(current => {
+          if (!current || current.token !== token || JSON.stringify(current.permissions) === JSON.stringify(permissions)) return current;
+          const updated = { ...current, permissions };
+          localStorage.setItem('vf_user', JSON.stringify(updated));
+          return updated;
+        });
+      } catch { /* retry on focus or next refresh */ }
+    };
+    window.addEventListener('focus', refresh);
+    const timer = window.setInterval(refresh, 30000);
+    return () => { active = false; window.removeEventListener('focus', refresh); window.clearInterval(timer); };
+  }, [user?.token]);
+
+  const [searchRevision, setSearchRevision] = useState(0);
   const [searchResults, setSearchResults] = useState<FileItem[] | null>(null);
+  const [searchPending, setSearchPending] = useState(false);
+  const [searchError, setSearchError] = useState('');
   const searchAbortRef = useRef<AbortController | null>(null);
+  const searchSeqRef = useRef(0);
 
   const fetchSellingPoints = useCallback(async () => {
     if (!user) return;
@@ -988,6 +1173,14 @@ export default function App() {
   // 有搜索词时调用递归搜索 API，直接返回匹配的文件（不含文件夹）
   useEffect(() => {
     const q = searchQuery.trim();
+    searchSeqRef.current += 1;
+    const seq = searchSeqRef.current;
+    if (searchAbortRef.current) {
+      searchAbortRef.current.abort();
+      searchAbortRef.current = null;
+    }
+    setSearchError('');
+    setSearchPending(!!q);
     if (!q) {
       setSearchResults(null);
       {
@@ -997,31 +1190,57 @@ export default function App() {
       }
       return;
     }
+    setSearchResults([]);
     const t = setTimeout(async () => {
-      if (searchAbortRef.current) searchAbortRef.current.abort();
-      searchAbortRef.current = new AbortController();
+      const controller = new AbortController();
+      searchAbortRef.current = controller;
       {
         const next = new Set<string>();
         selectedPathsRef.current = next;
         setSelectedPaths(next);
       }
       try {
-        const res = await fetch(`${API_BASE}/files/search?q=${encodeURIComponent(q)}`, {
+        const res = await fetch(`${API_BASE}/files/search?stream=1&q=${encodeURIComponent(q)}`, {
           headers: { 'Authorization': `Bearer ${user?.token}` },
-          signal: searchAbortRef.current.signal
+          signal: controller.signal
         });
         if (res.status === 401) {
           handleAuthExpired();
           return;
         }
-        const data = await res.json().catch(() => []);
-        setSearchResults(Array.isArray(data) ? data : []);
+        if (!res.ok) throw new Error('搜索失败');
+        if (res.body && res.headers.get('content-type')?.includes('application/x-ndjson')) {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let pending = '';
+          while (!controller.signal.aborted) {
+            const { done, value } = await reader.read();
+            pending += decoder.decode(value, { stream: !done });
+            const lines = pending.split('\n');
+            pending = lines.pop() || '';
+            const batch: FileItem[] = lines.filter(Boolean).flatMap(line => JSON.parse(line));
+            if (batch.length && seq === searchSeqRef.current) setSearchResults(prev => [...(prev || []), ...batch]);
+            if (done) break;
+          }
+        } else {
+          const data = await res.json();
+          if (seq === searchSeqRef.current) setSearchResults(Array.isArray(data) ? data : []);
+        }
       } catch (e) {
-        if ((e as Error).name !== 'AbortError') setSearchResults([]);
+        if (!controller.signal.aborted && seq === searchSeqRef.current) setSearchError('搜索未完成，请重试');
+      } finally {
+        if (seq === searchSeqRef.current) setSearchPending(false);
+        if (searchAbortRef.current === controller) searchAbortRef.current = null;
       }
-    }, 300);
-    return () => clearTimeout(t);
-  }, [searchQuery, user?.token, handleAuthExpired]);
+    }, 180);
+    return () => {
+      clearTimeout(t);
+      if (searchAbortRef.current) {
+        searchAbortRef.current.abort();
+        searchAbortRef.current = null;
+      }
+    };
+  }, [searchQuery, searchRevision, user?.token, handleAuthExpired]);
 
   // 无搜索时用当前目录；有搜索时用递归搜索结果（仅文件）
   const filteredFiles = useMemo(() => {
@@ -1044,7 +1263,9 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (activeTab !== 'files') return;
+      if (activeTab !== 'files' || e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+      if (e.target instanceof HTMLElement && (e.target.isContentEditable ||
+        e.target.closest('input, textarea, select, [role="dialog"]'))) return;
       if (e.key === 'a' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         handleSelectAll();
@@ -1199,8 +1420,10 @@ export default function App() {
     }
   };
 
+  const canAsset = (action: string, path: string) => allowsFolder(user?.permissions, action, path,
+    ['canDelete', 'canRename', 'canMove', 'canTag'].includes(action));
   const handleDownload = (file: FileItem) => {
-    if (!user) return;
+    if (!user || !canAsset('canDownload', file.path)) return;
     const url = `${window.location.origin}${API_BASE}/download?path=${encodeURIComponent(file.path)}&token=${user.token}`;
     startDownloadToast(file.name || '正在下载文件', Number(file.size || 0));
     const electron = (window as any).electron;
@@ -1222,7 +1445,7 @@ export default function App() {
 
   /** 双击打开：Electron 下用系统默认程序打开；本地无文件时先下载到临时目录再打开 */
   const handleOpenFile = async (file: FileItem) => {
-    if (!user) return;
+    if (!user || !canAsset('canDownload', file.path)) return;
     const electron = (window as any).electron;
     if (electron?.openFile) {
       const downloadUrl = `${window.location.origin}${API_BASE}/download?path=${encodeURIComponent(file.path)}&token=${user.token}`;
@@ -1234,7 +1457,7 @@ export default function App() {
   };
 
   const handleDelete = async (file: FileItem) => {
-    if (!user || !user.permissions.canDelete) return;
+    if (!user || !canAsset('canDelete', file.path)) return;
     if (!confirm(`确定要删除 ${file.name} 吗？`)) return;
 
     try {
@@ -1248,8 +1471,96 @@ export default function App() {
     }
   };
 
+  const executeDeleteFile = useCallback(async (filePath: string, emptyOnly = false) => {
+    if (!user || !allowsFolder(user.permissions, 'canDelete', filePath, true)) return false;
+    try {
+      const res = await fetch(`${API_BASE}/files?path=${encodeURIComponent(filePath)}${emptyOnly ? '&emptyOnly=1' : ''}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${user.token}` }
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || '删除失败');
+        return false;
+      }
+      await fetchFiles(currentPath);
+      return true;
+    } catch (err) {
+      alert('删除失败');
+      return false;
+    }
+  }, [currentPath, fetchFiles, user]);
+
+  const handleSafeDelete = async (file: FileItem) => {
+    if (!user || !canAsset('canDelete', file.path)) return;
+    if (!file.isDir) {
+      if (!confirm(`确定要删除 ${file.name} 吗？`)) return;
+      await executeDeleteFile(file.path);
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/files/folder-info?path=${encodeURIComponent(file.path)}`, {
+        headers: { 'Authorization': `Bearer ${user.token}` }
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(data.error || '读取文件夹失败');
+        return;
+      }
+      if (data.isEmpty) {
+        if (!confirm(`确定要删除空文件夹 ${file.name} 吗？`)) return;
+        await executeDeleteFile(file.path, true);
+        return;
+      }
+      setFolderDeleteModal({
+        folder: file,
+        itemCount: Number(data.itemCount || 0),
+        childPaths: Array.isArray(data.childPaths) ? data.childPaths : [],
+      });
+    } catch (err) {
+      alert('读取文件夹失败');
+    }
+  };
+
+  const handleRename = async () => {
+    if (!user || !renameModal || !canAsset('canRename', renameModal.file.path)) return;
+    const nextName = renameModal.name.trim();
+    if (nextName === renameModal.file.name) {
+      setRenameModal(null);
+      return;
+    }
+    if (!nextName) {
+      alert('名称不能为空');
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/files/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${user.token}` },
+        body: JSON.stringify({ path: renameModal.file.path, newName: nextName })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(data.error || '重命名失败');
+        return;
+      }
+      const renamedCurrentFolder = currentPath === renameModal.file.path || currentPath.startsWith(renameModal.file.path + '/');
+      const nextPath = renamedCurrentFolder && data.path ? `${data.path}${currentPath.slice(renameModal.file.path.length)}` : currentPath;
+      setRenameModal(null);
+      const cleared = new Set<string>();
+      selectedPathsRef.current = cleared;
+      setSelectedPaths(cleared);
+      if (renamedCurrentFolder) navigateTo(nextPath);
+      setSavedSearch(null);
+      if (searchQuery.trim()) setSearchRevision(n => n + 1);
+      await Promise.all([fetchFiles(nextPath), fetchProducts()]);
+    } catch (err) {
+      alert('重命名失败');
+    }
+  };
+
   const handleDeleteProduct = async (id: number) => {
-    if (!user || !user.permissions.canDelete || !user.permissions.canManageProducts) return;
+    if (!user || !canAsset('canDelete', '') || !user.permissions.canManageProducts) return;
     if (!confirm('确定要删除该产品吗？')) return;
 
     try {
@@ -1297,7 +1608,7 @@ export default function App() {
     skipLoading?: boolean,
     conflictStrategy?: 'overwrite' | 'rename'
   ): Promise<{ path: string; name: string }[] | undefined> => {
-    if (!user || !user.permissions.canUpload || !filesToUpload.length) return undefined;
+    if (!user || !allowsFolder(user.permissions, 'canUpload', targetPathOverride ?? currentPath) || !filesToUpload.length) return undefined;
     if (!skipLoading) setLoading(true);
     try {
       let selectedStrategy = conflictStrategy;
@@ -1320,7 +1631,7 @@ export default function App() {
 
         if (res.ok) {
           fetchFiles(currentPath);
-          if (!skipTaggingModal) {
+          if (!skipTaggingModal && data.files?.every((f: FileItem) => allowsFolder(user.permissions, 'canTag', f.path, true))) {
             setShowTaggingModal({ files: data.files, selectedProductIds: [], selectedVariantIds: [] });
           }
           return (data.files as { path: string; name: string }[]) || [];
@@ -1534,6 +1845,7 @@ export default function App() {
     setLoading(true);
     setSmartUploadSuccess(null);
     setSmartUploadProgress({ productIndex: 0, productTotal: 1, productName: '…' });
+    setSmartUploadError('');
     const cleanup = () => {
       setLoading(false);
       setSmartUploadProgress(null);
@@ -1541,29 +1853,28 @@ export default function App() {
 
     if (!smartUploadConfig.productIds.length) {
       cleanup();
-      alert('请先搜索并选择要上传到的产品');
+      setSmartUploadError('请先搜索并选择要上传到的产品');
+      smartSearchRef.current?.querySelector('input')?.focus();
       return;
     }
     const hasFiles = files.length > 0;
     const hasPaths = pathsFromOs && pathsFromOs.length > 0;
     if (!hasFiles && !hasPaths) {
       cleanup();
-      alert('请先添加要上传的文件');
+      setSmartUploadError('请先添加要上传的文件');
       return;
     }
 
-    const selectedProducts = products.filter(p => smartUploadConfig.productIds.includes(p.id));
+    const selectedProducts = smartUploadConfig.productIds.map(id => products.find(p => p.id === id)).filter((p): p is Product => !!p);
     if (!selectedProducts.length) {
       cleanup();
-      alert('未找到所选产品，请重新选择');
+      setSmartUploadError('未找到所选产品，请重新选择');
+      smartSearchRef.current?.querySelector('input')?.focus();
       return;
     }
 
     const primaryProduct = selectedProducts[0];
-    const variant = primaryProduct.variants?.find(v => v.id === smartUploadConfig.variantId);
-    const brandName = primaryProduct.brand_name || '未分类品牌';
-    const productFolderName = ((primaryProduct.official_name || '').trim() || primaryProduct.sku).replace(/[/\\:*?"<>|]/g, '_');
-    let targetPath = pathJoin(brandName, productFolderName);
+    let targetPath = getProductFolderPath(primaryProduct);
     if (smartUploadConfig.selectedFolderPath.length > 0) {
       targetPath = pathJoin(targetPath, ...smartUploadConfig.selectedFolderPath);
     }
@@ -1577,7 +1888,7 @@ export default function App() {
     const allProductIds = selectedProducts.map(p => p.id);
     const variantIds = smartUploadConfig.productIds.length === 1 && smartUploadConfig.variantId ? [smartUploadConfig.variantId] : [];
     const tagFiles = (filePaths: { path: string }[]) => {
-      if (!filePaths.length || !user) return;
+      if (!filePaths.length || !user || !filePaths.every(f => allowsFolder(user.permissions, 'canTag', f.path, true))) return;
       return fetch(`${API_BASE}/files/tag`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${user.token}` },
@@ -1630,18 +1941,31 @@ export default function App() {
       setSmartUploadPendingPaths([]);
     } catch (err) {
       console.error('智能上传失败', err);
-      alert(err instanceof Error ? err.message : '上传过程出错，请重试');
+      setSmartUploadError(err instanceof Error ? err.message : '上传过程出错，请重试');
     } finally {
       setLoading(false);
       setSmartUploadProgress(null);
     }
   }, [smartUploadConfig, products, doUpload, user, waitForUploadConflictChoice]);
 
-  // 仅在弹窗打开时重置；不依赖 fetchProducts，避免其引用变化时重复清空待上传文件
+  useEffect(() => {
+    if (!showSmartUpload || !showSmartSearchResults || smartUploadSuccess) return;
+    const closeOutside = (e: PointerEvent) => {
+      if (e.target instanceof Node && !smartSearchRef.current?.contains(e.target)) {
+        setShowSmartSearchResults(false);
+      }
+    };
+    document.addEventListener('pointerdown', closeOutside, true);
+    return () => document.removeEventListener('pointerdown', closeOutside, true);
+  }, [showSmartUpload, showSmartSearchResults, smartUploadSuccess]);
+
+  // 每次打开只重置一次，避免刷新产品时清空待上传文件。
   const prevShowSmartUpload = useRef(false);
   useEffect(() => {
     if (showSmartUpload && !prevShowSmartUpload.current) {
       prevShowSmartUpload.current = true;
+      setSmartUploadError('');
+      setShowSmartSearchResults(false);
       fetchProducts();
       setSmartUploadPendingFiles([]);
       setSmartUploadSuccess(null);
@@ -1649,8 +1973,7 @@ export default function App() {
       setSmartUploadConfig(prev => ({
         ...prev,
         folders: cloneFolderTree(INITIAL_SMART_UPLOAD_FOLDERS),
-        selectedFolderPath: [],
-        newFolderName: ''
+        selectedFolderPath: []
       }));
     }
     if (!showSmartUpload) prevShowSmartUpload.current = false;
@@ -1665,9 +1988,7 @@ export default function App() {
     if (!smartUploadConfig.productIds.length || !products.length) return '';
     const p = products.find(prod => prod.id === smartUploadConfig.productIds[0]);
     if (!p) return '';
-    const brandName = (p as any).brand_name || '未分类品牌';
-    const productFolderName = (((p as any).official_name || '').trim() || (p.sku || '')).replace(/[/\\:*?"<>|]/g, '_');
-    return pathJoin(brandName, productFolderName);
+    return getProductFolderPath(p);
   }, [smartUploadConfig.productIds, products]);
 
   // 按实际目录扫描：当产品与路径变化时拉取当前层级的子文件夹
@@ -1717,6 +2038,102 @@ export default function App() {
       })
       .slice(0, 5);
   }, [products, smartUploadSearch]);
+
+  const productFolderFlatOptions = useMemo(() => flattenProductFolderPaths(newProductForm.folders), [newProductForm.folders]);
+  const selectedProductFolderPaths = useMemo(
+    () => compactProductFolderPaths(Array.from(selectedProductFolderKeys).map(productFolderPathFromKey)),
+    [selectedProductFolderKeys]
+  );
+  const validFolderMoveTargets = useMemo(() => {
+    return productFolderFlatOptions.filter(option => !selectedProductFolderPaths.some(path => (
+      isSameProductPath(option.path, path) || isProductPathInside(option.path, path)
+    )));
+  }, [productFolderFlatOptions, selectedProductFolderPaths]);
+
+  const clearProductFolderSelection = useCallback(() => {
+    setSelectedProductFolderKeys(new Set());
+    setBatchRenameFoldersOpen(false);
+    setBatchRenameFolderText('');
+  }, []);
+
+  const toggleProductFolderSelection = useCallback((path: number[]) => {
+    const key = productFolderPathKey(path);
+    setSelectedProductFolderKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const deleteSelectedProductFolders = useCallback(() => {
+    if (!selectedProductFolderKeys.size) return;
+    if (!confirm(`确定删除选中的 ${selectedProductFolderKeys.size} 个默认文件夹吗？`)) return;
+    const selectedOptions = selectedProductFolderPaths
+      .map(path => productFolderFlatOptions.find(option => option.key === productFolderPathKey(path)))
+      .filter((option): option is NonNullable<typeof option> => Boolean(option));
+    setPendingProductFolderOps(prev => [
+      ...prev,
+      ...selectedOptions.map(option => ({ type: 'delete' as const, fromSegments: option.segments })),
+    ]);
+    setNewProductForm(prev => ({
+      ...prev,
+      folders: removeProductNodesByKeys(prev.folders, selectedProductFolderKeys),
+    }));
+    if (selectedProductFolderPaths.some(path => isSameProductPath(path, selectedFolderPath) || isProductPathInside(selectedFolderPath, path))) {
+      setSelectedFolderPath([]);
+    }
+    clearProductFolderSelection();
+  }, [clearProductFolderSelection, productFolderFlatOptions, selectedFolderPath, selectedProductFolderKeys, selectedProductFolderPaths]);
+
+  const openBatchRenameProductFolders = useCallback(() => {
+    if (!selectedProductFolderKeys.size) return;
+    const names = productFolderFlatOptions
+      .filter(option => selectedProductFolderKeys.has(option.key))
+      .map(option => option.name);
+    setBatchRenameFolderText(names.join('\n'));
+    setBatchRenameFoldersOpen(true);
+  }, [productFolderFlatOptions, selectedProductFolderKeys]);
+
+  const applyBatchRenameProductFolders = useCallback(() => {
+    const selected = productFolderFlatOptions.filter(option => selectedProductFolderKeys.has(option.key));
+    const names = batchRenameFolderText.split(/\r?\n/).map(name => name.trim());
+    if (names.length !== selected.length || names.some(name => !name)) {
+      alert('请按选中顺序填写新名称，每行一个，且不能为空。');
+      return;
+    }
+    const nameMap = new Map<string, string>();
+    selected.forEach((option, index) => nameMap.set(option.key, names[index]));
+    setPendingProductFolderOps(prev => [
+      ...prev,
+      ...selected.map((option, index) => ({ type: 'rename' as const, fromSegments: option.segments, toName: names[index] }))
+        .filter(op => op.fromSegments.at(-1) !== op.toName)
+        .sort((a, b) => b.fromSegments.length - a.fromSegments.length),
+    ]);
+    setNewProductForm(prev => ({ ...prev, folders: renameProductNodesByKey(prev.folders, nameMap) }));
+    setBatchRenameFoldersOpen(false);
+  }, [batchRenameFolderText, productFolderFlatOptions, selectedProductFolderKeys]);
+
+  const moveSelectedProductFolders = useCallback(() => {
+    if (!selectedProductFolderKeys.size) return;
+    const targetPath = productFolderPathFromKey(folderMoveTargetKey);
+    if (selectedProductFolderPaths.some(path => isSameProductPath(path, targetPath) || isProductPathInside(targetPath, path))) {
+      alert('不能移动到选中文件夹本身或它的子文件夹里。');
+      return;
+    }
+    const selectedOptions = productFolderFlatOptions.filter(option => selectedProductFolderKeys.has(option.key));
+    const targetOption = productFolderFlatOptions.find(option => option.key === folderMoveTargetKey);
+    setPendingProductFolderOps(prev => [
+      ...prev,
+      ...selectedOptions.map(option => ({ type: 'move' as const, fromSegments: option.segments, toSegments: targetOption?.segments || [] })),
+    ]);
+    setNewProductForm(prev => ({
+      ...prev,
+      folders: moveProductNodesToPath(prev.folders, selectedProductFolderPaths, targetPath),
+    }));
+    clearProductFolderSelection();
+    setFolderMoveTargetKey('');
+  }, [clearProductFolderSelection, folderMoveTargetKey, productFolderFlatOptions, selectedProductFolderKeys, selectedProductFolderPaths]);
 
   const manualNotifyFilteredProducts = useMemo(() => {
     const query = manualNotifyProductSearch.toLowerCase().trim();
@@ -1791,7 +2208,9 @@ export default function App() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${user.token}` 
         },
-        body: JSON.stringify({ ...newProductForm, names: normalizedNames, image_path: imagePath })
+        body: JSON.stringify({ ...newProductForm,
+          folders: isEditingProduct && JSON.stringify(newProductForm.folders) === JSON.stringify(productFolderTemplate) ? undefined : newProductForm.folders,
+          names: normalizedNames, image_path: imagePath, folderRenames: pendingProductFolderOps.filter(op => op.type === 'rename') })
       });
       if (res.ok) {
         fetchProducts();
@@ -1818,8 +2237,9 @@ export default function App() {
     }
   };
 
-  const handleSaveFolderTemplate = async () => {
-    if (!user || !user.permissions.canManageProducts) return;
+  const submitFolderTemplate = async (syncOptions: ProductFolderSyncOptions): Promise<boolean> => {
+    if (!user || !user.permissions.canManageProducts || folderTemplateSaving) return false;
+    setFolderTemplateSaving(true);
     try {
       const res = await fetch(`${API_BASE}/product-folders/template`, {
         method: 'POST',
@@ -1827,18 +2247,84 @@ export default function App() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${user.token}` 
         },
-        body: JSON.stringify({ folders: newProductForm.folders })
+        body: JSON.stringify({ folders: newProductForm.folders, operations: pendingProductFolderOps, syncOptions })
       });
       if (res.ok) {
         setProductFolderTemplate(newProductForm.folders);
+        setPendingProductFolderOps([]);
+        setFolderTemplateDeletePreview(null);
         alert('已保存为默认文件夹模板，之后新建产品将使用该结构');
+        return true;
       } else {
         const data = await res.json().catch(() => ({}));
         alert(data.error || '保存默认文件夹模板失败');
+        return false;
       }
-    } catch {
-      alert('网络错误，保存默认文件夹模板失败');
+    } catch (err: any) {
+      console.error('save product folder template failed', err);
+      alert(`保存默认文件夹模板失败：${err?.message || '网络错误'}`);
+      return false;
+    } finally {
+      setFolderTemplateSaving(false);
     }
+  };
+
+  const handleSaveFolderTemplate = async () => {
+    if (!user || !user.permissions.canManageProducts || folderTemplateSaving) return;
+    const deleteOperations = pendingProductFolderOps.filter(op => op.type === 'delete');
+    if (!deleteOperations.length) {
+      await submitFolderTemplate({});
+      return;
+    }
+
+    setFolderTemplateSaving(true);
+    try {
+      const previewRes = await fetch(`${API_BASE}/product-folders/sync-preview`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${user.token}`,
+        },
+        body: JSON.stringify({ operations: deleteOperations }),
+      });
+      const previewData = await previewRes.json().catch(() => ({}));
+      if (!previewRes.ok) {
+        alert(previewData.error || '检查现有文件夹失败');
+        return;
+      }
+      const preview: ProductFolderDeletePreview = {
+        nonEmptyDeletes: Array.isArray(previewData.nonEmptyDeletes) ? previewData.nonEmptyDeletes : [],
+        nonEmptyDeleteCount: Number(previewData.nonEmptyDeleteCount || 0),
+      };
+      if (preview.nonEmptyDeleteCount <= 0) {
+        setFolderTemplateSaving(false);
+        await submitFolderTemplate({ deleteStrategy: 'keep' });
+        return;
+      }
+      setFolderTemplateDeleteStrategy('move');
+      setFolderTemplateDeleteTargetKey('__root__');
+      setFolderTemplateDeletePreview(preview);
+    } catch (err: any) {
+      console.error('preview product folder deletion failed', err);
+      alert(`检查现有文件夹失败：${err?.message || '网络错误'}`);
+    } finally {
+      setFolderTemplateSaving(false);
+    }
+  };
+
+  const confirmFolderTemplateDeletion = async () => {
+    let syncOptions: ProductFolderSyncOptions = { deleteStrategy: folderTemplateDeleteStrategy };
+    if (folderTemplateDeleteStrategy === 'move') {
+      const target = folderTemplateDeleteTargetKey === '__root__'
+        ? { segments: [] as string[] }
+        : productFolderFlatOptions.find(option => option.key === folderTemplateDeleteTargetKey);
+      if (!target) {
+        alert('请选择有效的移动目标文件夹');
+        return;
+      }
+      syncOptions = { deleteStrategy: 'move', moveTargetSegments: target.segments };
+    }
+    await submitFolderTemplate(syncOptions);
   };
 
   const handleCreateBrand = async () => {
@@ -1876,30 +2362,6 @@ export default function App() {
       }
     } catch (err) {
       alert('删除品牌失败');
-    }
-  };
-
-  const handleCreateFolder = async () => {
-    if (!user || !user.permissions.canUpload || !newFolderName) return;
-    try {
-      const res = await fetch(`${API_BASE}/mkdir`, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${user.token}` 
-        },
-        body: JSON.stringify({ path: currentPath, name: newFolderName })
-      });
-      if (res.ok) {
-        fetchFiles(currentPath);
-        setShowNewFolderModal(false);
-        setNewFolderName('');
-      } else {
-        const data = await res.json();
-        alert(data.error || '创建失败');
-      }
-    } catch (err) {
-      alert('网络错误');
     }
   };
 
@@ -1941,10 +2403,11 @@ export default function App() {
   }, [user])
 
   // 打开移动弹窗，pathsToMove 为要移动的文件路径列表
-  const openMoveModal = useCallback((pathsToMove: string[]) => {
+  const openMoveModal = useCallback((pathsToMove: string[], afterDeleteFolderPath: string | null = null) => {
     if (!pathsToMove.length) return
     const initialBrowsePath = getCommonParentPath(pathsToMove) || currentPath
     setMovePaths(pathsToMove)
+    setMoveAfterDeleteFolder(afterDeleteFolderPath)
     setMoveInitialPath(initialBrowsePath)
     setMoveBrowsePath(initialBrowsePath)
     loadMoveBrowse(initialBrowsePath)
@@ -1953,7 +2416,11 @@ export default function App() {
 
   // 底层移动执行（不依赖弹窗状态，可供拖拽和弹窗共用）
   const doMoveFiles = useCallback(async (paths: string[], destination: string) => {
-    if (!user || !paths.length) return
+    if (!user || !paths.length) return false
+    if (!paths.every(p => allowsFolder(user.permissions, 'canMove', p, true)) || !allowsFolder(user.permissions, 'canMove', destination)) {
+      alert('来源和目标必须都在移动权限范围内');
+      return false;
+    }
     try {
       const res = await fetch(`${API_BASE}/files/move`, {
         method: 'POST',
@@ -1963,7 +2430,7 @@ export default function App() {
       const data = await res.json()
       if (!res.ok && res.status !== 207) {
         alert(data.error || '移动失败')
-        return
+        return false
       }
       const failed = (data.results as { success: boolean; path: string; error?: string }[])
         ?.filter(r => !r.success) ?? []
@@ -1974,6 +2441,7 @@ export default function App() {
       selectedPathsRef.current = next
       setSelectedPaths(next)
       fetchFiles(currentPath)
+      return failed.length === 0
     } catch {
       alert('网络错误，请重试')
     }
@@ -2003,7 +2471,7 @@ export default function App() {
       setCustomDragGhost(null);
       setDragOverPath(null);
       const electron = (window as any).electron;
-      if (electron?.startDrag) {
+      if (electron?.startDrag && data.paths.every(p => allowsFolder(userRef.current?.permissions, 'canDownload', p))) {
         isInternalDragRef.current = true;
         const firstName = data.paths.length > 1 ? `${data.paths.length} 个文件` : ((data.paths[0] || '').split(/[\\/]/).pop() || '正在下载文件');
         startDownloadToast(firstName, 0);
@@ -2182,14 +2650,24 @@ export default function App() {
   // 执行移动（弹窗版，依赖 movePaths 状态）
   const handleMoveFiles = useCallback(async (destination: string) => {
     if (!user || !movePaths.length) return
+    if (moveAfterDeleteFolder && (destination === moveAfterDeleteFolder || destination.startsWith(moveAfterDeleteFolder + '/'))) {
+      alert('不能移动到正在删除的文件夹里面，请选择其他目标文件夹');
+      return;
+    }
     setMoveExecuting(true)
     try {
-      await doMoveFiles(movePaths, destination)
+      const moved = await doMoveFiles(movePaths, destination)
+      if (!moved) return
+      if (moveAfterDeleteFolder) {
+        const deleted = await executeDeleteFile(moveAfterDeleteFolder, true)
+        if (!deleted) return
+        setMoveAfterDeleteFolder(null)
+      }
       setShowMoveModal(false)
     } finally {
       setMoveExecuting(false)
     }
-  }, [user, movePaths, doMoveFiles])
+  }, [doMoveFiles, executeDeleteFile, moveAfterDeleteFolder, movePaths, user])
 
   const currentNewDev = useMemo(
     () => newDevProjects.find(p => p.id === selectedNewDevId) || null,
@@ -2327,6 +2805,7 @@ export default function App() {
     if (file.isDir) return <Folder className={`w-10 h-10 ${theme === 'dark' ? 'text-amber-400 fill-amber-400' : 'text-amber-500 fill-amber-500'}`} />;
     const ext = file.ext;
     if (['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext)) return <ImageIcon className="w-10 h-10 text-blue-400" />;
+    if (['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.flv', '.wmv', '.mpg', '.mpeg', '.3gp'].includes(ext)) return <Film className="w-10 h-10 text-indigo-400" />;
     if (['.obj', '.fbx', '.glb', '.gltf', '.stl'].includes(ext)) return <Box className="w-10 h-10 text-purple-400" />;
     if (['.psd', '.ai', '.pdf'].includes(ext)) return <FileText className="w-10 h-10 text-red-400" />;
     return <FileIcon className="w-10 h-10 text-slate-400" />;
@@ -2345,77 +2824,55 @@ export default function App() {
 
   if (!user) {
     return (
-      <div className={`min-h-screen ${theme === 'dark' ? 'bg-slate-950' : 'bg-slate-50'} flex items-center justify-center p-4 sm:p-6 font-sans transition-colors duration-500`} style={{ minHeight: '100vh', backgroundColor: theme === 'dark' ? '#020617' : '#f8fafc' }}>
-        <div 
-          className={`${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} border p-5 sm:p-8 rounded-2xl w-full max-w-md shadow-2xl`}
-          style={{ backgroundColor: theme === 'dark' ? '#0f172a' : '#ffffff' }}
-        >
-          <div className="text-center mb-8">
-            <div className="flex justify-center mb-4">
-              <div className="w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center">
-                <img src={appLogo} alt="尚品易站云资产" className="h-16 w-16 sm:h-20 sm:w-20 object-contain" />
-              </div>
-            </div>
-            <h1 className={`text-2xl sm:text-3xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'} tracking-tight mb-2`} style={{ color: theme === 'dark' ? '#ffffff' : '#0f172a' }}>尚品易站云资产</h1>
-            <p className="text-slate-400 text-sm font-medium tracking-wide">PREMIUM ASSET HUB</p>
-          </div>
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">用户名（支持中文）</label>
-              <input 
-                type="text" 
-                className={`w-full ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-100 border-slate-200 text-slate-900'} border rounded-lg px-4 py-3 focus:ring-2 focus:ring-sky-500 outline-none transition-all`}
-                value={loginForm.username}
-                onChange={e => setLoginForm({...loginForm, username: e.target.value})}
-                placeholder="例如：管理员 / 上传专员 / 只读"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">密码</label>
-              <div className="relative">
-                <input 
-                  type={showLoginPassword ? 'text' : 'password'} 
-                  className={`w-full ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-100 border-slate-200 text-slate-900'} border rounded-lg px-4 py-3 pr-11 focus:ring-2 focus:ring-sky-500 outline-none transition-all`}
-                  value={loginForm.password}
-                  onChange={e => setLoginForm({...loginForm, password: e.target.value})}
-                  placeholder="密码（例如：admin123）"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowLoginPassword(prev => !prev)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-sky-500 transition-colors"
-                  title={showLoginPassword ? '隐藏密码' : '显示密码'}
-                >
-                  {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
-            <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={rememberPassword}
-                onChange={e => {
-                  const checked = e.target.checked;
-                  setRememberPassword(checked);
-                  if (!checked) localStorage.removeItem('vf_saved_login');
-                }}
-                className="w-4 h-4 rounded border-slate-600 accent-sky-500"
-              />
-              记住密码
-            </label>
-            {error && <p className="text-red-400 text-xs font-medium">{error}</p>}
-            <button 
-              type="submit"
-              className="w-full bg-sky-600 hover:bg-sky-500 text-white font-bold py-3 rounded-lg shadow-lg shadow-sky-900/20 transition-all active:scale-95"
-            >
-              进入系统
-            </button>
-          </form>
-          <div className="mt-6 pt-6 border-t border-slate-800 text-center">
-            <p className="text-slate-500 text-[10px] uppercase tracking-widest">Secure Internal Access Only</p>
+      <main className="nebula-login">
+        <LoginCloud />
+        <div className="nebula-login__scroll">
+          <div className="nebula-login__layout">
+            <section className="nebula-login__card" aria-labelledby="login-title">
+              <header>
+                <img src={appLogo} alt="" />
+                <h1 id="login-title">{registering ? '注册新成员' : '尚品易站云资产'}</h1>
+                <p>PREMIUM ASSET HUB</p>
+              </header>
+              {registering ? <RegistrationForm onBack={() => setRegistering(false)} /> : <>
+              <form onSubmit={handleLogin}>
+                <label htmlFor="login-username">用户名（支持中文）</label>
+                <div className="nebula-login__field">
+                  <input
+                    id="login-username" type="text" autoComplete="username" placeholder="请输入用户名"
+                    value={loginForm.username} onChange={e => setLoginForm({ ...loginForm, username: e.target.value })}
+                  />
+                </div>
+                <label htmlFor="login-password">密码</label>
+                <div className="nebula-login__field">
+                  <input
+                    id="login-password" type={showLoginPassword ? 'text' : 'password'} autoComplete="current-password" placeholder="请输入密码"
+                    value={loginForm.password} onChange={e => setLoginForm({ ...loginForm, password: e.target.value })}
+                  />
+                  <button type="button" className="nebula-login__eye" title={showLoginPassword ? '隐藏密码' : '显示密码'}
+                    onClick={() => setShowLoginPassword(prev => !prev)}>
+                    {showLoginPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+                <label className="nebula-login__remember">
+                  <input type="checkbox" checked={rememberPassword} onChange={e => {
+                    const checked = e.target.checked;
+                    setRememberPassword(checked);
+                    if (!checked) localStorage.removeItem('vf_saved_login');
+                  }} />
+                  记住密码
+                </label>
+                {error && <p role="alert" className="nebula-login__error">{error}</p>}
+                <button type="submit" className="nebula-login__submit">进入系统</button>
+              </form>
+              <button type="button" className="mt-4 w-full text-sm text-sky-300 hover:underline"
+                onClick={() => { setError(''); setRegistering(true); }}>注册新成员</button>
+              </>}
+              <footer>SECURE INTERNAL ACCESS ONLY</footer>
+            </section>
           </div>
         </div>
-      </div>
+      </main>
     );
   }
 
@@ -2543,7 +3000,7 @@ export default function App() {
               刷新
             </button>
 
-            {(user.permissions.canManageNewDevelopment || user.permissions.canManageUsers || user.username === '任小雨') && (
+            {(user.permissions.canManageNewDevelopment || user.permissions.canManageUsers || user.permissions.canSendNotification || user.username === '任小雨') && (
               <button
                 type="button"
                 onClick={openManualNotify}
@@ -2577,7 +3034,7 @@ export default function App() {
               </button>
               {showUserMenu && (
                 <div className={`absolute right-0 top-full z-[80] mt-2 w-44 rounded-xl border p-1 shadow-2xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                  {(user.username === '任小雨' || user.permissions.canManageUsers) && (
+                  {(user.username === '任小雨' || user.permissions.canManageUsers || user.permissions.canApproveRegistrations) && (
                     <button
                       type="button"
                       onClick={() => {
@@ -2586,7 +3043,7 @@ export default function App() {
                       }}
                       className={`w-full rounded-lg px-3 py-2 text-left text-sm ${theme === 'dark' ? 'text-slate-200 hover:bg-slate-800' : 'text-slate-700 hover:bg-slate-100'}`}
                     >
-                      账号权限设置
+                      {user.username === '任小雨' || user.permissions.canManageUsers ? '账号权限设置' : '审批新成员'}
                     </button>
                   )}
                   <button
@@ -2599,7 +3056,7 @@ export default function App() {
                 </div>
               )}
             </div>
-            <button onClick={handleLogout} className="p-1.5 hover:bg-slate-800 rounded-full text-slate-400 hover:text-red-500 transition-all">
+            <button aria-label="退出登录" onClick={handleLogout} className="p-1.5 hover:bg-slate-800 rounded-full text-slate-400 hover:text-red-500 transition-all">
               <LogOut className="w-4 h-4" />
             </button>
           </div>
@@ -2754,7 +3211,7 @@ export default function App() {
                   )}
                   {selectedPaths.size > 0 && (
                     <>
-                      {user.permissions.canDelete && (
+                      {[...selectedPaths].every(p => canAsset('canDelete', p)) && (
                         <button 
                           type="button"
                           onClick={async () => {
@@ -2764,6 +3221,12 @@ export default function App() {
                             const fromState = [...selectedPaths] as string[];
                             const paths = (fromRef.length ? fromRef : fromState) as string[];
                             if (!paths.length) return;
+                            const selectedItems = filteredFiles.filter(f => paths.includes(f.path));
+                            if (selectedItems.some(f => f.isDir)) {
+                              if (selectedItems.length === 1) await handleSafeDelete(selectedItems[0]);
+                              else alert('批量删除里包含文件夹，请单独删除文件夹，以便选择删除内容或移动内容。');
+                              return;
+                            }
                             if (!confirm(`确定要删除选中的 ${paths.length} 个项目吗？`)) return;
                             setBatchDeleting(true);
                             let failed = 0;
@@ -2802,7 +3265,7 @@ export default function App() {
                           {batchDeleting ? '删除中…' : '删除'}
                         </button>
                       )}
-                      {user.permissions.canUpload && (
+                      {[...selectedPaths].every(p => canAsset('canMove', p)) && (
                         <button
                           type="button"
                           onClick={() => {
@@ -2816,7 +3279,7 @@ export default function App() {
                           移动到
                         </button>
                       )}
-                      <button 
+                      {[...selectedPaths].every(p => canAsset('canDownload', p)) && <button
                         onClick={() => {
                           const currentSel = selectedPathsRef.current;
                           const sel = filteredFiles.filter(f => currentSel.has(f.path));
@@ -2842,7 +3305,7 @@ export default function App() {
                       >
                         <Download className="w-4 h-4" />
                         下载
-                      </button>
+                      </button>}
                     </>
                   )}
                   <div className="relative hidden md:block">
@@ -2879,6 +3342,12 @@ export default function App() {
                       </button>
                     )}
                   </div>
+                  {canAsset('canCreateFolder', currentPath) && (
+                    <button type="button" onClick={() => { setShowNewFolderModal(true); }}
+                      className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold border border-slate-500">
+                      <FolderPlus className="w-4 h-4" /> 新建文件夹
+                    </button>
+                  )}
                   {user.permissions.canUpload && (
                     <>
                       <button 
@@ -2893,10 +3362,12 @@ export default function App() {
                 </div>
               </div>
 
-              {loading ? (
+              {searchQuery.trim() && !searchPending && !searchError && !filteredFiles.length && <p className="p-4 text-slate-500">未找到匹配的资产</p>}
+              {searchQuery.trim() && searchError && <p role="alert" className="p-4 text-amber-500">{searchError}</p>}
+              {(searchQuery.trim() ? searchPending && !filteredFiles.length : loading) ? (
                 <div className="flex flex-col items-center justify-center h-64 gap-4">
                   <Loader2 className="w-10 h-10 text-sky-500 animate-spin" />
-                  <p className="text-slate-500 text-sm animate-pulse">正在同步云端资产...</p>
+                  <p className="text-slate-500 text-sm animate-pulse">{searchQuery.trim() ? '正在搜索资产…' : '正在同步云端资产...'}</p>
                 </div>
               ) : (
                 <div 
@@ -2931,7 +3402,7 @@ export default function App() {
                         data-file-path={file.path}
                         data-is-dir={file.isDir ? 'true' : undefined}
                         onPointerDown={(e) => {
-                          if (e.button !== 0) return;
+                          if (e.button !== 0 || (e.target as Element).closest('button, input, a')) return;
                           // 阻止浏览器默认的图片/文字拖拽，确保 pointermove/pointerup 持续触发
                           e.preventDefault();
                           const toDrag = selectedPaths.has(file.path) && selectedPaths.size > 1
@@ -2976,7 +3447,8 @@ export default function App() {
                                   <div className={`${viewMode === 'grid' ? 'absolute inset-4' : 'absolute inset-2'} grid grid-cols-2 gap-0.5 overflow-hidden rounded-md pointer-events-none`}>
                                     {file.previews.map((prev, idx) => (
                                       <img 
-                                        key={idx}
+                                        key={prev}
+                                        loading="lazy" decoding="async"
                                         src={`${API_BASE}/thumbnail?path=${encodeURIComponent(prev)}&token=${user.token}`}
                                         className="w-full h-full object-cover rounded-[1px]"
                                         referrerPolicy="no-referrer"
@@ -2987,7 +3459,7 @@ export default function App() {
                                 )}
                               </div>
                             ) : (
-                              ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.psd', '.pdf', '.ai'].includes((file.ext || '').toLowerCase()) ? (
+                              ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.psd', '.pdf', '.ai', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.flv', '.wmv', '.mpg', '.mpeg', '.3gp'].includes((file.ext || '').toLowerCase()) ? (
                                 (() => {
                                   const ext = (file.ext || '').toLowerCase();
                                   const isSourceFile = ['.ai', '.psd', '.pdf'].includes(ext);
@@ -2997,9 +3469,10 @@ export default function App() {
                                     '.pdf': { bg: '#ef4444', label: 'PDF' },
                                   }[ext] : null;
                                   const thumb = (
-                                    <div className="relative w-32 h-32 overflow-hidden rounded-t-lg bg-slate-900/80 flex items-center justify-center">
+                                    <div key={file.mtime} className="relative w-32 h-32 overflow-hidden rounded-lg bg-slate-900/80 flex items-center justify-center">
                                       <img 
-                                        src={`${API_BASE}/thumbnail?path=${encodeURIComponent(file.path)}&token=${user.token}`} 
+                                        loading="lazy" decoding="async"
+                                        src={`${API_BASE}/thumbnail?path=${encodeURIComponent(file.path)}&v=${encodeURIComponent(file.mtime)}&token=${user.token}`}
                                         alt={file.name}
                                         className="max-w-full max-h-full object-contain"
                                         referrerPolicy="no-referrer"
@@ -3024,24 +3497,7 @@ export default function App() {
                                       </div>
                                     );
                                   }
-                                  return (
-                                    <div className="relative w-32 h-32 bg-slate-900/80 rounded-lg flex items-center justify-center">
-                                      <img 
-                                        src={`${API_BASE}/thumbnail?path=${encodeURIComponent(file.path)}&token=${user.token}`} 
-                                        alt={file.name}
-                                        className="max-w-full max-h-full object-contain shadow-md"
-                                        referrerPolicy="no-referrer"
-                                        draggable={false}
-                                        onError={(e) => {
-                                          (e.currentTarget as HTMLImageElement).style.display = 'none';
-                                          (e.currentTarget as HTMLImageElement).nextElementSibling?.classList.remove('hidden');
-                                        }}
-                                      />
-                                      <div className="hidden absolute inset-0 flex items-center justify-center rounded-lg bg-slate-800/50">
-                                        {getFileIcon(file)}
-                                      </div>
-                                    </div>
-                                  );
+                                  return thumb;
                                 })()
                               ) : getFileIcon(file)
                             )}
@@ -3067,7 +3523,7 @@ export default function App() {
                           flex items-center gap-1
                           ${viewMode === 'grid' ? "absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-all" : ""}
                         `}>
-                          {!file.isDir && (
+                          {!file.isDir && canAsset('canTag', file.path) && (
                             <button 
                               onClick={(e) => { 
                                 e.stopPropagation(); 
@@ -3083,9 +3539,21 @@ export default function App() {
                               <Tag className="w-4 h-4" />
                             </button>
                           )}
-                          <button 
-                            onClick={(e) => { 
-                              e.stopPropagation(); 
+                          {canAsset('canRename', file.path) && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRenameModal({ file, name: file.name });
+                              }}
+                              className="p-1.5 hover:bg-slate-800 rounded-md text-slate-400 hover:text-sky-500 transition-all"
+                              title={file.isDir ? '重命名文件夹' : '重命名文件'}
+                            >
+                              <Pencil className="w-4 h-4" />
+                            </button>
+                          )}
+                          {canAsset('canDownload', file.path) && <button
+                            onClick={(e) => {
+                              e.stopPropagation();
                               const electron = (window as any).electron;
                               if (!file.isDir) {
                                 handleDownload(file);
@@ -3102,10 +3570,10 @@ export default function App() {
                             className="p-1.5 hover:bg-slate-800 rounded-md text-slate-400 hover:text-sky-500 transition-all"
                           >
                             <Download className="w-4 h-4" />
-                          </button>
-                          {user.permissions.canDelete && (
+                          </button>}
+                          {canAsset('canDelete', file.path) && (
                             <button 
-                              onClick={(e) => { e.stopPropagation(); handleDelete(file); }}
+                              onClick={(e) => { e.stopPropagation(); handleSafeDelete(file); }}
                               className="p-1.5 hover:bg-slate-800 rounded-md text-slate-400 hover:text-red-500 transition-all"
                             >
                               <Trash2 className="w-4 h-4" />
@@ -3144,6 +3612,9 @@ export default function App() {
                         setIsEditingProduct(false);
                         setProductImageFile(null);
                         setSelectedFolderPath([]);
+                        clearProductFolderSelection();
+                        setFolderMoveTargetKey('');
+                        setPendingProductFolderOps([]);
                         setNewProductForm({ 
                           id: undefined,
                           sku: '', 
@@ -3206,11 +3677,19 @@ export default function App() {
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] font-bold text-sky-500 uppercase tracking-wider bg-sky-500/10 px-1.5 py-0.5 rounded">{product.sku}</span>
                           {product.brand_name && (
-                            <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider bg-slate-800 px-1.5 py-0.5 rounded">{product.brand_name}</span>
+                            <span className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${theme === 'dark' ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-700 ring-1 ring-slate-200'}`}>{product.brand_name}</span>
                           )}
                         </div>
-                        {user.permissions.canManageProducts && (
-                          <div className="flex items-center gap-1 opacity-0 transition-all group-hover:opacity-100">
+                        <div className="flex items-center gap-1 opacity-0 transition-all group-hover:opacity-100">
+                          {(() => {
+                            const canSend = user.permissions.canSendNotification;
+                            console.log('[Notification Button Debug]', {
+                              username: user.username,
+                              canSendNotification: canSend,
+                              allPermissions: user.permissions
+                            });
+                            return canSend;
+                          })() && (
                             <button
                               type="button"
                               title="通知图片更新"
@@ -3222,7 +3701,8 @@ export default function App() {
                             >
                               <Bell className="w-4 h-4" />
                             </button>
-                            {user.permissions.canDelete && (
+                          )}
+                          {canAsset('canDelete', '') && (
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -3233,8 +3713,7 @@ export default function App() {
                                 <Trash2 className="w-4 h-4" />
                               </button>
                             )}
-                          </div>
-                        )}
+                        </div>
                       </div>
                       <h4 className={`text-sm font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'} truncate`}>{product.official_name || '未命名产品'}</h4>
                       <div className="flex flex-wrap gap-1 mt-1 opacity-60">
@@ -3274,7 +3753,7 @@ export default function App() {
                 {brands.map(brand => (
                   <div key={brand.id} className={`p-4 rounded-xl border ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} flex items-center justify-between group`}>
                     <span className={`font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{brand.name}</span>
-                    {user.permissions.canDelete && user.permissions.canManageBrands && (
+                    {canAsset('canDelete', '') && user.permissions.canManageBrands && (
                       <button 
                         onClick={() => handleDeleteBrand(brand.id)}
                         className="p-1 hover:bg-red-500/10 text-slate-500 hover:text-red-500 rounded transition-all opacity-0 group-hover:opacity-100"
@@ -3350,7 +3829,22 @@ export default function App() {
                 打开文件所在文件夹
               </button>
             )}
-            {user.permissions.canUpload && (
+            {contextMenu.path && canAsset('canRename', contextMenu.path) && (
+              <button
+                type="button"
+                onClick={() => {
+                  const file = filteredFiles.find(item => item.path === contextMenu.path);
+                  if (file) setRenameModal({ file, name: file.name });
+                  closeContextMenu();
+                }}
+                className={`w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md transition-all ${theme === 'dark' ? 'hover:bg-slate-800 text-slate-300 hover:text-white' : 'hover:bg-slate-100 text-slate-600 hover:text-slate-900'}`}
+              >
+                <Pencil className="w-4 h-4" />
+                {contextMenu.isDir ? '重命名文件夹' : '重命名文件'}
+              </button>
+            )}
+            {(contextMenu.path && !selectedPaths.has(contextMenu.path) ? [contextMenu.path] : [...selectedPaths]).some(Boolean) &&
+              (contextMenu.path && !selectedPaths.has(contextMenu.path) ? [contextMenu.path] : [...selectedPaths]).every(p => canAsset('canMove', p)) && (
               <button
                 type="button"
                 onClick={() => {
@@ -3368,6 +3862,20 @@ export default function App() {
               >
                 <Move className="w-4 h-4" />
                 移动到文件夹
+              </button>
+            )}
+            {contextMenu.path && contextMenu.isDir && canAsset('canDelete', contextMenu.path) && (
+              <button
+                type="button"
+                onClick={() => {
+                  const file = filteredFiles.find(item => item.path === contextMenu.path);
+                  closeContextMenu();
+                  if (file) handleSafeDelete(file);
+                }}
+                className={`w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md transition-all ${theme === 'dark' ? 'hover:bg-red-500/10 text-red-300 hover:text-red-200' : 'hover:bg-red-50 text-red-600 hover:text-red-700'}`}
+              >
+                <Trash2 className="w-4 h-4" />
+                删除文件夹
               </button>
             )}
             <button 
@@ -3428,12 +3936,10 @@ export default function App() {
         </AnimatePresence>
       </AnimatePresence>
 
-      {showUserManagement && (
-        <UserManagementModal
-          theme={theme}
-          user={user}
-          onClose={() => setShowUserManagement(false)}
-        />
+      {showUserManagement && (user.permissions.canManageUsers || user.permissions.canApproveRegistrations || user.username === '任小雨') && (
+        <Suspense fallback={null}>
+          <UserManagementModal theme={theme} user={user} onClose={() => setShowUserManagement(false)} />
+        </Suspense>
       )}
 
       <AnimatePresence>
@@ -3720,13 +4226,105 @@ export default function App() {
 
       {/* 移动到文件夹 弹窗 */}
       <AnimatePresence>
+        {renameModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+            onClick={(e) => { if (e.target === e.currentTarget) setRenameModal(null); }}
+          >
+            <motion.div
+              initial={{ scale: 0.94, y: 16 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.94, y: 16 }}
+              className={`w-full max-w-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} border rounded-2xl p-6 shadow-2xl`}
+            >
+              <h3 className={`text-lg font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'} mb-4`}>{renameModal.file.isDir ? '重命名文件夹' : '重命名文件'}</h3>
+              <input
+                autoFocus
+                type="text"
+                value={renameModal.name}
+                onChange={e => setRenameModal({ ...renameModal, name: e.target.value })}
+                onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229 && handleRename()}
+                className={`w-full ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-100 border-slate-200 text-slate-900'} border rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-sky-500 mb-6 transition-all`}
+              />
+              <div className="flex gap-3">
+                <button onClick={handleRename} className="flex-1 bg-sky-600 hover:bg-sky-500 text-white font-bold py-2 rounded-lg transition-all">保存</button>
+                <button onClick={() => setRenameModal(null)} className={`flex-1 ${theme === 'dark' ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'} font-bold py-2 rounded-lg transition-all`}>取消</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {folderDeleteModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+            onClick={(e) => { if (e.target === e.currentTarget) setFolderDeleteModal(null); }}
+          >
+            <motion.div
+              initial={{ scale: 0.94, y: 16 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.94, y: 16 }}
+              className={`w-full max-w-md ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} border rounded-2xl p-6 shadow-2xl`}
+            >
+              <h3 className={`text-lg font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>文件夹里还有文件</h3>
+              <p className="mt-2 text-sm text-slate-500">
+                「{folderDeleteModal.folder.name}」里有 {folderDeleteModal.itemCount} 个项目。请选择删除方式。
+              </p>
+              <div className="mt-6 grid gap-3">
+                <button
+                  type="button"
+                  disabled={!folderDeleteModal.childPaths.every(p => canAsset('canMove', p))}
+                  onClick={() => {
+                    const modal = folderDeleteModal;
+                    setFolderDeleteModal(null);
+                    openMoveModal(modal.childPaths, modal.folder.path);
+                  }}
+                  className="flex items-center justify-center gap-2 rounded-lg bg-sky-600 px-4 py-3 text-sm font-bold text-white hover:bg-sky-500"
+                >
+                  <Move className="w-4 h-4" />
+                  移动里面的文件后删除空文件夹
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const folder = folderDeleteModal.folder;
+                    if (!confirm(`确定要删除「${folder.name}」以及里面所有文件吗？`)) return;
+                    setFolderDeleteModal(null);
+                    await executeDeleteFile(folder.path);
+                  }}
+                  className="flex items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-3 text-sm font-bold text-white hover:bg-red-500"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  删除文件夹和里面所有文件
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFolderDeleteModal(null)}
+                  className={`rounded-lg px-4 py-2 text-sm font-bold ${theme === 'dark' ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                >
+                  取消
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
         {showMoveModal && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
-            onClick={(e) => { if (e.target === e.currentTarget) setShowMoveModal(false) }}
+            onClick={(e) => { if (e.target === e.currentTarget) { setShowMoveModal(false); setMoveAfterDeleteFolder(null); } }}
           >
             <motion.div
               initial={{ scale: 0.92, opacity: 0, y: 16 }}
@@ -3742,7 +4340,7 @@ export default function App() {
                   <p className="text-xs text-slate-500 mt-0.5">已选 {movePaths.length} 个项目</p>
                 </div>
                 <button
-                  onClick={() => setShowMoveModal(false)}
+                  onClick={() => { setShowMoveModal(false); setMoveAfterDeleteFolder(null); }}
                   className="p-2 hover:bg-slate-800 rounded-full text-slate-500 hover:text-white transition-colors"
                 >
                   <X className="w-4 h-4" />
@@ -3847,14 +4445,14 @@ export default function App() {
                 </div>
                 <div className="flex items-center gap-2 flex-shrink-0">
                   <button
-                    onClick={() => setShowMoveModal(false)}
+                    onClick={() => { setShowMoveModal(false); setMoveAfterDeleteFolder(null); }}
                     className={`px-4 py-2 rounded-lg text-sm font-medium ${theme === 'dark' ? 'bg-slate-800 text-slate-400 hover:text-white' : 'bg-slate-100 text-slate-600 hover:text-slate-900'} transition-colors`}
                   >
                     取消
                   </button>
                   <button
                     onClick={() => handleMoveFiles(moveBrowsePath)}
-                    disabled={moveExecuting || moveBrowsePath === moveInitialPath}
+                    disabled={moveExecuting || !allowsFolder(user.permissions, 'canMove', moveBrowsePath) || moveBrowsePath === moveInitialPath || !!(moveAfterDeleteFolder && (moveBrowsePath === moveAfterDeleteFolder || moveBrowsePath.startsWith(moveAfterDeleteFolder + '/')))}
                     className="px-4 py-2 rounded-lg text-sm font-medium bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                   >
                     {moveExecuting ? '移动中…' : '移动到此处'}
@@ -3897,7 +4495,7 @@ export default function App() {
                     className={`w-full px-4 py-2.5 rounded-lg border ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} outline-none focus:ring-2 focus:ring-sky-500`}
                     value={newBrandName}
                     onChange={e => setNewBrandName(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && handleCreateBrand()}
+                    onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229 && handleCreateBrand()}
                   />
                 </div>
                 <div className="flex gap-3 pt-2">
@@ -3987,7 +4585,7 @@ export default function App() {
             onDrop={e => { e.preventDefault(); e.stopPropagation(); }}
             onDragOver={e => { e.preventDefault(); e.stopPropagation(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; }}
           >
-            <motion.div 
+            <motion.div role="dialog" aria-modal="true" aria-label="智能分类上传"
               initial={{ scale: 0.9, opacity: 0, y: 20 }}
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.9, opacity: 0, y: 20 }}
@@ -3999,7 +4597,7 @@ export default function App() {
                   <Zap className="w-5 h-5 text-indigo-500" />
                   <h3 className={`text-lg font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>智能分类上传</h3>
                 </div>
-                <button onClick={() => { setShowSmartUpload(false); setSmartUploadSuccess(null); setSmartUploadPendingFiles([]); setSmartUploadPendingPaths([]); setSmartUploadConfig(prev => ({ ...prev, folders: cloneFolderTree(INITIAL_SMART_UPLOAD_FOLDERS), selectedFolderPath: [], newFolderName: '' })); }} className="p-2 hover:bg-slate-800 rounded-full text-slate-500">
+                <button onClick={() => { setShowSmartUpload(false); setSmartUploadSuccess(null); setSmartUploadPendingFiles([]); setSmartUploadPendingPaths([]); setSmartUploadConfig(prev => ({ ...prev, folders: cloneFolderTree(INITIAL_SMART_UPLOAD_FOLDERS), selectedFolderPath: [] })); }} className="p-2 hover:bg-slate-800 rounded-full text-slate-500">
                   <X className="w-5 h-5" />
                 </button>
               </div>
@@ -4020,7 +4618,7 @@ export default function App() {
                         继续上传
                       </button>
                       <button
-                      onClick={() => { setShowSmartUpload(false); setSmartUploadSuccess(null); setSmartUploadPendingFiles([]); setSmartUploadPendingPaths([]); setSmartUploadConfig(prev => ({ ...prev, folders: cloneFolderTree(INITIAL_SMART_UPLOAD_FOLDERS), selectedFolderPath: [], newFolderName: '' })); }}
+                      onClick={() => { setShowSmartUpload(false); setSmartUploadSuccess(null); setSmartUploadPendingFiles([]); setSmartUploadPendingPaths([]); setSmartUploadConfig(prev => ({ ...prev, folders: cloneFolderTree(INITIAL_SMART_UPLOAD_FOLDERS), selectedFolderPath: [] })); }}
                         className="flex-1 py-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold transition-all"
                       >
                         完成
@@ -4030,11 +4628,21 @@ export default function App() {
                 ) : (
                 <>
                 <div className="space-y-2">
-                  <label className="text-xs font-bold text-slate-500 uppercase">搜索并选择产品</label>
-                  <div className="relative">
-                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-                    <input 
-                      type="text" 
+                  <label htmlFor="smart-product-search" className="text-xs font-bold text-slate-500 uppercase">搜索并选择产品</label>
+                  <div ref={smartSearchRef} className="relative"
+                    onBlur={e => {
+                      if (!e.currentTarget.contains(e.relatedTarget)) setShowSmartSearchResults(false);
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === 'Escape' && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
+                        e.preventDefault();
+                        setShowSmartSearchResults(false);
+                      }
+                    }}>
+                    <Search className="pointer-events-none w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                    <input
+                      id="smart-product-search"
+                      type="text"
                       placeholder="输入 SKU、名称或别名搜索..."
                       className={`w-full pl-10 pr-4 py-2.5 rounded-lg border ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} outline-none focus:ring-2 focus:ring-indigo-500 text-sm`}
                       value={smartUploadSearch}
@@ -4043,59 +4651,52 @@ export default function App() {
                         setShowSmartSearchResults(true);
                       }}
                       onFocus={() => setShowSmartSearchResults(true)}
+                      onClick={() => setShowSmartSearchResults(true)}
                     />
                     
                     {/* 搜索结果下拉列表 */}
-                    <AnimatePresence>
-                      {showSmartSearchResults && (
-                        <>
-                          <div 
-                            className="fixed inset-0 z-10" 
-                            onClick={() => setShowSmartSearchResults(false)}
-                          />
-                          <motion.div 
-                            initial={{ opacity: 0, y: -10 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -10 }}
-                            className={`absolute left-0 right-0 top-full mt-1 z-[100] max-h-60 overflow-y-auto rounded-xl border shadow-xl ${theme === 'dark' ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}
-                            onClick={e => e.stopPropagation()}
-                            onMouseDown={e => e.stopPropagation()}
-                          >
-                            {smartUploadFilteredProducts.length > 0 ? (
-                              smartUploadFilteredProducts.map(p => (
-                                <button
-                                  key={p.id}
-                                  className={`w-full text-left px-4 py-3 hover:bg-indigo-500/10 transition-colors border-b last:border-0 ${theme === 'dark' ? 'border-slate-700' : 'border-slate-100'}`}
-                                  onClick={() => {
-                                    if (!smartUploadConfig.productIds.includes(p.id)) {
-                                      setSmartUploadConfig({
-                                        ...smartUploadConfig, 
-                                        productIds: [...smartUploadConfig.productIds, p.id],
-                                        variantId: null // 多选时暂不支持规格精确匹配
-                                      });
-                                    }
-                                    setSmartUploadSearch('');
-                                    setShowSmartSearchResults(false);
-                                  }}
-                                >
-                                  <div className={`text-sm font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{p.sku}</div>
-                                  <div className="text-xs text-slate-500 truncate">{p.official_name}</div>
-                                  {p.names && (
-                                    <div className="text-[10px] text-slate-400 italic mt-0.5 truncate">别名: {p.names}</div>
-                                  )}
-                                </button>
-                              ))
-                            ) : (
-                              <div className="p-4 text-center text-sm text-slate-500 italic">未找到匹配产品</div>
-                            )}
-                          </motion.div>
-                        </>
-                      )}
-                    </AnimatePresence>
+                    {showSmartSearchResults && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className={`absolute left-0 right-0 top-full mt-1 z-[100] max-h-60 overflow-y-auto rounded-xl border shadow-xl ${theme === 'dark' ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}
+                        onClick={e => e.stopPropagation()}
+                        onMouseDown={e => e.stopPropagation()}
+                      >
+                        {smartUploadFilteredProducts.length > 0 ? (
+                          smartUploadFilteredProducts.map(p => (
+                            <button
+                              key={p.id}
+                              className={`w-full text-left px-4 py-3 hover:bg-indigo-500/10 transition-colors border-b last:border-0 ${theme === 'dark' ? 'border-slate-700' : 'border-slate-100'}`}
+                              onClick={() => {
+                                if (!smartUploadConfig.productIds.includes(p.id)) {
+                                  setSmartUploadConfig({
+                                    ...smartUploadConfig,
+                                    productIds: [...smartUploadConfig.productIds, p.id],
+                                    variantId: null // 多选时暂不支持规格精确匹配
+                                  });
+                                }
+                                setSmartUploadError('');
+                                setSmartUploadSearch('');
+                                setShowSmartSearchResults(false);
+                              }}
+                            >
+                              <div className={`text-sm font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{p.sku}</div>
+                              <div className="text-xs text-slate-500 truncate">{p.official_name}</div>
+                              {p.names && (
+                                <div className="text-[10px] text-slate-400 italic mt-0.5 truncate">别名: {p.names}</div>
+                              )}
+                            </button>
+                          ))
+                        ) : (
+                          <div className="p-4 text-center text-sm text-slate-500 italic">未找到匹配产品</div>
+                        )}
+                      </motion.div>
+                    )}
                   </div>
                   
                   {/* 已选产品展示 */}
-                  {smartUploadConfig.productIds.length > 0 && !showSmartSearchResults && (
+                  {smartUploadConfig.productIds.length > 0 && (
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <label className="text-[10px] font-bold text-slate-500 uppercase">已选择 {smartUploadConfig.productIds.length} 个产品</label>
@@ -4215,63 +4816,20 @@ export default function App() {
                                 </button>
                               ))}
                               {smartUploadDirs.length === 0 && !smartUploadDirsLoading && (
-                                <span className="text-[9px] text-slate-500 italic">当前目录下无子文件夹，可新建</span>
+                                <span className="text-[9px] text-slate-500 italic">当前目录下无子文件夹</span>
                               )}
                             </div>
-                            <div className="flex gap-2">
-                              <input
-                                type="text"
-                                placeholder={smartUploadConfig.selectedFolderPath.length === 0 ? '新建文件夹名...' : '添加子文件夹...'}
-                                className={`flex-1 px-2 py-1 text-[10px] rounded border ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} outline-none focus:ring-1 focus:ring-indigo-500`}
-                                value={smartUploadConfig.newFolderName}
-                                onChange={e => setSmartUploadConfig(prev => ({ ...prev, newFolderName: e.target.value }))}
-                                onKeyDown={async e => {
-                                  if (e.key === 'Enter' && smartUploadConfig.newFolderName.trim()) {
-                                    e.preventDefault();
-                                    const parentPath = smartUploadConfig.selectedFolderPath.length ? pathJoin(smartUploadBasePath, ...smartUploadConfig.selectedFolderPath) : smartUploadBasePath;
-                                    try {
-                                      const res = await fetch(`${API_BASE}/mkdir`, {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${user!.token}` },
-                                        body: JSON.stringify({ path: parentPath, name: smartUploadConfig.newFolderName.trim() }),
-                                      });
-                                      if (res.ok) {
-                                        setSmartUploadConfig(prev => ({ ...prev, newFolderName: '' }));
-                                        fetchSmartUploadDirs();
-                                      } else {
-                                        const data = await res.json().catch(() => ({}));
-                                        alert((data as any).error || '创建失败');
-                                      }
-                                    } catch { alert('网络错误'); }
-                                  }
-                                }}
-                              />
-                              <button
-                                type="button"
-                                disabled={!smartUploadConfig.newFolderName.trim()}
-                                onClick={async () => {
-                                  if (!smartUploadConfig.newFolderName.trim() || !user) return;
-                                  const parentPath = smartUploadConfig.selectedFolderPath.length ? pathJoin(smartUploadBasePath, ...smartUploadConfig.selectedFolderPath) : smartUploadBasePath;
-                                  try {
-                                    const res = await fetch(`${API_BASE}/mkdir`, {
-                                      method: 'POST',
-                                      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${user.token}` },
-                                      body: JSON.stringify({ path: parentPath, name: smartUploadConfig.newFolderName.trim() }),
-                                    });
-                                    if (res.ok) {
-                                      setSmartUploadConfig(prev => ({ ...prev, newFolderName: '' }));
-                                      fetchSmartUploadDirs();
-                                    } else {
-                                      const data = await res.json().catch(() => ({}));
-                                      alert((data as any).error || '创建失败');
-                                    }
-                                  } catch { alert('网络错误'); }
-                                }}
-                                className="px-2 py-1 bg-indigo-600 text-white rounded hover:bg-indigo-500 transition-all text-[10px] disabled:opacity-50 disabled:cursor-not-allowed"
-                              >
-                                <Plus className="w-3 h-3" />
-                              </button>
-                            </div>
+                            {canAsset('canCreateFolder', pathJoin(smartUploadBasePath, ...smartUploadConfig.selectedFolderPath)) && (
+                              <div key={pathJoin(smartUploadBasePath, ...smartUploadConfig.selectedFolderPath)}>
+                                <CreateFolderField
+                                  path={pathJoin(smartUploadBasePath, ...smartUploadConfig.selectedFolderPath)}
+                                  token={user.token}
+                                  theme={theme}
+                                  placeholder={smartUploadConfig.selectedFolderPath.length ? '添加子文件夹...' : '新建文件夹名...'}
+                                  onCreated={fetchSmartUploadDirs}
+                                />
+                              </div>
+                            )}
                           </>
                         )}
                       </div>
@@ -4307,7 +4865,8 @@ export default function App() {
                     className={`w-full flex flex-col items-center justify-center gap-3 p-6 border-2 border-dashed rounded-xl transition-all cursor-pointer select-none ${smartUploadConfig.productIds.length === 0 ? 'opacity-50 cursor-not-allowed border-slate-700' : 'border-indigo-500/50 hover:border-indigo-500 bg-indigo-500/5'}`}
                     onClick={() => {
                       if (smartUploadConfig.productIds.length === 0) {
-                        alert('请先搜索并选择产品');
+                        setSmartUploadError('请先搜索并选择产品');
+                        smartSearchRef.current?.querySelector('input')?.focus();
                         return;
                       }
                       smartUploadInputRef.current?.click();
@@ -4354,6 +4913,8 @@ export default function App() {
                   </div>
                 </div>
 
+                {smartUploadError && <p role="alert" className="text-sm text-red-500">{smartUploadError}</p>}
+
                 {/* 上传进度 */}
                 {loading && smartUploadProgress && (
                   <div className={`flex flex-col gap-2 p-3 rounded-xl border ${theme === 'dark' ? 'bg-indigo-500/10 border-indigo-500/30' : 'bg-indigo-50 border-indigo-200'}`}>
@@ -4378,7 +4939,7 @@ export default function App() {
                   return (
                 <button
                   type="button"
-                  disabled={pendingCount === 0 || loading}
+                  disabled={pendingCount === 0 || loading || !canAsset('canUpload', pathJoin(smartUploadBasePath, ...smartUploadConfig.selectedFolderPath))}
                   onClick={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -4566,12 +5127,51 @@ export default function App() {
                       <button
                         type="button"
                         onClick={handleSaveFolderTemplate}
-                        className="text-[10px] font-bold text-sky-500 hover:text-sky-400"
+                        disabled={folderTemplateSaving}
+                        className="flex items-center gap-1 text-[10px] font-bold text-sky-500 hover:text-sky-400 disabled:cursor-not-allowed disabled:opacity-50"
                       >
+                        {folderTemplateSaving && <Loader2 className="h-3 w-3 animate-spin" />}
                         保存为默认文件夹
                       </button>
                     )}
                   </div>
+                  {selectedProductFolderKeys.size > 0 && (
+                    <div className={`rounded-lg border p-2 ${theme === 'dark' ? 'border-slate-700 bg-slate-800/70' : 'border-slate-200 bg-slate-50'}`}>
+                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[10px] font-bold text-sky-500">已选 {selectedProductFolderKeys.size} 个默认文件夹</span>
+                        <button type="button" onClick={clearProductFolderSelection} className="text-[10px] font-bold text-slate-500 hover:text-slate-300">取消选择</button>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button type="button" onClick={openBatchRenameProductFolders} className="rounded bg-sky-600 px-2 py-1 text-[10px] font-bold text-white hover:bg-sky-500">批量重命名</button>
+                        <button type="button" onClick={deleteSelectedProductFolders} className="rounded bg-red-600 px-2 py-1 text-[10px] font-bold text-white hover:bg-red-500">批量删除</button>
+                        <select
+                          value={folderMoveTargetKey}
+                          onChange={e => setFolderMoveTargetKey(e.target.value)}
+                          className={`min-w-0 flex-1 rounded border px-2 py-1 text-[10px] ${theme === 'dark' ? 'border-slate-700 bg-slate-900 text-slate-200' : 'border-slate-200 bg-white text-slate-800'}`}
+                        >
+                          <option value="">移动到根目录</option>
+                          {validFolderMoveTargets.map(option => (
+                            <option key={option.key} value={option.key}>{option.label}</option>
+                          ))}
+                        </select>
+                        <button type="button" onClick={moveSelectedProductFolders} className="rounded bg-indigo-600 px-2 py-1 text-[10px] font-bold text-white hover:bg-indigo-500">移动</button>
+                      </div>
+                      {batchRenameFoldersOpen && (
+                        <div className="mt-2 space-y-2">
+                          <textarea
+                            rows={Math.min(6, Math.max(2, selectedProductFolderKeys.size))}
+                            value={batchRenameFolderText}
+                            onChange={e => setBatchRenameFolderText(e.target.value)}
+                            className={`w-full rounded border px-2 py-1 text-[10px] ${theme === 'dark' ? 'border-slate-700 bg-slate-900 text-slate-200' : 'border-slate-200 bg-white text-slate-800'}`}
+                          />
+                          <div className="flex justify-end gap-2">
+                            <button type="button" onClick={() => setBatchRenameFoldersOpen(false)} className="rounded px-2 py-1 text-[10px] font-bold text-slate-500 hover:bg-slate-700/40">取消</button>
+                            <button type="button" onClick={applyBatchRenameProductFolders} className="rounded bg-sky-600 px-2 py-1 text-[10px] font-bold text-white hover:bg-sky-500">应用重命名</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {selectedFolderPath.length > 0 && (
                     <div className="flex flex-wrap items-center gap-1 mb-2">
                       <button
@@ -4600,20 +5200,41 @@ export default function App() {
                     </div>
                   )}
                   <div className="flex flex-wrap gap-1.5 mb-2">
-                    {(selectedFolderPath.length === 0 ? newProductForm.folders : (getProductNodeAtPath(newProductForm.folders, selectedFolderPath)?.children || [])).map((node, i) => (
+                    {(selectedFolderPath.length === 0 ? newProductForm.folders : (getProductNodeAtPath(newProductForm.folders, selectedFolderPath)?.children || [])).map((node, i) => {
+                      const nextPath = selectedFolderPath.length === 0 ? [i] : [...selectedFolderPath, i];
+                      const key = productFolderPathKey(nextPath);
+                      const checked = selectedProductFolderKeys.has(key);
+                      return (
                       <div
-                        key={i}
-                        className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium cursor-pointer transition-all border ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700' : 'bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200'}`}
+                        key={key}
+                        className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium transition-all border ${checked ? 'border-sky-500 bg-sky-500/15 text-sky-300' : theme === 'dark' ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700' : 'bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200'}`}
                       >
-                        <span onClick={() => setSelectedFolderPath(selectedFolderPath.length === 0 ? [i] : [...selectedFolderPath, i])}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleProductFolderSelection(nextPath)}
+                          onClick={e => e.stopPropagation()}
+                          className="h-3 w-3 accent-sky-500"
+                          title="选择用于批量编辑"
+                        />
+                        <span className="cursor-pointer" onClick={() => setSelectedFolderPath(nextPath)}>
                           {node.name}
                         </span>
                         <button
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            const nextPath = selectedFolderPath.length === 0 ? [i] : [...selectedFolderPath, i];
+                            const deletedOption = productFolderFlatOptions.find(option => option.key === key);
+                            setPendingProductFolderOps(prev => [
+                              ...prev,
+                              { type: 'delete', fromSegments: deletedOption?.segments || [...selectedFolderPath.map((_, depth) => getProductNodeAtPath(newProductForm.folders, selectedFolderPath.slice(0, depth + 1))?.name || ''), node.name].filter(Boolean) },
+                            ]);
                             setNewProductForm({ ...newProductForm, folders: removeProductNodeAtPath(newProductForm.folders, nextPath) });
+                            setSelectedProductFolderKeys(prev => {
+                              const next = new Set(prev);
+                              next.delete(key);
+                              return next;
+                            });
                             if (selectedFolderPath.length > 0 && selectedFolderPath[0] === nextPath[0] && nextPath.length === 1) setSelectedFolderPath([]);
                             else if (selectedFolderPath.length >= nextPath.length && selectedFolderPath.slice(0, nextPath.length).every((v, j) => v === nextPath[j])) setSelectedFolderPath(selectedFolderPath.slice(0, -1));
                           }}
@@ -4622,7 +5243,8 @@ export default function App() {
                           <X className="w-3 h-3" />
                         </button>
                       </div>
-                    ))}
+                      );
+                    })}
                     {((selectedFolderPath.length === 0 ? newProductForm.folders : (getProductNodeAtPath(newProductForm.folders, selectedFolderPath)?.children || []))).length === 0 && (
                       <span className="text-[9px] text-slate-500 italic">暂无子文件夹，可在下方添加</span>
                     )}
@@ -4635,7 +5257,7 @@ export default function App() {
                       value={newChildFolderName}
                       onChange={e => setNewChildFolderName(e.target.value)}
                       onKeyDown={e => {
-                        if (e.key === 'Enter' && newChildFolderName.trim()) {
+                        if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229 && newChildFolderName.trim()) {
                           setNewProductForm({ ...newProductForm, folders: addProductChildAtPath(newProductForm.folders, selectedFolderPath, { name: newChildFolderName.trim(), children: [] }) });
                           setNewChildFolderName('');
                         }
@@ -4678,44 +5300,159 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      <AnimatePresence>
+        {folderTemplateDeletePreview && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="folder-template-delete-title"
+            onClick={(event) => {
+              if (event.target === event.currentTarget && !folderTemplateSaving) setFolderTemplateDeletePreview(null);
+            }}
+          >
+            <motion.div
+              initial={{ scale: 0.94, opacity: 0, y: 16 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.96, opacity: 0, y: 10 }}
+              className={`w-full max-w-xl overflow-hidden rounded-lg border shadow-2xl ${theme === 'dark' ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-200 bg-white text-slate-900'}`}
+            >
+              <div className={`flex items-start justify-between gap-4 border-b px-5 py-4 ${theme === 'dark' ? 'border-slate-800' : 'border-slate-200'}`}>
+                <div className="flex min-w-0 items-start gap-3">
+                  <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-amber-500/15 text-amber-500">
+                    <Trash2 className="h-5 w-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <h2 id="folder-template-delete-title" className="text-sm font-bold">处理非空文件夹</h2>
+                    <p className="mt-1 text-xs text-slate-500">
+                      在 {folderTemplateDeletePreview.nonEmptyDeleteCount} 个现有产品目录中找到了文件或子文件夹。
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setFolderTemplateDeletePreview(null)}
+                  disabled={folderTemplateSaving}
+                  className="rounded p-1 text-slate-500 hover:bg-slate-700/40 hover:text-slate-200 disabled:opacity-40"
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="max-h-[65vh] space-y-4 overflow-y-auto px-5 py-4">
+                <div className={`max-h-28 overflow-y-auto rounded-md border px-3 py-2 text-[11px] ${theme === 'dark' ? 'border-slate-700 bg-slate-950/60 text-slate-400' : 'border-slate-200 bg-slate-50 text-slate-600'}`}>
+                  {folderTemplateDeletePreview.nonEmptyDeletes.slice(0, 8).map((item, index) => (
+                    <div key={`${item.productId}-${item.path}-${index}`} className="flex items-center justify-between gap-3 py-0.5">
+                      <span className="truncate" title={item.path}>{item.productName || item.path}</span>
+                      <span className="shrink-0">{item.itemCount} 项</span>
+                    </div>
+                  ))}
+                  {folderTemplateDeletePreview.nonEmptyDeletes.length > 8 && (
+                    <div className="pt-1 text-slate-500">另有 {folderTemplateDeletePreview.nonEmptyDeletes.length - 8} 个目录</div>
+                  )}
+                </div>
+
+                <fieldset className="space-y-2">
+                  <legend className="mb-2 text-xs font-bold text-slate-500">处理方式</legend>
+                  {([
+                    { value: 'move' as const, label: '移动里面的内容', detail: '保留文件，并移动到指定的默认文件夹', icon: Move },
+                    { value: 'keep' as const, label: '保留非空文件夹', detail: '空文件夹会删除，包含内容的文件夹保持原位', icon: FolderOpen },
+                    { value: 'delete' as const, label: '连同内容一起删除', detail: '永久删除对应文件夹中的全部内容', icon: Trash2 },
+                  ]).map(option => {
+                    const Icon = option.icon;
+                    const checked = folderTemplateDeleteStrategy === option.value;
+                    return (
+                      <label
+                        key={option.value}
+                        className={`flex cursor-pointer items-center gap-3 rounded-md border px-3 py-2.5 transition-colors ${checked ? 'border-sky-500 bg-sky-500/10' : theme === 'dark' ? 'border-slate-700 hover:border-slate-600' : 'border-slate-200 hover:border-slate-300'}`}
+                      >
+                        <input
+                          type="radio"
+                          name="folder-template-delete-strategy"
+                          value={option.value}
+                          checked={checked}
+                          onChange={() => setFolderTemplateDeleteStrategy(option.value)}
+                          className="h-4 w-4 accent-sky-500"
+                        />
+                        <Icon className={`h-4 w-4 shrink-0 ${option.value === 'delete' ? 'text-red-500' : 'text-sky-500'}`} />
+                        <span className="min-w-0">
+                          <span className="block text-xs font-bold">{option.label}</span>
+                          <span className="block text-[11px] text-slate-500">{option.detail}</span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </fieldset>
+
+                {folderTemplateDeleteStrategy === 'move' && (
+                  <div>
+                    <label htmlFor="folder-template-delete-target" className="mb-1.5 block text-xs font-bold text-slate-500">移动到</label>
+                    <select
+                      id="folder-template-delete-target"
+                      value={folderTemplateDeleteTargetKey}
+                      onChange={event => setFolderTemplateDeleteTargetKey(event.target.value)}
+                      className={`w-full rounded-md border px-3 py-2 text-xs outline-none focus:border-sky-500 ${theme === 'dark' ? 'border-slate-700 bg-slate-950 text-slate-200' : 'border-slate-200 bg-white text-slate-800'}`}
+                    >
+                      <option value="__root__">产品根目录</option>
+                      {productFolderFlatOptions.map(option => (
+                        <option key={option.key} value={option.key}>{option.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              <div className={`flex justify-end gap-2 border-t px-5 py-3 ${theme === 'dark' ? 'border-slate-800 bg-slate-950/50' : 'border-slate-200 bg-slate-50'}`}>
+                <button
+                  type="button"
+                  onClick={() => setFolderTemplateDeletePreview(null)}
+                  disabled={folderTemplateSaving}
+                  className="rounded-md px-3 py-2 text-xs font-bold text-slate-500 hover:bg-slate-700/30 disabled:opacity-40"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmFolderTemplateDeletion}
+                  disabled={folderTemplateSaving}
+                  className={`flex min-w-24 items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-bold text-white disabled:cursor-not-allowed disabled:opacity-50 ${folderTemplateDeleteStrategy === 'delete' ? 'bg-red-600 hover:bg-red-500' : 'bg-sky-600 hover:bg-sky-500'}`}
+                >
+                  {folderTemplateSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                  确认保存
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* 新建文件夹弹窗 */}
       <AnimatePresence>
-        {showNewFolderModal && (
+        {canAsset('canCreateFolder', currentPath) && showNewFolderModal && (
           <motion.div 
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4"
           >
-            <motion.div 
+            <motion.div role="dialog" aria-modal="true" aria-label="新建文件夹"
               initial={{ scale: 0.9, y: 20 }}
               animate={{ scale: 1, y: 0 }}
               className={`w-full max-w-sm ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} border rounded-2xl p-6 shadow-2xl`}
             >
               <h3 className={`text-lg font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'} mb-4`}>新建文件夹</h3>
-              <input 
-                autoFocus
-                type="text" 
-                className={`w-full ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-100 border-slate-200 text-slate-900'} border rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-sky-500 mb-6 transition-all`}
+              <CreateFolderField
+                path={currentPath}
+                token={user.token}
+                theme={theme}
                 placeholder="文件夹名称"
-                value={newFolderName}
-                onChange={e => setNewFolderName(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && handleCreateFolder()}
+                onCreated={() => { fetchFiles(currentPath); setShowNewFolderModal(false); }}
+                onCancel={() => setShowNewFolderModal(false)}
               />
-              <div className="flex gap-3">
-                <button 
-                  onClick={handleCreateFolder}
-                  className="flex-1 bg-sky-600 hover:bg-sky-500 text-white font-bold py-2 rounded-lg transition-all"
-                >
-                  创建
-                </button>
-                <button 
-                  onClick={() => setShowNewFolderModal(false)}
-                  className={`flex-1 ${theme === 'dark' ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'} font-bold py-2 rounded-lg transition-all`}
-                >
-                  取消
-                </button>
-              </div>
             </motion.div>
           </motion.div>
         )}

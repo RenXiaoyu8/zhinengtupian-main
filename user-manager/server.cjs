@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 
-const PORT = 3799;
+const { childFolders, validScopes } = require('./folder-access.cjs');
 const APP_DATA_FOLDER = '程序图片勿动';
 
 // 解析 users.json 路径：优先 config.json 的 assetsRoot，其次环境变量 ASSETS_ROOT，再次默认 D:\尚品易站图片
@@ -48,7 +48,28 @@ function saveUsers(users) {
   fs.writeFileSync(USERS_JSON, JSON.stringify(users, null, 2), 'utf-8');
 }
 
-const PERM_KEYS = ['canUpload', 'canDownload', 'canDelete', 'canManageProducts', 'canManageBrands', 'canTag'];
+const { resetPassword } = require('./registration-password.cjs');
+const PERM_KEYS = ['canApproveRegistrations', 'canUpload', 'canRename', 'canMove', 'canCreateFolder', 'canDownload', 'canDelete', 'canManageProducts', 'canManageBrands', 'canTag'];
+
+function effectivePermissions(user) {
+  const role = String(user.role || '').toLowerCase();
+  const editor = role === 'admin' || role === 'editor';
+  const upload = user.permissions?.canUpload ?? editor;
+  return {
+    canApproveRegistrations: role === 'admin', canCreateFolder: role === 'admin', canUpload: upload, canRename: upload, canMove: upload,
+    canDownload: true, canDelete: editor, canManageProducts: editor, canManageBrands: editor,
+    canTag: editor, ...user.permissions,
+  };
+}
+
+function mergePermissions(current, changes) {
+  const permissions = { ...current };
+  for (const key of PERM_KEYS) {
+    if (Object.hasOwn(changes, key)) permissions[key] = changes[key] === true;
+  }
+  if (changes.folderScopes !== undefined) permissions.folderScopes = changes.folderScopes;
+  return permissions;
+}
 
 function send(res, code, body) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -79,6 +100,14 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, { ok: true });
   }
 
+  if (req.method === 'GET' && (url === '/scope-picker.mjs' || url === '/asset-scopes.mjs')) {
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+    return res.end(fs.readFileSync(path.join(__dirname, url.slice(1))));
+  }
+  if (req.method === 'GET' && url === '/api/users/folders') {
+    try { return send(res, 200, await childFolders(path.dirname(path.dirname(USERS_JSON)), q.get('path') || '')); }
+    catch { return send(res, 400, { error: '无法读取目录' }); }
+  }
   // 静态页
   if (url === '/' || url === '/index.html') {
     const htmlPath = path.join(__dirname, 'index.html');
@@ -98,8 +127,9 @@ const server = http.createServer(async (req, res) => {
     const list = users.map((u) => ({
       username: u.username,
       password: u.password || '',
+      protectedPassword: !!u.passwordHash,
       role: u.role || 'Viewer',
-      permissions: { ...{ canUpload: false, canDownload: false, canDelete: false, canManageProducts: false, canManageBrands: false, canTag: false }, ...(u.permissions || {}) },
+      permissions: effectivePermissions(u),
     }));
     return send(res, 200, list);
   }
@@ -113,11 +143,12 @@ const server = http.createServer(async (req, res) => {
     const users = loadUsers();
     if (users.some((u) => String(u.username).trim() === username)) return send(res, 400, { error: '用户名已存在' });
     const perms = body.permissions || {};
+    if (!validScopes(perms.folderScopes)) return send(res, 400, { error: '权限范围无效' });
     users.push({
       username,
       password,
       role: (body.role || 'Viewer').trim(),
-      permissions: PERM_KEYS.reduce((o, k) => { o[k] = !!perms[k]; return o; }, {}),
+      permissions: mergePermissions({}, perms),
     });
     saveUsers(users);
     return send(res, 200, { success: true });
@@ -131,10 +162,14 @@ const server = http.createServer(async (req, res) => {
     const users = loadUsers();
     const i = users.findIndex((u) => String(u.username).trim() === username);
     if (i < 0) return send(res, 404, { error: '用户不存在' });
-    if (typeof body.password === 'string' && body.password.trim()) users[i].password = body.password.trim();
+    if (typeof body.password === 'string' && body.password.trim()) {
+      if (users[i].passwordHash) users[i].passwordHash = resetPassword(body.password.trim());
+      else users[i].password = body.password.trim();
+    }
     if (typeof body.role === 'string' && body.role.trim()) users[i].role = body.role.trim();
     if (body.permissions && typeof body.permissions === 'object') {
-      users[i].permissions = PERM_KEYS.reduce((o, k) => { o[k] = !!body.permissions[k]; return o; }, {});
+      if (!validScopes(body.permissions.folderScopes)) return send(res, 400, { error: '权限范围无效' });
+      users[i].permissions = mergePermissions(users[i].permissions, body.permissions);
     }
     saveUsers(users);
     return send(res, 200, { success: true });
@@ -159,7 +194,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // 使用 0 由系统分配空闲端口，避免 3799 被占用时报错
-server.listen(0, () => {
+server.listen(0, '127.0.0.1', () => {
   const actual = server.address().port;
   const url = `http://127.0.0.1:${actual}`;
   console.log('用户管理工具已启动: ' + url);
